@@ -1,0 +1,51 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+packages/mcp/dist/
+packages/mcp/.vite/
+
+# Data (downloaded at install time, not tracked)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db.xz
+data/*.csv
+data/*.json
+packages/tracker/db/*.db
+packages/tracker/db/*.db-shm
+packages/tracker/db/*.db-wal
+packages/tracker/output/*.csv
+packages/tracker/output/*.json
+packages/tracker/checkpoints/
+packages/valuation/cache/
+packages/valuation/output/
+logs/
+
+# Install sentinel
+.install_complete
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# DXT build output
+*.dxt
+build/

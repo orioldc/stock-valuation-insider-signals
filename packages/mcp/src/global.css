@@ -1,0 +1,19 @@
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  font-family: -apple-system, system-ui, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  margin: 0;
+  padding: 0;
+  background: #0f1117;
+  color: #e1e4e8;
+}
+
+@media (prefers-color-scheme: light) {
+  html, body {
+    background: #ffffff;
+    color: #1f2937;
+  }
+}

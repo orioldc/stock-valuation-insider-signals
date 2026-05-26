@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-valuation-insider-signals"
+version = "0.1.0"
+description = "Insider-buying clusters, share-buyback signals, and DCF valuation for US equities — surfaced to Claude Desktop via MCP."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Oriol Diaz", email = "oriol.diaz@ozoneproject.com" }]
+
+# Union of deps across tracker + valuation + mcp FastAPI bridge.
+dependencies = [
+    # Core data / numerics
+    "pandas>=2.0.0",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+    # HTTP clients
+    "requests>=2.31.0",
+    "aiohttp>=3.9.0",
+    # Market data providers
+    "yfinance>=0.2.36",
+    # SEC EDGAR XBRL / Form-4 parsing
+    "lxml>=5.0.0",
+    "html5lib>=1.1",
+    # Config
+    "python-dotenv>=1.0.0",
+    # MCP FastAPI bridge runtime
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+]
+
+# Legacy alias: pip install -e .[all] still works; resolves to base deps.
+all = []
+
+[project.urls]
+Repository = "https://github.com/orioldc/stock-valuation-insider-signals"
+Issues    = "https://github.com/orioldc/stock-valuation-insider-signals/issues"
+
+# We don't ship the sub-packages as a single namespace; bridge.py uses sys.path
+# to discover them at runtime. setuptools therefore packages nothing, but `pip
+# install -e .` still wires up the deps and registers the project.
+[tool.setuptools]
+packages = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

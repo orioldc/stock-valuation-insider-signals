@@ -1,0 +1,82 @@
+name: Monthly DB snapshot
+
+# Runs once a month to rebuild the insider-signals SQLite DB and publish it
+# as a GitHub Release asset. The DXT install script pulls the latest release
+# tagged `data-YYYY-MM`.
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of every month.
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: "Optional suffix appended to the release tag (e.g. -hotfix)."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Initialize empty DB schema
+        run: |
+          mkdir -p data packages/tracker/db
+          python packages/tracker/db/init_db.py
+          # Bridge.py expects DB at data/insider_signals.db; tracker code reads
+          # via packages/tracker/db/insider_signals.db. Use a copy on CI (symlinks
+          # work on Linux but a copy is more robust for the workflow).
+          cp packages/tracker/db/insider_signals.db data/insider_signals.db
+
+      - name: Run full pipeline (~45 min)
+        timeout-minutes: 90
+        run: |
+          cd packages/tracker
+          python run_expanded_pipeline.py
+
+      - name: Sync data/ from tracker output
+        run: |
+          cp packages/tracker/db/insider_signals.db data/insider_signals.db
+          cp packages/tracker/output/latest_signals.csv data/latest_signals.csv
+
+      - name: Compress DB
+        run: |
+          # xz -9 takes ~30s for ~900MB → ~98MB.
+          xz -9 -k data/insider_signals.db
+          ls -lh data/
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          SUFFIX="${{ github.event.inputs.tag_suffix }}"
+          echo "tag=data-$(date -u +%Y-%m)${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            data/insider_signals.db.xz \
+            data/latest_signals.csv \
+            --title "Monthly DB snapshot — ${{ steps.tag.outputs.tag }}" \
+            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV. Generated automatically by the monthly-snapshot workflow."

@@ -1,0 +1,43 @@
+{
+  "name": "@fuertesito/insider-signal-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Insider Signal Tracker & Valuation Agent - MCP App Server",
+  "main": "dist/server.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit && cross-env INPUT=views/signal-scanner.html vite build && cross-env INPUT=views/valuation-card.html vite build && cross-env INPUT=views/cluster-detail.html vite build && tsc -p tsconfig.server.json && esbuild server.ts --bundle --platform=node --format=esm --outfile=dist/server.js --external:@modelcontextprotocol/sdk --external:@modelcontextprotocol/ext-apps --external:zod && esbuild main.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@modelcontextprotocol/sdk --external:@modelcontextprotocol/ext-apps --external:cors --external:express --external:zod --banner:js=\"#!/usr/bin/env node\"",
+    "dev": "cross-env NODE_ENV=development concurrently \"npm run watch\" \"npm run serve:http\"",
+    "watch": "cross-env INPUT=views/signal-scanner.html vite build --watch",
+    "serve:http": "node dist/index.js",
+    "serve:stdio": "node dist/index.js --stdio",
+    "start": "npm run start:http",
+    "start:http": "cross-env NODE_ENV=development npm run build && npm run serve:http",
+    "start:stdio": "cross-env NODE_ENV=development npm run build 1>&2 && npm run serve:stdio"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.24.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.0",
+    "@types/node": "22.10.0",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.9.3",
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.3.0"
+  }
+}

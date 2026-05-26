@@ -91,18 +91,27 @@ if [[ $SKIP_DB -eq 0 ]]; then
     else
       RELEASE_API="https://api.github.com/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG"
     fi
-    ASSET_URL="$(curl -sSL "$RELEASE_API" | grep -E '"browser_download_url".*insider_signals\.db\.xz"' | head -1 | cut -d '"' -f 4)"
-    if [[ -z "$ASSET_URL" ]]; then
+    RELEASE_JSON="$(curl -sSL "$RELEASE_API")"
+    DB_URL="$(echo "$RELEASE_JSON" | grep -E '"browser_download_url".*insider_signals\.db\.xz"' | head -1 | cut -d '"' -f 4)"
+    CSV_URL="$(echo "$RELEASE_JSON" | grep -E '"browser_download_url".*latest_signals\.csv"' | head -1 | cut -d '"' -f 4)"
+    if [[ -z "$DB_URL" ]]; then
       echo "[install] WARNING: no DB snapshot found in release $RELEASE_TAG. Skipping download."
       echo "[install]          You can rebuild from scratch with: python packages/tracker/run_expanded_pipeline.py"
     else
       mkdir -p "$REPO_ROOT/data"
-      echo "[install]   → $ASSET_URL"
-      curl -fL --progress-bar -o "$REPO_ROOT/data/insider_signals.db.xz" "$ASSET_URL"
+      echo "[install]   → $DB_URL"
+      curl -fL --progress-bar -o "$REPO_ROOT/data/insider_signals.db.xz" "$DB_URL"
       echo "[install] decompressing (this may take 30-60s) …"
       xz -dkf "$REPO_ROOT/data/insider_signals.db.xz"
       rm "$REPO_ROOT/data/insider_signals.db.xz"
       echo "[install]   → $DB_PATH"
+      if [[ -n "$CSV_URL" ]]; then
+        echo "[install]   → $CSV_URL"
+        curl -fL --progress-bar -o "$REPO_ROOT/data/latest_signals.csv" "$CSV_URL"
+        echo "[install]   → $REPO_ROOT/data/latest_signals.csv"
+      else
+        echo "[install] NOTE: latest_signals.csv not present in release; size-adjusted scanner will return empty until refresh."
+      fi
     fi
   fi
 fi

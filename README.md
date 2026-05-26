@@ -26,6 +26,16 @@ You don't need a GitHub account, an FMP API key, or any other paid service. The 
 
 ---
 
+## For AI agents
+
+If an AI assistant (Claude, ChatGPT, Cursor, etc.) is helping you install this, point it at [`MACHINE-INSTALL.md`](MACHINE-INSTALL.md) — that's the canonical scripted-install path with exit codes and recovery procedures. The one-liner version is:
+
+```
+curl -fsSL https://raw.githubusercontent.com/orioldc/stock-valuation-insider-signals/main/scripts/bootstrap.sh | bash
+```
+
+If you're a human and the rest of this README looks scary, this one-liner does the entire install for you. Open Terminal, paste, hit enter, restart Claude Desktop when it finishes.
+
 ## Install (60 seconds, no Terminal)
 
 1. **[Download the extension](https://github.com/orioldc/stock-valuation-insider-signals/releases/latest)** — click the `.mcpb` file under "Assets". The latest version always lives at the top of the [releases page](https://github.com/orioldc/stock-valuation-insider-signals/releases/latest).

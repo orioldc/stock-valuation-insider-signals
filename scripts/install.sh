@@ -18,6 +18,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SENTINEL="$REPO_ROOT/.install_complete"
 
+# ── log everything to a known location so users can find install errors ──
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/install.log"
+# tee stdout+stderr to the log file (append mode keeps history across runs)
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo
+echo "── install.sh started $(date -u +%Y-%m-%dT%H:%M:%SZ) ──"
+
+# Write a failure marker on any error so users / docs can grep for it.
+trap '
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "[install] FAILED with exit code $rc"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) exit=$rc" > "$REPO_ROOT/.install_failed"
+    echo "[install] Failure marker written: $REPO_ROOT/.install_failed"
+    echo "[install] Full log: $LOG_FILE"
+  fi
+' EXIT
+
 # ── flags ──
 FORCE=0
 DB_ONLY=0
@@ -45,11 +65,47 @@ echo "[install] repo root: $REPO_ROOT"
 # ── 1. dependencies present? ──
 if [[ $DB_ONLY -eq 0 ]]; then
   command -v python3 >/dev/null 2>&1 || {
-    echo "[install] ERROR: python3 not found. Install Python 3.11+ from https://python.org and re-run." >&2
+    cat >&2 <<EOF
+[install] ERROR: python3 not found.
+[install]   Install Python 3.11+ from https://python.org/downloads
+[install]   After installing, restart Claude Desktop (or run scripts/install.sh again).
+EOF
     exit 1
   }
+  # Validate Python version: needs 3.11+
+  PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3,11) else 0)' 2>/dev/null || echo 0)
+  if [[ "$PY_OK" != "1" ]]; then
+    PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")
+    cat >&2 <<EOF
+[install] ERROR: python3 is too old (found $PY_VER, need >=3.11).
+[install]   Install a newer Python from https://python.org/downloads
+EOF
+    exit 1
+  fi
   command -v node >/dev/null 2>&1 || {
-    echo "[install] ERROR: node not found. Install Node 20+ from https://nodejs.org and re-run." >&2
+    cat >&2 <<EOF
+[install] ERROR: node not found.
+[install]   Install Node 20+ from https://nodejs.org (LTS recommended)
+[install]   After installing, restart Claude Desktop.
+EOF
+    exit 1
+  }
+  # Validate node version: needs 20+
+  NODE_VER=$(node -p 'process.versions.node' 2>/dev/null || echo "unknown")
+  NODE_MAJOR=${NODE_VER%%.*}
+  if [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]] && (( NODE_MAJOR < 20 )); then
+    cat >&2 <<EOF
+[install] ERROR: node is too old (found $NODE_VER, need >=20).
+[install]   Install a newer Node from https://nodejs.org (LTS recommended)
+EOF
+    exit 1
+  fi
+  command -v xz >/dev/null 2>&1 || {
+    cat >&2 <<EOF
+[install] ERROR: xz not found (needed to decompress the DB snapshot).
+[install]   On macOS: brew install xz   (install Homebrew first from https://brew.sh)
+[install]   xz ships with macOS Sonoma+ by default; if you have it, you may be on an older macOS.
+EOF
     exit 1
   }
 fi
@@ -149,5 +205,6 @@ fi
 # ── 6. sentinel ──
 if [[ $DB_ONLY -eq 0 ]]; then
   touch "$SENTINEL"
+  rm -f "$REPO_ROOT/.install_failed"  # clear any stale failure marker
 fi
 echo "[install] done."

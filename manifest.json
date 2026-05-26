@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "stock-valuation-insider-signals",
   "display_name": "Stock Valuation + Insider Signals",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Insider-buying clusters, share-buyback signals, and Damodaran DCF/relative valuation for US equities.",
   "long_description": "Adds four MCP tools to Claude Desktop that surface insider-trading and corporate-action signals from a local SQLite snapshot of SEC EDGAR + Form-4 data, plus a full Damodaran-style valuation pipeline:\n\n- **get-signal-scanner** — ranks tickers by a size-adjusted composite of insider-buying clusters + share-buyback intensity. Mid-cap is the sweet spot; micro-cap is down-weighted to suppress noise.\n- **get-cluster-detail** — per-ticker view returning BOTH insider activity AND buyback status, with market-cap tier and percentile rank.\n- **get-buyback-status** — dedicated yes/no + magnitude buyback check, independent of the scanner intensity gate.\n- **run-valuation** — DCF + relative-multiples valuation with a verdict (UNDERVALUED / FAIRLY VALUED / OVERVALUED).\n\nData ships as a monthly snapshot (~98 MB compressed) downloaded from GitHub Releases on first launch. No API keys required for the default install.",
   "author": {

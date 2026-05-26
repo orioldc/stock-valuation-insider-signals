@@ -84,16 +84,36 @@ if [[ $SKIP_DB -eq 0 ]]; then
     echo "[install] DB already present at $DB_PATH (use --force to re-download)"
   else
     echo "[install] downloading DB snapshot ($RELEASE_TAG) from GitHub Releases …"
-    # Resolve the asset URL via GitHub's public anonymous API.
     REPO_SLUG="orioldc/stock-valuation-insider-signals"
+    # When "latest" is requested, find the most recent release whose tag starts
+    # with "data-" AND has the insider_signals.db.xz asset. This is more robust
+    # than the bare /releases/latest endpoint, which returns the most recently
+    # published release of ANY kind — so a code release (v0.1.x) without a DB
+    # asset would mask the actual data release.
     if [[ "$RELEASE_TAG" == "latest" ]]; then
-      RELEASE_API="https://api.github.com/repos/$REPO_SLUG/releases/latest"
+      URLS="$(curl -sSL "https://api.github.com/repos/$REPO_SLUG/releases?per_page=30" \
+        | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    if not r['tag_name'].startswith('data-') or r['draft'] or r['prerelease']:
+        continue
+    db = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider_signals.db.xz'), None)
+    if not db: continue
+    csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
+    print(db); print(csv); break
+")"
     else
-      RELEASE_API="https://api.github.com/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG"
+      URLS="$(curl -sSL "https://api.github.com/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG" \
+        | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+db = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider_signals.db.xz'), '')
+csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
+print(db); print(csv)
+")"
     fi
-    RELEASE_JSON="$(curl -sSL "$RELEASE_API")"
-    DB_URL="$(echo "$RELEASE_JSON" | grep -E '"browser_download_url".*insider_signals\.db\.xz"' | head -1 | cut -d '"' -f 4)"
-    CSV_URL="$(echo "$RELEASE_JSON" | grep -E '"browser_download_url".*latest_signals\.csv"' | head -1 | cut -d '"' -f 4)"
+    DB_URL="$(echo "$URLS" | sed -n 1p)"
+    CSV_URL="$(echo "$URLS" | sed -n 2p)"
     if [[ -z "$DB_URL" ]]; then
       echo "[install] WARNING: no DB snapshot found in release $RELEASE_TAG. Skipping download."
       echo "[install]          You can rebuild from scratch with: python packages/tracker/run_expanded_pipeline.py"

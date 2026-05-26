@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-valuation-insider-signals"
-version = "0.1.1"
+version = "0.1.2"
 description = "Insider-buying clusters, share-buyback signals, and DCF valuation for US equities — surfaced to Claude Desktop via MCP."
 readme = "README.md"
 requires-python = ">=3.11"

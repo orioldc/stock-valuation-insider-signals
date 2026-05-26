@@ -1,8 +1,17 @@
 name: Monthly DB snapshot
 
-# Runs once a month to rebuild the insider-signals SQLite DB and publish it
-# as a GitHub Release asset. The DXT install script pulls the latest release
+# Runs monthly to refresh the insider-signals SQLite DB and publish it as a
+# GitHub Release asset. The MCPB install script pulls the latest release
 # tagged `data-YYYY-MM`.
+#
+# Default mode is INCREMENTAL: downloads the previous month's DB from the
+# latest release, runs refresh.py to ingest only new Form 4 filings + recompute
+# scores, then publishes a new release. This is much cheaper (~5-10 min) than
+# a from-scratch rebuild and avoids re-fetching ~1.8M Form 4s every month.
+#
+# `force_full_rebuild: true` on manual dispatch falls back to the slow path
+# (run_expanded_pipeline.py, ~45-60 min) for cases where the prior DB is
+# corrupted or the schema changed.
 
 on:
   schedule:
@@ -14,6 +23,11 @@ on:
         description: "Optional suffix appended to the release tag (e.g. -hotfix)."
         required: false
         default: ""
+      force_full_rebuild:
+        description: "Rebuild the DB from scratch instead of incremental refresh."
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -39,30 +53,63 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
-      - name: Initialize empty DB schema
+      # ── Path A: incremental (default) ──
+      - name: Seed DB from previous release (incremental mode)
+        if: ${{ github.event.inputs.force_full_rebuild != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data packages/tracker/db
+          # Find the latest release whose tag starts with data-
+          PREV_TAG=$(gh release list --repo ${{ github.repository }} --json tagName --jq '[.[] | .tagName | select(startswith("data-"))][0]')
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous data-* release found; falling back to fresh init"
+            python packages/tracker/db/init_db.py
+            cp packages/tracker/db/insider_signals.db data/insider_signals.db
+          else
+            echo "Seeding from previous release: $PREV_TAG"
+            gh release download "$PREV_TAG" --repo ${{ github.repository }} --pattern "insider_signals.db.xz" --dir data/
+            xz -d data/insider_signals.db.xz
+            # tracker code reads from packages/tracker/db/; mirror it there
+            cp data/insider_signals.db packages/tracker/db/insider_signals.db
+            echo "Seeded DB size:"
+            ls -lh data/insider_signals.db packages/tracker/db/insider_signals.db
+          fi
+
+      - name: Run incremental refresh (~5-15 min)
+        if: ${{ github.event.inputs.force_full_rebuild != 'true' }}
+        timeout-minutes: 60
+        run: |
+          cd packages/tracker
+          python refresh.py --expanded --skip-sectors
+
+      # ── Path B: full rebuild (only if force_full_rebuild=true) ──
+      - name: Initialize empty DB schema (full rebuild mode)
+        if: ${{ github.event.inputs.force_full_rebuild == 'true' }}
         run: |
           mkdir -p data packages/tracker/db
           python packages/tracker/db/init_db.py
-          # Bridge.py expects DB at data/insider_signals.db; tracker code reads
-          # via packages/tracker/db/insider_signals.db. Use a copy on CI (symlinks
-          # work on Linux but a copy is more robust for the workflow).
           cp packages/tracker/db/insider_signals.db data/insider_signals.db
 
-      - name: Run full pipeline (~45 min)
+      - name: Run full pipeline (~45-60 min)
+        if: ${{ github.event.inputs.force_full_rebuild == 'true' }}
         timeout-minutes: 90
         run: |
           cd packages/tracker
           python run_expanded_pipeline.py
 
+      # ── Common: sync, compress, publish ──
       - name: Sync data/ from tracker output
         run: |
           cp packages/tracker/db/insider_signals.db data/insider_signals.db
-          cp packages/tracker/output/latest_signals.csv data/latest_signals.csv
+          if [ -f packages/tracker/output/latest_signals.csv ]; then
+            cp packages/tracker/output/latest_signals.csv data/latest_signals.csv
+          fi
 
       - name: Compress DB
         run: |
-          # xz -9 takes ~30s for ~900MB → ~98MB.
-          xz -9 -k data/insider_signals.db
+          # xz -9 -T0 (multi-threaded) takes ~1 min for ~900MB → ~98MB.
+          xz -9 -T0 -k data/insider_signals.db
           ls -lh data/
 
       - name: Compute release tag
@@ -75,8 +122,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          MODE="incremental"
+          if [ "${{ github.event.inputs.force_full_rebuild }}" = "true" ]; then
+            MODE="full rebuild"
+          fi
           gh release create "${{ steps.tag.outputs.tag }}" \
             data/insider_signals.db.xz \
             data/latest_signals.csv \
+            --repo ${{ github.repository }} \
             --title "Monthly DB snapshot — ${{ steps.tag.outputs.tag }}" \
-            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV. Generated automatically by the monthly-snapshot workflow."
+            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV. Generated automatically by the monthly-snapshot workflow ($MODE mode)."

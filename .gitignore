@@ -46,6 +46,7 @@ Thumbs.db
 .idea/
 *.swp
 
-# DXT build output
+# MCPB (DXT) build output
+*.mcpb
 *.dxt
 build/

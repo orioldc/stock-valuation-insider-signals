@@ -11,7 +11,7 @@ Ask Claude things like:
 ## Install (60 seconds, no Terminal)
 
 1. **Install Claude Desktop** from [anthropic.com/download](https://www.anthropic.com/download) if you don't have it yet.
-2. **Download the latest** `stock-valuation-insider-signals.dxt` from the [Releases page](https://github.com/orioldc/stock-valuation-insider-signals/releases).
+2. **Download the latest** `stock-valuation-insider-signals.mcpb` from the [Releases page](https://github.com/orioldc/stock-valuation-insider-signals/releases).
 3. **Double-click the file**. Claude Desktop will register the extension and download a ~98 MB data snapshot in the background. First launch takes 2–3 minutes; later launches are instant.
 
 That's it. Ask Claude any of the questions above.
@@ -92,7 +92,7 @@ Then `curl http://localhost:8502/health` to confirm the backend is up, or browse
 
 ```
 stock-valuation-insider-signals/
-├── manifest.json                    # DXT manifest for Claude Desktop
+├── manifest.json                    # MCPB (Claude Desktop) manifest
 ├── pyproject.toml                   # unified Python project
 ├── packages/
 │   ├── tracker/                     # signal pipeline + SQLite schema

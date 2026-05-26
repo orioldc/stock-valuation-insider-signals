@@ -1,0 +1,49 @@
+# Local virtualenv (created at install time)
+.venv/
+venv/
+*.egg-info/
+
+# Node deps (installed at install time)
+**/node_modules/
+
+# Python bytecode
+**/__pycache__/
+*.py[cod]
+
+# Data files (downloaded at install time from GitHub Releases)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db.xz
+data/*.csv
+data/*.json
+packages/tracker/db/*.db
+packages/tracker/db/*.db-shm
+packages/tracker/db/*.db-wal
+packages/tracker/output/
+packages/tracker/checkpoints/
+packages/tracker/bulk_data/
+
+# Caches built up over use
+packages/valuation/cache/
+packages/valuation/output/
+
+# Local install state
+.install_complete
+logs/
+
+# Source control & editor cruft
+.git/
+.gitignore
+.gitattributes
+.github/
+.DS_Store
+.vscode/
+.idea/
+
+# Vite build intermediates (we ship dist/ but not the cache)
+packages/mcp/.vite/
+
+# Other archive artifacts (don't bundle prior bundles)
+*.mcpb
+*.dxt

@@ -43,7 +43,11 @@ def _parse_sec_date(d):
         try:
             return datetime.strptime(d, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            return None
+            # YY-MM-DD (2-digit year, e.g. "24-05-23" -> "2024-05-23")
+            try:
+                return datetime.strptime(d, "%y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return None
 
 
 def _read_tsv_from_zip(zip_path, tsv_name):

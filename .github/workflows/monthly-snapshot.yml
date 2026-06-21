@@ -28,6 +28,11 @@ on:
         type: boolean
         required: false
         default: false
+      backfill_current_quarter:
+        description: "Backfill the current quarter's Form 4 filings for the full universe via live XML (slow, ~1-2h)."
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -35,7 +40,7 @@ permissions:
 jobs:
   build-snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
       PYTHONUNBUFFERED: "1"
@@ -75,6 +80,13 @@ jobs:
             echo "Seeded DB size:"
             ls -lh data/insider_signals.db packages/tracker/db/insider_signals.db
           fi
+
+      - name: Backfill current quarter (full-universe live XML)
+        if: ${{ github.event.inputs.force_full_rebuild != 'true' && github.event.inputs.backfill_current_quarter == 'true' }}
+        timeout-minutes: 240
+        run: |
+          cd packages/tracker
+          python backfill_quarter_live.py
 
       - name: Run incremental refresh (~5-15 min)
         if: ${{ github.event.inputs.force_full_rebuild != 'true' }}
@@ -130,5 +142,5 @@ jobs:
             data/insider_signals.db.xz \
             data/latest_signals.csv \
             --repo ${{ github.repository }} \
-            --title "Monthly DB snapshot — ${{ steps.tag.outputs.tag }}" \
+            --title "Monthly DB snapshot: ${{ steps.tag.outputs.tag }}" \
             --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV. Generated automatically by the monthly-snapshot workflow ($MODE mode)."

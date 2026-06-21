@@ -27,6 +27,9 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.d
 BULK_DIR = os.path.join(os.path.dirname(__file__), "..", "bulk_data")
 CHECKPOINT_FILE = os.path.join(BULK_DIR, "ingested_quarters.json")
 
+# SEC fair-access policy requires a descriptive UA with contact info.
+SEC_USER_AGENT = "stock-valuation-insider-signals oriol.diaz@ozoneproject.com"
+
 
 def _parse_sec_date(d):
     """Parse SEC date format (DD-MON-YYYY or YYYY-MM-DD) to YYYY-MM-DD."""
@@ -259,7 +262,7 @@ def download_quarter(year, quarter, use_wayback=False):
     if use_wayback:
         urls.append(f"https://web.archive.org/web/2026/https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/{filename}")
     
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    headers = {"User-Agent": SEC_USER_AGENT}
     
     for url in urls:
         try:

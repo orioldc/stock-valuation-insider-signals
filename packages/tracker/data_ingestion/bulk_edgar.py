@@ -288,27 +288,49 @@ def ingest_all_bulk(start_year=2020, ticker_filter=None, force=False):
         force: Re-ingest already-processed quarters
     """
     ingested_set = _load_checkpoint() if not force else set()
-    
+
     end_year = datetime.now().year
     end_quarter = (datetime.now().month - 1) // 3 + 1
-    
+    current_key = f"{end_year}q{end_quarter}"
+
     total_txns = 0
     results = []
-    
+
     for year in range(start_year, end_year + 1):
         max_q = end_quarter if year == end_year else 4
         for q in range(1, max_q + 1):
             key = f"{year}q{q}"
-            
-            if key in ingested_set and not force:
+            is_current = (key == current_key)
+
+            # The current (open) quarter is still being published by SEC, so never
+            # skip it and always pull a fresh copy from live SEC (not Wayback).
+            if key in ingested_set and not force and not is_current:
                 logger.info(f"Skipping {key} (already ingested)")
                 continue
-            
-            # Download if needed
+
             zip_path = os.path.join(BULK_DIR, f"{key}_form345.zip")
-            if not os.path.exists(zip_path):
+            if is_current:
+                # The open quarter is still being published; always fetch fresh from live SEC.
+                # Rename the stale copy aside so download_quarter can write to zip_path,
+                # then remove the backup only after a successful download.
+                stale_path = zip_path + ".stale"
+                # Recover from a prior interrupted run that left only the .stale backup.
+                if os.path.exists(stale_path) and not os.path.exists(zip_path):
+                    os.rename(stale_path, zip_path)
+                if os.path.exists(zip_path):
+                    os.rename(zip_path, stale_path)
+                download_quarter(year, q, use_wayback=False)
+                if os.path.exists(zip_path):
+                    # Fresh download succeeded; discard the stale backup.
+                    if os.path.exists(stale_path):
+                        os.remove(stale_path)
+                elif os.path.exists(stale_path):
+                    # Download failed; restore the stale copy so ingest can still proceed.
+                    logger.warning(f"Live SEC download failed for {key}; falling back to cached copy")
+                    os.rename(stale_path, zip_path)
+            elif not os.path.exists(zip_path):
                 download_quarter(year, q, use_wayback=True)
-            
+
             if not os.path.exists(zip_path):
                 results.append({"quarter": key, "status": "download_failed"})
                 continue

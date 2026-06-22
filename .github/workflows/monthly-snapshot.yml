@@ -81,6 +81,13 @@ jobs:
             ls -lh data/insider_signals.db packages/tracker/db/insider_signals.db
           fi
 
+      - name: Migrate transaction dedup constraint
+        if: ${{ github.event.inputs.force_full_rebuild != 'true' }}
+        timeout-minutes: 15
+        run: |
+          cd packages/tracker
+          python migrate_txn_dedup.py
+
       - name: Backfill current quarter (full-universe live XML)
         if: ${{ github.event.inputs.force_full_rebuild != 'true' && github.event.inputs.backfill_current_quarter == 'true' }}
         timeout-minutes: 240

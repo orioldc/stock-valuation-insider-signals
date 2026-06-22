@@ -20,6 +20,7 @@ import argparse
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_ingestion"))
 
 from data_ingestion.data_loader import get_db
 from data_ingestion.edgar_client import fetch_form4_filings, parse_form4_xml, get_rate_stats

@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS insider_transactions (
     source TEXT DEFAULT 'FMP',
     raw_json TEXT,
     created_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(company_id, transaction_date, reporting_cik, shares_transacted)
+    UNIQUE(company_id, transaction_date, reporting_cik, transaction_type, shares_transacted)
 );
 
 CREATE TABLE IF NOT EXISTS shares_outstanding (

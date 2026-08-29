@@ -109,11 +109,40 @@ export function createServer(): McpServer {
         .map(([t, n]) => `${t}=${n}`)
         .join(", ");
 
+      const fmtInsiders = (s: any) => {
+        const numInsiders = s.num_insiders;
+        const numTrades = s.num_trades ?? 0;
+        if (typeof numInsiders === "number") {
+          return `${numInsiders} insiders, ${numTrades} trades`;
+        }
+        return `${numTrades} trades`;
+      };
+
+      // Extract snapshot metadata from first signal (all rows share the same snapshot)
+      let snapshotLine = "";
+      if (signals.length > 0) {
+        const first = signals[0];
+        const release = first.release ?? null;
+        const asOf = first.as_of ?? null;
+        const ageDays = first.age_days ?? null;
+        if (release && asOf) {
+          snapshotLine = `Snapshot: ${release} (${asOf}`;
+          if (typeof ageDays === "number") {
+            snapshotLine += `, ${ageDays} days old`;
+          }
+          snapshotLine += ")\n";
+        } else if (release) {
+          snapshotLine = `Snapshot: ${release}\n`;
+        }
+      }
+
       const top = signals
         .slice(0, 10)
         .map(
           (s: any) =>
-            `  ${s.ticker} [${s.tier ?? "?"}] composite=${(s.composite_score ?? 0).toFixed(2)} (insider ${(s.cluster_adjusted ?? 0).toFixed(2)}, buyback ${(s.buyback_adjusted ?? 0).toFixed(2)})`,
+            `  ${s.ticker} [${s.tier ?? "?"}] composite=${(s.composite_score ?? 0).toFixed(2)} ` +
+            `(insider ${(s.cluster_adjusted ?? 0).toFixed(2)}, buyback ${(s.buyback_adjusted ?? 0).toFixed(2)}) — ` +
+            `${fmtInsiders(s)}`,
         )
         .join("\n");
 
@@ -122,6 +151,7 @@ export function createServer(): McpServer {
         `mid-cap is the sweet spot, micro-cap is down-weighted to suppress noise). ` +
         `${clusters} have an insider-buying cluster.\n` +
         `Tier mix: ${tierLine}\n` +
+        snapshotLine +
         (top ? `Top:\n${top}` : "");
 
       return {
@@ -152,9 +182,9 @@ export function createServer(): McpServer {
       title: "Per-ticker insider buying + share-buyback report",
       description:
         "For a given stock ticker, returns BOTH (a) insider open-market buying activity " +
-        "(Form 4 P-code transactions, cluster detection, score, individual trades) AND " +
-        "(b) share-buyback status (trailing-4Q and QoQ shares-outstanding delta, trend label, " +
-        "whether ANY buyback is occurring regardless of intensity). " +
+        "(Form 4 P-code transactions, 90-day cluster detection, score, individual trades, " +
+        "plus all-time activity summary) AND (b) share-buyback status (trailing-4Q and QoQ " +
+        "shares-outstanding delta, trend label, whether ANY buyback is occurring regardless of intensity). " +
         "Use this whenever you want to know if a ticker has insider buying OR buybacks. " +
         "Renders a UI card; the text body always summarizes both signals so the LLM sees them in context.",
       inputSchema: ClusterDetailInputSchema.shape,
@@ -191,17 +221,62 @@ export function createServer(): McpServer {
           `tier-percentile ${(bbPct * 100).toFixed(0)}, relevance=${bbRelevance.toFixed(2)})`
         : "Buyback: no data";
 
-      const insiderLine =
-        `Insider cluster: ${detected ? "yes" : "no"} (raw score ${score.toFixed(1)}, ` +
-        `tier-percentile ${(clusterPct * 100).toFixed(0)}, relevance=${clusterRelevance.toFixed(2)}), ` +
-        `${insiders} unique insider buyers, $${(totalValue / 1000).toFixed(0)}K total open-market purchases`;
+      // 90-day cluster verdict
+      const clusterLine =
+        `Insider cluster (90-day rolling window): ${detected ? "yes" : "no"} ` +
+        `(raw score ${score.toFixed(1)}, tier-percentile ${(clusterPct * 100).toFixed(0)}, ` +
+        `relevance=${clusterRelevance.toFixed(2)})`;
+
+      // Lifetime activity
+      const dateRange = summary.date_range;
+      const rangeStr = dateRange?.earliest && dateRange?.latest
+        ? ` (${dateRange.earliest} to ${dateRange.latest})`
+        : "";
+      const activityLine =
+        `All-time insider activity${rangeStr}: ${insiders} unique buyers, ` +
+        `$${(totalValue / 1000).toFixed(0)}K total open-market purchases`;
+
+      // Snapshot verdict (if present)
+      const frozen = cluster.frozen;
+      const frozenLines: string[] = [];
+      if (frozen?.in_snapshot) {
+        const snapshotDetected = frozen.cluster_detected ?? false;
+        const release = frozen.release ?? "snapshot";
+        const asOf = frozen.as_of ?? null;
+        const asOfSource = frozen.as_of_source ?? "file_mtime";
+        const ageDays = frozen.age_days ?? null;
+
+        let snapshotPrefix = `Monthly snapshot ${release}`;
+        if (asOf) {
+          const datePhrase = asOfSource === "release_published_at" ? "built" : "snapshot file dated";
+          snapshotPrefix += ` (${datePhrase} ${asOf}`;
+          if (typeof ageDays === "number") {
+            snapshotPrefix += `, ${ageDays} days old`;
+          }
+          snapshotPrefix += ")";
+        } else if (typeof ageDays === "number") {
+          snapshotPrefix += ` (${ageDays} days old)`;
+        }
+
+        if (snapshotDetected !== detected) {
+          const verb = detected ? "newly appeared" : "expired";
+          frozenLines.push(
+            `${snapshotPrefix}: cluster was ${snapshotDetected ? "detected" : "not detected"}; ` +
+            `signal has since ${verb}`
+          );
+        } else {
+          frozenLines.push(`${snapshotPrefix}: cluster ${snapshotDetected ? "detected" : "not detected"}`);
+        }
+      }
 
       const salient =
         bb.is_buyback || detected || clusterRelevance >= 0.5 || bbRelevance >= 0.5;
       const text = [
         `${upper} signal summary${salient ? " (relevant signal present)" : ""}:`,
         `- ${sizeLine}`,
-        `- ${insiderLine}`,
+        `- ${clusterLine}`,
+        `- ${activityLine}`,
+        ...frozenLines.map(l => `- ${l}`),
         `- ${buybackLine}`,
       ].join("\n");
 

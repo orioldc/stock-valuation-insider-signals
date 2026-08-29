@@ -16,7 +16,7 @@ interface ValuationData {
   growth_rate?: number;
   terminal_growth_rate?: number;
   risk_flags?: string[];
-  insider_signal?: { cluster_detected?: boolean; cluster_score?: number; insider_count?: number };
+  insider_signal?: { cluster_detected?: boolean; conviction_score?: number; insider_count?: number };
   verdict?: string;
 }
 
@@ -202,7 +202,7 @@ function Card({ data, hostContext, onReset }: { data: ValuationData; hostContext
           <h2 className={styles.sectionTitle}>Insider Signal</h2>
           <div className={styles.insiderInfo}>
             {data.insider_signal.cluster_detected && <span className={styles.clusterBadge}>🔥 Cluster</span>}
-            {data.insider_signal.cluster_score != null && <span>Score: {data.insider_signal.cluster_score.toFixed(1)}</span>}
+            {data.insider_signal.conviction_score != null && <span>Conviction: {data.insider_signal.conviction_score.toFixed(1)}</span>}
             {data.insider_signal.insider_count != null && <span>{data.insider_signal.insider_count} insiders</span>}
           </div>
         </div>

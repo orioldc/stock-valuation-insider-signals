@@ -50,6 +50,8 @@ def score_universe(tickers, date=None):
         cluster = detect_clusters(ticker)
         share = compute_share_delta(ticker)
         mcap = mcaps.get(ticker)
+        # cluster_details counts trades; cluster_insiders counts distinct people
+        distinct_ciks = set(detail["cik"] for detail in cluster["details"])
         results.append({
             "ticker": ticker,
             "market_cap": mcap,
@@ -57,6 +59,7 @@ def score_universe(tickers, date=None):
             "cluster_detected": cluster["cluster_detected"],
             "cluster_score_raw": cluster["score"],
             "cluster_details": len(cluster["details"]),
+            "cluster_insiders": len(distinct_ciks),
             "share_delta_qoq": share["delta_qoq"],
             "share_delta_4q": share["delta_4q"],
             "share_trend": share["trend"],

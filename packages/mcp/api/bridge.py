@@ -49,6 +49,104 @@ from signals.size_adjustment import (
 # Refreshed when the underlying CSV mtime changes.
 _UNIVERSE_CACHE: dict = {"loaded_at": 0.0, "csv_mtime": 0.0, "by_tier": None, "by_ticker": None}
 
+# GitHub release cache (memoized for ~6 hours to avoid hammering the API)
+# Maps {tag_name: published_at_date} for all data-* releases, plus latest_tag
+_GITHUB_RELEASE_CACHE: dict = {"fetched_at": 0.0, "latest_tag": None, "tag_dates": {}}
+
+
+def _fetch_github_releases() -> None:
+    """Fetch data-* releases from GitHub and cache {tag_name: published_at_date}.
+
+    Updates the global cache with latest_tag and tag_dates map.
+    Success cache: 6 hours. Failure cache: 5 minutes.
+    """
+    now = time.time()
+    # Check cache (6 hours = 21600 seconds on success, 5 min = 300s on failure)
+    cached_at = _GITHUB_RELEASE_CACHE.get("fetched_at", 0)
+    if now - cached_at < 21600 and _GITHUB_RELEASE_CACHE.get("latest_tag") is not None:
+        return  # Fresh success cache
+    if now - cached_at < 300:
+        return  # Recent failure, don't retry yet
+
+    try:
+        import urllib.request
+        url = "https://api.github.com/repos/orioldc/stock-valuation-insider-signals/releases?per_page=30"
+        req = urllib.request.Request(url, headers={"User-Agent": "insider-signal-mcp"})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            releases = json.loads(response.read())
+
+        # Build {tag_name: YYYY-MM-DD} map for all data-* releases
+        tag_dates = {}
+        data_tags = []
+        for r in releases:
+            tag = r.get("tag_name", "")
+            if tag.startswith("data-"):
+                data_tags.append(tag)
+                # published_at is ISO timestamp, extract date portion
+                published = r.get("published_at", "")
+                if published:
+                    tag_dates[tag] = published[:10]  # "YYYY-MM-DD"
+
+        latest = data_tags[0] if data_tags else None
+        _GITHUB_RELEASE_CACHE["fetched_at"] = now
+        _GITHUB_RELEASE_CACHE["latest_tag"] = latest
+        _GITHUB_RELEASE_CACHE["tag_dates"] = tag_dates
+    except Exception:
+        # Negative-cache failures for 5 minutes
+        _GITHUB_RELEASE_CACHE["fetched_at"] = now
+
+
+def _snapshot_metadata(release_tag: str = None) -> dict:
+    """Return snapshot metadata: as_of (YYYY-MM-DD), age_days, as_of_source.
+
+    Prefers the release tag's published_at from GitHub API (cached).
+    Falls back to CSV file mtime when tag or API result unavailable.
+    Returns None fields if both are unavailable.
+    """
+    # Try release-published date first
+    _fetch_github_releases()
+    tag_dates = _GITHUB_RELEASE_CACHE.get("tag_dates", {})
+
+    if release_tag and release_tag in tag_dates:
+        as_of_str = tag_dates[release_tag]
+        as_of_dt = datetime.strptime(as_of_str, "%Y-%m-%d")
+        age_days = (datetime.now() - as_of_dt).days
+        return {
+            "release": release_tag,
+            "as_of": as_of_str,
+            "as_of_source": "release_published_at",
+            "age_days": age_days,
+        }
+
+    # Fall back to file mtime
+    if os.path.exists(SIGNALS_CSV):
+        mtime = os.path.getmtime(SIGNALS_CSV)
+        as_of_dt = datetime.fromtimestamp(mtime)
+        age_days = (datetime.now() - as_of_dt).days
+        return {
+            "release": release_tag,
+            "as_of": as_of_dt.strftime("%Y-%m-%d"),
+            "as_of_source": "file_mtime",
+            "age_days": age_days,
+        }
+
+    # No data available
+    return {
+        "release": release_tag,
+        "as_of": None,
+        "as_of_source": "unavailable",
+        "age_days": None,
+    }
+
+
+def _get_installed_release() -> str | None:
+    """Read installed release tag from data/.data_release. Returns None if missing."""
+    release_file = os.path.join(_REPO_ROOT, "data", ".data_release")
+    if os.path.exists(release_file):
+        with open(release_file) as f:
+            return f.read().strip()
+    return None
+
 
 def _load_universe() -> dict:
     """Load (ticker → {mcap, tier, raw_cluster, raw_share}) + per-tier score arrays.
@@ -95,9 +193,17 @@ def _load_universe() -> dict:
             raw_share = float(r.get("share_score_raw") or 0)
         except ValueError:
             raw_share = 0.0
+        cluster_detected_str = r.get("cluster_detected", "").lower()
+        cluster_detected = cluster_detected_str == "true"
+        try:
+            cluster_adj = float(r.get("cluster_adj") or 0)
+        except ValueError:
+            cluster_adj = 0.0
         by_ticker[ticker] = {
             "mcap": mcap, "tier": tier,
             "raw_cluster": raw_cluster, "raw_share": raw_share,
+            "cluster_detected": cluster_detected,
+            "cluster_adj": cluster_adj,
         }
         if tier in by_tier_cluster:
             by_tier_cluster[tier].append(raw_cluster)
@@ -173,6 +279,10 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
     if not os.path.exists(SIGNALS_CSV):
         return []
 
+    # Get snapshot metadata (prefer release published_at over file mtime)
+    release_tag = _get_installed_release()
+    snapshot_meta = _snapshot_metadata(release_tag)
+
     # Read CSV
     with open(SIGNALS_CSV) as f:
         reader = csv.DictReader(f)
@@ -203,11 +313,22 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
         if sector and co.get("sector", "").lower() != sector.lower():
             continue
 
+        # cluster_details = trade count; cluster_insiders = distinct CIK count
         cluster_details = r.get("cluster_details", "0")
         try:
-            num_insiders = int(cluster_details) if cluster_details else 0
+            num_trades = int(cluster_details) if cluster_details else 0
         except ValueError:
-            num_insiders = 0
+            num_trades = 0
+
+        cluster_insiders = r.get("cluster_insiders")
+        if cluster_insiders:
+            try:
+                num_insiders = int(cluster_insiders)
+            except ValueError:
+                num_insiders = None
+        else:
+            # Column absent (all pre-2026-08 releases): return None, not the trade count
+            num_insiders = None
 
         raw_cluster = float(r.get("cluster_score_raw", 0) or 0)
         raw_share = float(r.get("share_score_raw", 0) or 0)
@@ -231,8 +352,13 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
             "buyback_score": raw_share,
             "buyback_adjusted": sa["share_adjusted"],
             "cluster_detected": cluster_detected,
+            "num_trades": num_trades,
             "num_insiders": num_insiders,
             "total_insider_value": None,
+            "release": snapshot_meta["release"],
+            "as_of": snapshot_meta["as_of"],
+            "as_of_source": snapshot_meta["as_of_source"],
+            "age_days": snapshot_meta["age_days"],
         })
 
     results.sort(key=lambda x: x["composite_score"], reverse=True)
@@ -335,6 +461,35 @@ def get_cluster(ticker):
     mcap = bb.get("market_cap")
     sa = _size_adjust(ticker, raw_cluster=raw_cluster, raw_share=0.0, mcap=mcap)
 
+    # Build frozen snapshot block from the CSV data loaded by _load_universe
+    universe = _load_universe()
+    frozen_entry = universe["by_ticker"].get(ticker)
+    release_tag = _get_installed_release()
+    snapshot_meta = _snapshot_metadata(release_tag)
+
+    if frozen_entry:
+        frozen = {
+            "in_snapshot": True,
+            "cluster_detected": frozen_entry.get("cluster_detected"),
+            "score_raw": frozen_entry.get("raw_cluster"),
+            "cluster_adjusted": frozen_entry.get("cluster_adj"),
+            "release": snapshot_meta["release"],
+            "as_of": snapshot_meta["as_of"],
+            "as_of_source": snapshot_meta["as_of_source"],
+            "age_days": snapshot_meta["age_days"],
+        }
+    else:
+        frozen = {
+            "in_snapshot": False,
+            "cluster_detected": None,
+            "score_raw": None,
+            "cluster_adjusted": None,
+            "release": snapshot_meta["release"],
+            "as_of": snapshot_meta["as_of"],
+            "as_of_source": snapshot_meta["as_of_source"],
+            "age_days": snapshot_meta["age_days"],
+        }
+
     return {
         "ticker": ticker,
         "cluster_detected": result["cluster_detected"],
@@ -348,6 +503,7 @@ def get_cluster(ticker):
         "market_cap": mcap,
         "trades": trade_list,
         "buyback": bb,
+        "frozen": frozen,
     }
 
 
@@ -473,10 +629,19 @@ def _build_summary_text(p):
     if insider:
         lines.append("")
         lines.append("## Insider Signal")
-        lines.append(
-            f"Cluster detected: {insider.get('cluster_detected')}  |  "
-            f"Score: {insider.get('cluster_score')}  |  Insiders: {insider.get('insider_count')}"
-        )
+        parts = [f"Cluster detected: {insider.get('cluster_detected')}"]
+        if insider.get("conviction_score") is not None:
+            parts.append(f"Conviction: {insider['conviction_score']:.1f}")
+        if insider.get("quality"):
+            parts.append(f"Quality: {insider['quality']}")
+        if insider.get("insider_count") is not None:
+            parts.append(f"Insiders: {insider['insider_count']}")
+        if insider.get("latest_transaction_date"):
+            parts.append(f"Latest trade: {insider['latest_transaction_date']}")
+        lines.append("  |  ".join(parts))
+        # Add snapshot vintage line if available
+        if insider.get("release") and insider.get("as_of"):
+            lines.append(f"Snapshot: {insider['release']} as of {insider['as_of']}")
     if p.get("errors"):
         lines.append("")
         lines.append("## Warnings")
@@ -539,10 +704,30 @@ def run_valuation(ticker):
     }
 
     if insider:
+        # Frozen snapshot keys: conviction_score, n_insiders, quality, total_value, latest_transaction_date
+        # Live fetcher fallback keys: cluster_score/score, num_insiders/unique_insiders
+        # Use explicit is-not-None checks to avoid treating 0 as missing
+        conviction = insider.get("conviction_score")
+        if conviction is None:
+            conviction = insider.get("cluster_score")
+        if conviction is None:
+            conviction = insider.get("score")
+        conviction = _to_native(conviction)
+
+        insider_count = insider.get("n_insiders")
+        if insider_count is None:
+            insider_count = insider.get("num_insiders")
+        if insider_count is None:
+            insider_count = insider.get("unique_insiders")
+        insider_count = _to_native(insider_count)
+
         payload["insider_signal"] = {
             "cluster_detected": bool(insider.get("cluster_detected")),
-            "cluster_score": _to_native(insider.get("cluster_score") or insider.get("score")),
-            "insider_count": _to_native(insider.get("num_insiders") or insider.get("unique_insiders")),
+            "conviction_score": conviction,
+            "insider_count": insider_count,
+            "quality": insider.get("quality"),
+            "total_value": _to_native(insider.get("total_value")),
+            "latest_transaction_date": insider.get("latest_transaction_date"),
         }
 
     payload["summary_text"] = _build_summary_text(payload)
@@ -604,4 +789,39 @@ def get_health():
         with open(SIGNALS_CSV) as f:
             stats["signals_count"] = sum(1 for _ in f) - 1
     conn.close()
+
+    # Snapshot block: installed vs. latest release
+    release_tag = _get_installed_release()
+    meta = _snapshot_metadata(release_tag)
+
+    # Fetch latest release from GitHub (cached, non-blocking)
+    _fetch_github_releases()
+    latest = _GITHUB_RELEASE_CACHE.get("latest_tag")
+
+    # Compute releases_behind (None if either tag is missing)
+    releases_behind = None
+    if release_tag and latest:
+        try:
+            # Extract YYYY-MM from "data-YYYY-MM" tags
+            installed_parts = release_tag.split("-")
+            latest_parts = latest.split("-")
+            if len(installed_parts) == 3 and len(latest_parts) == 3:
+                installed_ym = (int(installed_parts[1]), int(installed_parts[2]))
+                latest_ym = (int(latest_parts[1]), int(latest_parts[2]))
+                # Rough month diff (ignores day precision)
+                months_behind = (latest_ym[0] - installed_ym[0]) * 12 + (latest_ym[1] - installed_ym[1])
+                releases_behind = max(0, months_behind)
+        except (ValueError, IndexError):
+            pass
+
+    snapshot = {
+        "installed_release": release_tag,
+        "as_of": meta["as_of"],
+        "as_of_source": meta["as_of_source"],
+        "age_days": meta["age_days"],
+        "latest_release": latest,
+        "releases_behind": releases_behind,
+    }
+
+    stats["snapshot"] = snapshot
     return stats

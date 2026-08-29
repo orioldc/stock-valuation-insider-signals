@@ -19,6 +19,7 @@ data/*.db-wal
 data/*.db.xz
 data/*.csv
 data/*.json
+data/.data_release
 packages/tracker/db/*.db
 packages/tracker/db/*.db-shm
 packages/tracker/db/*.db-wal

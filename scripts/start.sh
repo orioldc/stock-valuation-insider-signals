@@ -22,6 +22,27 @@ PORT="${MCP_API_PORT:-8502}"
 LOG_DIR="$REPO_ROOT/logs"
 mkdir -p "$LOG_DIR"
 
+# Check for stale data snapshot (non-fatal, warn only).
+if [[ -f "$REPO_ROOT/data/.data_release" ]]; then
+  INSTALLED_TAG="$(cat "$REPO_ROOT/data/.data_release" 2>/dev/null || echo "")"
+  if [[ -n "$INSTALLED_TAG" ]]; then
+    LATEST_TAG="$(curl -m 3 -sSL "https://api.github.com/repos/orioldc/stock-valuation-insider-signals/releases?per_page=30" 2>/dev/null \
+      | python3 -c "
+import json, sys
+try:
+    for r in json.load(sys.stdin):
+        if r.get('tag_name', '').startswith('data-') and not r.get('draft') and not r.get('prerelease'):
+            print(r['tag_name'])
+            break
+except: pass
+" 2>/dev/null || echo "")"
+    if [[ -n "$LATEST_TAG" && "$INSTALLED_TAG" != "$LATEST_TAG" ]]; then
+      echo "[start] WARNING: data snapshot is behind (installed=$INSTALLED_TAG, latest=$LATEST_TAG)" >&2
+      echo "[start]   Run: bash scripts/install.sh --db-only --force" >&2
+    fi
+  fi
+fi
+
 # Start FastAPI bridge if not already on PORT.
 if ! lsof -ti:"$PORT" >/dev/null 2>&1; then
   echo "[start] launching FastAPI on :$PORT …" >&2

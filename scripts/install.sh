@@ -147,7 +147,7 @@ if [[ $SKIP_DB -eq 0 ]]; then
     # published release of ANY kind — so a code release (v0.1.x) without a DB
     # asset would mask the actual data release.
     if [[ "$RELEASE_TAG" == "latest" ]]; then
-      URLS="$(curl -sSL "https://api.github.com/repos/$REPO_SLUG/releases?per_page=30" \
+      RELEASE_INFO="$(curl -sSL "https://api.github.com/repos/$REPO_SLUG/releases?per_page=30" \
         | python3 -c "
 import json, sys
 for r in json.load(sys.stdin):
@@ -156,9 +156,13 @@ for r in json.load(sys.stdin):
     db = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider_signals.db.xz'), None)
     if not db: continue
     csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
-    print(db); print(csv); break
+    print(r['tag_name']); print(db); print(csv); break
 ")"
+      RESOLVED_TAG="$(echo "$RELEASE_INFO" | sed -n 1p)"
+      DB_URL="$(echo "$RELEASE_INFO" | sed -n 2p)"
+      CSV_URL="$(echo "$RELEASE_INFO" | sed -n 3p)"
     else
+      RESOLVED_TAG="$RELEASE_TAG"
       URLS="$(curl -sSL "https://api.github.com/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG" \
         | python3 -c "
 import json, sys
@@ -167,9 +171,9 @@ db = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider
 csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
 print(db); print(csv)
 ")"
+      DB_URL="$(echo "$URLS" | sed -n 1p)"
+      CSV_URL="$(echo "$URLS" | sed -n 2p)"
     fi
-    DB_URL="$(echo "$URLS" | sed -n 1p)"
-    CSV_URL="$(echo "$URLS" | sed -n 2p)"
     if [[ -z "$DB_URL" ]]; then
       echo "[install] WARNING: no DB snapshot found in release $RELEASE_TAG. Skipping download."
       echo "[install]          You can rebuild from scratch with: python packages/tracker/run_expanded_pipeline.py"
@@ -187,6 +191,11 @@ print(db); print(csv)
         echo "[install]   → $REPO_ROOT/data/latest_signals.csv"
       else
         echo "[install] NOTE: latest_signals.csv not present in release; size-adjusted scanner will return empty until refresh."
+      fi
+      # Record the installed release tag
+      if [[ -n "$RESOLVED_TAG" ]]; then
+        echo "$RESOLVED_TAG" > "$REPO_ROOT/data/.data_release"
+        echo "[install] recorded release tag: $RESOLVED_TAG"
       fi
     fi
   fi

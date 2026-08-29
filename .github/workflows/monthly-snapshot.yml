@@ -99,11 +99,21 @@ jobs:
           python run_expanded_pipeline.py
 
       # ── Common: sync, compress, publish ──
+      - name: Run historical backtest
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python backtest/historical_backtest.py
+
       - name: Sync data/ from tracker output
         run: |
           cp packages/tracker/db/insider_signals.db data/insider_signals.db
           if [ -f packages/tracker/output/latest_signals.csv ]; then
             cp packages/tracker/output/latest_signals.csv data/latest_signals.csv
+          fi
+          if [ -f packages/tracker/output/historical_clusters.csv ]; then
+            cp packages/tracker/output/historical_clusters.csv data/historical_clusters.csv
           fi
 
       - name: Compress DB
@@ -126,9 +136,12 @@ jobs:
           if [ "${{ github.event.inputs.force_full_rebuild }}" = "true" ]; then
             MODE="full rebuild"
           fi
+          ASSETS="data/insider_signals.db.xz data/latest_signals.csv"
+          if [ -f data/historical_clusters.csv ]; then
+            ASSETS="$ASSETS data/historical_clusters.csv"
+          fi
           gh release create "${{ steps.tag.outputs.tag }}" \
-            data/insider_signals.db.xz \
-            data/latest_signals.csv \
+            $ASSETS \
             --repo ${{ github.repository }} \
             --title "Monthly DB snapshot — ${{ steps.tag.outputs.tag }}" \
-            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV. Generated automatically by the monthly-snapshot workflow ($MODE mode)."
+            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV and historical hit rate clusters. Generated automatically by the monthly-snapshot workflow ($MODE mode)."

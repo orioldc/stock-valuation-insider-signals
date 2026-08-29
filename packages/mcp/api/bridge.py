@@ -696,7 +696,7 @@ def _compute_conviction_live(ticker: str, insider: dict, hit_rates_release: str 
     try:
         from signals.conviction_scorer import score_signal
         from signals.insider_clusters import detect_clusters
-        from signals.historical_hit_rate import compute_hit_rates
+        from signals.historical_hit_rate import compute_hit_rates, get_sector_hit_rates
     except Exception:
         return {}
 
@@ -793,34 +793,51 @@ def _compute_conviction_live(ticker: str, insider: dict, hit_rates_release: str 
     if row["sector"] is None or row["share_delta_4q"] is None:
         return {}
 
-    # Check if historical hit rates are available
-    # NOTE: historical_clusters.csv is currently always absent (not produced by any
-    # pipeline step; only written by standalone backtest script), so historical_accuracy
-    # is always 0 and max_achievable is always 80 for live signals.
-    try:
-        hit_rates = compute_hit_rates()
-        has_hit_rates = bool(hit_rates)
-    except Exception:
-        has_hit_rates = False
-
     # Score the signal
     try:
         scored = score_signal(row)
-
-        # Determine max achievable score and missing components
-        max_achievable = 100 if has_hit_rates else 80
-        missing_components = [] if has_hit_rates else ["historical_accuracy"]
-
-        return {
-            "conviction_score": scored["total"],
-            "quality": scored["breakdown"].get("quality"),
-            "conviction_source": "computed_live",
-            "hit_rates_release": hit_rates_release,
-            "conviction_max_achievable": max_achievable,
-            "conviction_missing_components": missing_components,
-        }
     except Exception:
         return {}
+
+    # Determine max achievable score and missing components based on what actually resolved.
+    # Even when the artifact exists, coverage is partial: not all tickers/sectors will be present.
+    try:
+        hit_rates = compute_hit_rates()
+        sector_rates = get_sector_hit_rates()
+    except Exception:
+        hit_rates = {}
+        sector_rates = {}
+
+    missing_components = []
+    max_achievable = 100
+
+    # Historical accuracy: three bands based on n_clusters
+    # - ticker absent: 0 points earned, 20 unreachable
+    # - n_clusters 1-2: max 10 points, 10 unreachable
+    # - n_clusters >= 3: max 20 points, 0 unreachable
+    if ticker not in hit_rates:
+        max_achievable -= 20
+        missing_components.append("historical_accuracy")
+    else:
+        n_clusters = hit_rates[ticker].get("n_clusters", 0)
+        if n_clusters < 3:
+            max_achievable -= 10
+            missing_components.append("historical_accuracy_partial")
+
+    # Sector favorability: 8 points unreachable when sector not in sector_rates
+    # (it falls back to 7 out of 15, so 15 - 7 = 8 points unreachable)
+    if row["sector"] not in sector_rates:
+        max_achievable -= 8
+        missing_components.append("sector_favorability")
+
+    return {
+        "conviction_score": scored["total"],
+        "quality": scored["breakdown"].get("quality"),
+        "conviction_source": "computed_live",
+        "hit_rates_release": hit_rates_release,
+        "conviction_max_achievable": max_achievable,
+        "conviction_missing_components": missing_components,
+    }
 
 
 def _build_summary_text(p):

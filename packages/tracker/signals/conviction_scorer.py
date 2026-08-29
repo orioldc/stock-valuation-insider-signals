@@ -5,25 +5,53 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from signals.sweet_spot_filter import classify_cluster
-from signals.historical_hit_rate import compute_hit_rates, get_sector_hit_rates
+from signals.historical_hit_rate import compute_hit_rates, get_sector_hit_rates, _resolve_csv_path
 
-# Cache these at module level
-_hit_rates = None
-_sector_rates = None
+# Cache with mtime-based invalidation (follows pattern from packages/mcp/api/bridge.py:50)
+_hit_rates_cache = {"csv_mtime": 0.0, "data": None}
+_sector_rates_cache = {"csv_mtime": 0.0, "data": None}
 
 
 def _get_hit_rates():
-    global _hit_rates
-    if _hit_rates is None:
-        _hit_rates = compute_hit_rates()
-    return _hit_rates
+    """Load hit rates, memoized; reloads when CSV mtime changes."""
+    csv_path = _resolve_csv_path()
+
+    # Get current mtime if file exists, else 0
+    try:
+        current_mtime = os.path.getmtime(csv_path) if os.path.exists(csv_path) else 0.0
+    except OSError:
+        current_mtime = 0.0
+
+    # Return cached data if mtime unchanged and data exists
+    if _hit_rates_cache["csv_mtime"] == current_mtime and _hit_rates_cache["data"] is not None:
+        return _hit_rates_cache["data"]
+
+    # Reload
+    data = compute_hit_rates()
+    _hit_rates_cache["csv_mtime"] = current_mtime
+    _hit_rates_cache["data"] = data
+    return data
 
 
 def _get_sector_rates():
-    global _sector_rates
-    if _sector_rates is None:
-        _sector_rates = get_sector_hit_rates()
-    return _sector_rates
+    """Load sector rates, memoized; reloads when CSV mtime changes."""
+    csv_path = _resolve_csv_path()
+
+    # Get current mtime if file exists, else 0
+    try:
+        current_mtime = os.path.getmtime(csv_path) if os.path.exists(csv_path) else 0.0
+    except OSError:
+        current_mtime = 0.0
+
+    # Return cached data if mtime unchanged and data exists
+    if _sector_rates_cache["csv_mtime"] == current_mtime and _sector_rates_cache["data"] is not None:
+        return _sector_rates_cache["data"]
+
+    # Reload
+    data = get_sector_hit_rates()
+    _sector_rates_cache["csv_mtime"] = current_mtime
+    _sector_rates_cache["data"] = data
+    return data
 
 
 def score_signal(row):

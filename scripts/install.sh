@@ -156,11 +156,13 @@ for r in json.load(sys.stdin):
     db = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider_signals.db.xz'), None)
     if not db: continue
     csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
-    print(r['tag_name']); print(db); print(csv); break
+    hist_csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='historical_clusters.csv'), '')
+    print(r['tag_name']); print(db); print(csv); print(hist_csv); break
 ")"
       RESOLVED_TAG="$(echo "$RELEASE_INFO" | sed -n 1p)"
       DB_URL="$(echo "$RELEASE_INFO" | sed -n 2p)"
       CSV_URL="$(echo "$RELEASE_INFO" | sed -n 3p)"
+      HIST_CSV_URL="$(echo "$RELEASE_INFO" | sed -n 4p)"
     else
       RESOLVED_TAG="$RELEASE_TAG"
       URLS="$(curl -sSL "https://api.github.com/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG" \
@@ -169,10 +171,12 @@ import json, sys
 r = json.load(sys.stdin)
 db = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider_signals.db.xz'), '')
 csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
-print(db); print(csv)
+hist_csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='historical_clusters.csv'), '')
+print(db); print(csv); print(hist_csv)
 ")"
       DB_URL="$(echo "$URLS" | sed -n 1p)"
       CSV_URL="$(echo "$URLS" | sed -n 2p)"
+      HIST_CSV_URL="$(echo "$URLS" | sed -n 3p)"
     fi
     if [[ -z "$DB_URL" ]]; then
       echo "[install] WARNING: no DB snapshot found in release $RELEASE_TAG. Skipping download."
@@ -191,6 +195,13 @@ print(db); print(csv)
         echo "[install]   → $REPO_ROOT/data/latest_signals.csv"
       else
         echo "[install] NOTE: latest_signals.csv not present in release; size-adjusted scanner will return empty until refresh."
+      fi
+      if [[ -n "$HIST_CSV_URL" ]]; then
+        echo "[install]   → $HIST_CSV_URL"
+        curl -fL --progress-bar -o "$REPO_ROOT/data/historical_clusters.csv" "$HIST_CSV_URL"
+        echo "[install]   → $REPO_ROOT/data/historical_clusters.csv"
+      else
+        echo "[install] NOTE: historical_clusters.csv not present in release; historical accuracy scoring will degrade to 0 until backtest runs."
       fi
       # Record the installed release tag
       if [[ -n "$RESOLVED_TAG" ]]; then

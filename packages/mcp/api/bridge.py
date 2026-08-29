@@ -152,6 +152,10 @@ def _load_universe() -> dict:
     """Load (ticker → {mcap, tier, raw_cluster, raw_share}) + per-tier score arrays.
 
     Memoized; reloads only when latest_signals.csv mtime changes.
+
+    Market cap is derived from (latest price × latest shares) when both are available,
+    falling back to companies.market_cap otherwise. This ensures tier assignment
+    uses fresh data even when the stored value is stale.
     """
     if not os.path.exists(SIGNALS_CSV):
         return {"by_ticker": {}, "by_tier_cluster": {}, "by_tier_share": {}}
@@ -165,16 +169,77 @@ def _load_universe() -> dict:
         rows = list(csv.DictReader(f))
 
     tickers = [r["ticker"] for r in rows]
-    mcap_by_ticker: dict[str, float] = {}
+    mcap_by_ticker: dict[str, dict] = {}  # ticker → {mcap, asof, source}
     if tickers:
         conn = get_db()
         placeholders = ",".join("?" * len(tickers))
-        for r in conn.execute(
-            f"SELECT ticker, market_cap FROM companies WHERE ticker IN ({placeholders})",
-            tickers,
-        ).fetchall():
-            if r["market_cap"]:
-                mcap_by_ticker[r["ticker"]] = float(r["market_cap"])
+
+        # Check if market_cap_asof column exists (tolerate old DBs)
+        cur = conn.execute("PRAGMA table_info(companies)")
+        columns = [col[1] for col in cur.fetchall()]
+        has_asof_column = "market_cap_asof" in columns
+
+        # Get stored market cap
+        stored_mcap = {}
+        if has_asof_column:
+            for r in conn.execute(
+                f"SELECT ticker, market_cap, market_cap_asof FROM companies WHERE ticker IN ({placeholders})",
+                tickers,
+            ).fetchall():
+                stored_mcap[r["ticker"]] = {
+                    "mcap": float(r["market_cap"]) if r["market_cap"] else None,
+                    "asof": r["market_cap_asof"],
+                }
+        else:
+            for r in conn.execute(
+                f"SELECT ticker, market_cap FROM companies WHERE ticker IN ({placeholders})",
+                tickers,
+            ).fetchall():
+                stored_mcap[r["ticker"]] = {
+                    "mcap": float(r["market_cap"]) if r["market_cap"] else None,
+                    "asof": None,
+                }
+
+        # Derive market cap from price × shares
+        for r in conn.execute(f"""
+            SELECT c.ticker, p.date as price_date, p.close, so.shares
+            FROM companies c
+            LEFT JOIN (
+                SELECT ticker, date, close,
+                       ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) as rn
+                FROM prices
+            ) p ON c.ticker = p.ticker AND p.rn = 1
+            LEFT JOIN (
+                SELECT company_id, shares,
+                       ROW_NUMBER() OVER (PARTITION BY company_id ORDER BY date DESC) as rn
+                FROM shares_outstanding
+            ) so ON c.id = so.company_id AND so.rn = 1
+            WHERE c.ticker IN ({placeholders})
+        """, tickers).fetchall():
+            ticker = r["ticker"]
+            if r["close"] and r["shares"]:
+                # Derived value available
+                derived_mcap = float(r["close"]) * float(r["shares"])
+                mcap_by_ticker[ticker] = {
+                    "mcap": derived_mcap,
+                    "asof": r["price_date"],
+                    "source": "derived_price_x_shares",
+                }
+            elif ticker in stored_mcap and stored_mcap[ticker]["mcap"]:
+                # Fall back to stored value
+                mcap_by_ticker[ticker] = {
+                    "mcap": stored_mcap[ticker]["mcap"],
+                    "asof": stored_mcap[ticker]["asof"],
+                    "source": "companies_table",
+                }
+            else:
+                # No data available
+                mcap_by_ticker[ticker] = {
+                    "mcap": None,
+                    "asof": None,
+                    "source": "unavailable",
+                }
+
         conn.close()
 
     by_ticker: dict[str, dict] = {}
@@ -183,7 +248,8 @@ def _load_universe() -> dict:
 
     for r in rows:
         ticker = r["ticker"]
-        mcap = mcap_by_ticker.get(ticker)
+        mcap_info = mcap_by_ticker.get(ticker, {"mcap": None, "asof": None, "source": "unavailable"})
+        mcap = mcap_info["mcap"]
         tier = get_tier(mcap)
         try:
             raw_cluster = float(r.get("cluster_score_raw") or 0)
@@ -200,8 +266,12 @@ def _load_universe() -> dict:
         except ValueError:
             cluster_adj = 0.0
         by_ticker[ticker] = {
-            "mcap": mcap, "tier": tier,
-            "raw_cluster": raw_cluster, "raw_share": raw_share,
+            "mcap": mcap,
+            "mcap_asof": mcap_info["asof"],
+            "mcap_source": mcap_info["source"],
+            "tier": tier,
+            "raw_cluster": raw_cluster,
+            "raw_share": raw_share,
             "cluster_detected": cluster_detected,
             "cluster_adj": cluster_adj,
         }
@@ -333,7 +403,15 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
         raw_cluster = float(r.get("cluster_score_raw", 0) or 0)
         raw_share = float(r.get("share_score_raw", 0) or 0)
         raw_composite = float(r.get("composite", 0) or 0)
-        sa = _size_adjust(r["ticker"], raw_cluster, raw_share, mcap=co.get("market_cap"))
+
+        # Get enriched market cap from universe (derived or fallback)
+        universe = _load_universe()
+        ticker_info = universe["by_ticker"].get(r["ticker"], {})
+        mcap = ticker_info.get("mcap") or co.get("market_cap")
+        mcap_asof = ticker_info.get("mcap_asof")
+        mcap_source = ticker_info.get("mcap_source", "companies_table")
+
+        sa = _size_adjust(r["ticker"], raw_cluster, raw_share, mcap=mcap)
         composite_adj = round(0.6 * sa["cluster_adjusted"] + 0.4 * sa["share_adjusted"], 4)
 
         if composite_adj < min_score:
@@ -343,7 +421,9 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
             "ticker": r["ticker"],
             "name": co.get("name"),
             "sector": co.get("sector"),
-            "market_cap": co.get("market_cap"),
+            "market_cap": mcap,
+            "market_cap_asof": mcap_asof,
+            "market_cap_source": mcap_source,
             "tier": sa["tier"],
             "composite_score": composite_adj,
             "composite_score_raw": raw_composite,
@@ -379,6 +459,9 @@ def get_buyback_status(ticker):
     latest_shares = None
     latest_date = None
     mcap = None
+    mcap_asof = None
+    mcap_source = "unavailable"
+
     conn = get_db()
     row = conn.execute("""
         SELECT so.date, so.shares
@@ -391,11 +474,40 @@ def get_buyback_status(ticker):
     if row:
         latest_date = row["date"]
         latest_shares = row["shares"]
-    mcap_row = conn.execute(
-        "SELECT market_cap FROM companies WHERE ticker = ?", (ticker,)
-    ).fetchone()
-    if mcap_row and mcap_row["market_cap"]:
-        mcap = float(mcap_row["market_cap"])
+
+    # Derive market cap from price × shares (prefer fresh data)
+    derived_row = conn.execute("""
+        SELECT p.date as price_date, p.close, so.shares, c.market_cap
+        FROM companies c
+        LEFT JOIN (
+            SELECT ticker, date, close
+            FROM prices
+            WHERE ticker = ?
+            ORDER BY date DESC
+            LIMIT 1
+        ) p ON c.ticker = p.ticker
+        LEFT JOIN (
+            SELECT company_id, shares
+            FROM shares_outstanding
+            WHERE company_id = (SELECT id FROM companies WHERE ticker = ?)
+            ORDER BY date DESC
+            LIMIT 1
+        ) so ON c.id = so.company_id
+        WHERE c.ticker = ?
+    """, (ticker, ticker, ticker)).fetchone()
+
+    if derived_row:
+        if derived_row["close"] and derived_row["shares"]:
+            # Derived value available
+            mcap = float(derived_row["close"]) * float(derived_row["shares"])
+            mcap_asof = derived_row["price_date"]
+            mcap_source = "derived_price_x_shares"
+        elif derived_row["market_cap"]:
+            # Fall back to stored value
+            mcap = float(derived_row["market_cap"])
+            mcap_asof = None
+            mcap_source = "companies_table"
+
     conn.close()
 
     delta_4q = delta.get("delta_4q")
@@ -416,6 +528,8 @@ def get_buyback_status(ticker):
         "tier_percentile": sa["share_percentile"],
         "tier_thresholds": sa["tier_thresholds"],
         "market_cap": mcap,
+        "market_cap_asof": mcap_asof,
+        "market_cap_source": mcap_source,
         "data_points": delta.get("data_points"),
         "latest_shares": latest_shares,
         "latest_date": latest_date,
@@ -501,6 +615,8 @@ def get_cluster(ticker):
         "tier_percentile": sa["cluster_percentile"],
         "tier_thresholds": sa["tier_thresholds"],
         "market_cap": mcap,
+        "market_cap_asof": bb.get("market_cap_asof"),
+        "market_cap_source": bb.get("market_cap_source", "unavailable"),
         "trades": trade_list,
         "buyback": bb,
         "frozen": frozen,
@@ -570,6 +686,143 @@ def _money(x, digits=2):
         return "n/a"
 
 
+def _compute_conviction_live(ticker: str, insider: dict, hit_rates_release: str | None) -> dict:
+    """Compute conviction score and quality for a live insider signal.
+
+    Returns dict with conviction_score, quality, conviction_source, hit_rates_release,
+    conviction_max_achievable, conviction_missing_components, or empty dict if computation fails.
+    """
+    # Lazy imports to defer CSV read and cluster detection
+    try:
+        from signals.conviction_scorer import score_signal
+        from signals.insider_clusters import detect_clusters
+        from signals.historical_hit_rate import compute_hit_rates
+    except Exception:
+        return {}
+
+    # Get 90-day cluster counts: prefer live EDGAR figures when present, fall back to DB
+    # This ensures the cluster verdict and the cluster score come from the same source.
+    # Live fetches (after this fix) surface cluster_n_insiders/cluster_total_value.
+    # Older cached payloads and frozen snapshots lack those keys, so we fall back to
+    # querying the tracker DB via detect_clusters(ticker).
+    if insider.get("cluster_n_insiders") is not None and insider.get("cluster_total_value") is not None:
+        # Live path: use the cluster figures from the same EDGAR fetch that produced cluster_detected
+        cluster_detected = insider.get("cluster_detected", False)
+        num_insiders_cluster = insider.get("cluster_n_insiders", 0)
+        total_value_cluster = insider.get("cluster_total_value", 0)
+    else:
+        # Fallback path: cached payload or frozen snapshot lacks live cluster figures
+        # Query the tracker DB (monthly snapshot) to get cluster counts
+        try:
+            cluster_result = detect_clusters(ticker)
+            cluster_detected = cluster_result.get("cluster_detected", False)
+            cluster_trades = cluster_result.get("details", [])
+
+            # Count distinct insiders and total value from the cluster itself
+            if cluster_detected and cluster_trades:
+                distinct_ciks = set(t.get("cik") for t in cluster_trades if t.get("cik"))
+                num_insiders_cluster = len(distinct_ciks)
+                total_value_cluster = sum(t.get("value", 0) for t in cluster_trades)
+            else:
+                # No cluster = 0/0, so classify_cluster grades honestly
+                num_insiders_cluster = 0
+                total_value_cluster = 0
+        except Exception:
+            # Defensive: if cluster detection fails, use 0/0
+            cluster_detected = insider.get("cluster_detected", False)
+            num_insiders_cluster = 0
+            total_value_cluster = 0
+
+    # Assemble row for scorer using 90-day cluster window values
+    row = {
+        "ticker": ticker,
+        "cluster_detected": cluster_detected,
+        "num_insiders": num_insiders_cluster,
+        "total_value": total_value_cluster,
+        "share_delta_4q": insider.get("share_delta_4q"),
+    }
+
+    # Get sector from companies table
+    try:
+        conn = get_db()
+        sector_row = conn.execute(
+            "SELECT sector FROM companies WHERE ticker = ?", (ticker,)
+        ).fetchone()
+        row["sector"] = sector_row["sector"] if sector_row else "Unknown"
+    except Exception:
+        row["sector"] = "Unknown"
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+    # Derive has_ceo / has_officer from insider_transactions.raw_json
+    # Use 90-day window to match cluster detection
+    try:
+        conn = get_db()
+        cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        trades = conn.execute("""
+            SELECT it.raw_json
+            FROM insider_transactions it
+            JOIN companies c ON it.company_id = c.id
+            WHERE c.ticker = ? AND it.transaction_type = 'P'
+              AND it.transaction_date >= ?
+        """, (ticker, cutoff)).fetchall()
+
+        has_ceo = False
+        has_officer = False
+        for t in trades:
+            raw = json.loads(t["raw_json"]) if t["raw_json"] else {}
+            rel = (raw.get("relationship") or "").upper()
+            if any(k in rel for k in ["CEO", "CFO", "COO", "CHIEF", "PRESIDENT"]):
+                has_ceo = True
+            if any(k in rel for k in ["VP", "SVP", "EVP", "OFFICER"]) or has_ceo:
+                has_officer = True
+            if has_ceo and has_officer:
+                break
+
+        row["has_ceo"] = has_ceo
+        row["has_officer"] = has_officer
+    except Exception:
+        row["has_ceo"] = False
+        row["has_officer"] = False
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+    # Defensive: if any required field is missing, bail
+    if row["sector"] is None or row["share_delta_4q"] is None:
+        return {}
+
+    # Check if historical hit rates are available
+    # NOTE: historical_clusters.csv is currently always absent (not produced by any
+    # pipeline step; only written by standalone backtest script), so historical_accuracy
+    # is always 0 and max_achievable is always 80 for live signals.
+    try:
+        hit_rates = compute_hit_rates()
+        has_hit_rates = bool(hit_rates)
+    except Exception:
+        has_hit_rates = False
+
+    # Score the signal
+    try:
+        scored = score_signal(row)
+
+        # Determine max achievable score and missing components
+        max_achievable = 100 if has_hit_rates else 80
+        missing_components = [] if has_hit_rates else ["historical_accuracy"]
+
+        return {
+            "conviction_score": scored["total"],
+            "quality": scored["breakdown"].get("quality"),
+            "conviction_source": "computed_live",
+            "hit_rates_release": hit_rates_release,
+            "conviction_max_achievable": max_achievable,
+            "conviction_missing_components": missing_components,
+        }
+    except Exception:
+        return {}
+
+
 def _build_summary_text(p):
     """Build a multi-section text summary for the LLM chat context."""
     lines = []
@@ -631,17 +884,44 @@ def _build_summary_text(p):
         lines.append("## Insider Signal")
         parts = [f"Cluster detected: {insider.get('cluster_detected')}"]
         if insider.get("conviction_score") is not None:
-            parts.append(f"Conviction: {insider['conviction_score']:.1f}")
+            # Show conviction out of max achievable, with missing components if any
+            max_ach = insider.get("conviction_max_achievable")
+            if max_ach is None:
+                # Frozen snapshot: scale unknown
+                conv_str = f"Conviction: {insider['conviction_score']:.1f} (scale unknown, from snapshot)"
+            else:
+                conv_str = f"Conviction: {insider['conviction_score']:.1f}/{max_ach}"
+                missing = insider.get("conviction_missing_components")
+                if missing:
+                    conv_str += f" ({', '.join(missing)} unavailable)"
+            parts.append(conv_str)
         if insider.get("quality"):
             parts.append(f"Quality: {insider['quality']}")
-        if insider.get("insider_count") is not None:
-            parts.append(f"Insiders: {insider['insider_count']}")
-        if insider.get("latest_transaction_date"):
-            parts.append(f"Latest trade: {insider['latest_transaction_date']}")
         lines.append("  |  ".join(parts))
-        # Add snapshot vintage line if available
-        if insider.get("release") and insider.get("as_of"):
-            lines.append(f"Snapshot: {insider['release']} as of {insider['as_of']}")
+
+        # Count line with window
+        count_parts = []
+        if insider.get("insider_count") is not None:
+            count_str = f"Insiders: {insider['insider_count']}"
+            if insider.get("count_window_days"):
+                count_str += f" ({insider['count_window_days']}d window)"
+            count_parts.append(count_str)
+        if insider.get("latest_transaction_date"):
+            count_parts.append(f"Latest trade: {insider['latest_transaction_date']}")
+        if count_parts:
+            lines.append("  |  ".join(count_parts))
+
+        # Provenance line
+        prov_parts = []
+        if insider.get("source"):
+            src_str = f"Source: {insider['source']}"
+            if insider.get("as_of"):
+                src_str += f" (as of {insider['as_of']})"
+            prov_parts.append(src_str)
+        if insider.get("hit_rates_release"):
+            prov_parts.append(f"Hit rates: {insider['hit_rates_release']} backtest")
+        if prov_parts:
+            lines.append("  |  ".join(prov_parts))
     if p.get("errors"):
         lines.append("")
         lines.append("## Warnings")
@@ -663,6 +943,27 @@ def run_valuation(ticker):
     insider = result.get("insider_signal") or {}
     decision = result.get("decision") or {}
     dcf_assumptions = dcf.get("assumptions") or {}
+
+    # Get hit-rates release tag for provenance
+    hit_rates_release = _get_installed_release()
+
+    # Handle conviction source provenance
+    if insider:
+        if insider.get("source") == "live_edgar" and insider.get("conviction_score") is None:
+            # Compute conviction for live signal
+            computed = _compute_conviction_live(ticker, insider, hit_rates_release)
+            if computed:
+                insider.update(computed)
+        elif insider.get("source") == "frozen_snapshot" and insider.get("conviction_score") is not None:
+            # Mark frozen conviction with provenance
+            # Scale unknown: the frozen file records only the score, not the components or max.
+            # historical_clusters.csv was never committed and is not produced by any pipeline step,
+            # so the May snapshot was likely also computed with historical_accuracy=0 (max=80),
+            # but we cannot prove it. Treat as genuinely unknown to avoid cross-source inconsistency.
+            insider["conviction_source"] = "frozen_snapshot"
+            insider["hit_rates_release"] = hit_rates_release
+            insider["conviction_max_achievable"] = None
+            insider["conviction_missing_components"] = None
 
     payload = {
         "ticker": result.get("ticker", ticker.upper()),
@@ -728,6 +1029,13 @@ def run_valuation(ticker):
             "quality": insider.get("quality"),
             "total_value": _to_native(insider.get("total_value")),
             "latest_transaction_date": insider.get("latest_transaction_date"),
+            "conviction_source": insider.get("conviction_source"),
+            "hit_rates_release": insider.get("hit_rates_release"),
+            "conviction_max_achievable": insider.get("conviction_max_achievable"),
+            "conviction_missing_components": insider.get("conviction_missing_components"),
+            "source": insider.get("source"),
+            "as_of": insider.get("as_of"),
+            "count_window_days": insider.get("count_window_days"),
         }
 
     payload["summary_text"] = _build_summary_text(payload)

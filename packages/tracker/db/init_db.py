@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS companies (
     name TEXT,
     cik INTEGER,
     sector TEXT,
-    industry TEXT
+    industry TEXT,
+    market_cap REAL,
+    market_cap_asof TEXT
 );
 
 CREATE TABLE IF NOT EXISTS insider_transactions (

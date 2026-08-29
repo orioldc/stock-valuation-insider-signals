@@ -220,6 +220,92 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
             else:
                 logger.info("  All tickers have sector data")
 
+    # ── Phase 2.6: Refresh market cap from prices × shares ──
+    logger.info("=" * 60)
+    logger.info("PHASE 2.6: Refreshing market cap from latest prices and shares")
+    logger.info("=" * 60)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Check if market_cap_asof column exists (tolerate old DBs)
+    cur.execute("PRAGMA table_info(companies)")
+    columns = [col[1] for col in cur.fetchall()]
+    has_asof_column = "market_cap_asof" in columns
+
+    # Migrate schema if needed: add market_cap_asof column
+    if not has_asof_column:
+        try:
+            cur.execute("ALTER TABLE companies ADD COLUMN market_cap_asof TEXT")
+            conn.commit()
+            has_asof_column = True
+            logger.info("  Schema migration: added market_cap_asof column")
+        except Exception as e:
+            # Column already exists (race condition) or other error
+            if "duplicate column" in str(e).lower():
+                has_asof_column = True
+                logger.info("  Schema migration: market_cap_asof column already exists")
+            else:
+                logger.warning(f"  Failed to add market_cap_asof column: {e}")
+                # Continue without asof tracking rather than aborting the whole refresh
+
+    # Get all companies
+    cur.execute("SELECT id, ticker FROM companies")
+    all_companies = cur.fetchall()
+    logger.info(f"  Refreshing market cap for {len(all_companies)} companies")
+
+    updated_count = 0
+    preserved_stale = 0
+
+    for i, (company_id, ticker) in enumerate(all_companies):
+        # Get latest price
+        price_row = cur.execute("""
+            SELECT date, close FROM prices
+            WHERE ticker = ?
+            ORDER BY date DESC
+            LIMIT 1
+        """, (ticker,)).fetchone()
+
+        # Get latest shares outstanding
+        shares_row = cur.execute("""
+            SELECT shares FROM shares_outstanding
+            WHERE company_id = ?
+            ORDER BY date DESC
+            LIMIT 1
+        """, (company_id,)).fetchone()
+
+        if price_row and shares_row and price_row[1] and shares_row[0]:
+            # Both available: compute market cap
+            price_date = price_row[0]
+            close_price = float(price_row[1])
+            shares = float(shares_row[0])
+            market_cap = close_price * shares
+
+            if has_asof_column:
+                cur.execute("""
+                    UPDATE companies
+                    SET market_cap = ?, market_cap_asof = ?
+                    WHERE id = ?
+                """, (market_cap, price_date, company_id))
+            else:
+                cur.execute("""
+                    UPDATE companies
+                    SET market_cap = ?
+                    WHERE id = ?
+                """, (market_cap, company_id))
+            updated_count += 1
+        else:
+            # Missing price or shares: preserve existing market_cap (stale is better than None)
+            preserved_stale += 1
+
+        if (i + 1) % 500 == 0:
+            logger.info(f"  Progress: {i+1}/{len(all_companies)} ({updated_count} updated, {preserved_stale} preserved)")
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+    logger.info(f"Phase 2.6 complete: {updated_count} market caps refreshed, {preserved_stale} preserved (no price/shares data)")
+
     # ── Phase 3: Re-run scoring ──
     logger.info("=" * 60)
     logger.info("PHASE 3: Cluster detection & composite scoring")

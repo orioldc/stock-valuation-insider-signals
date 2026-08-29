@@ -229,7 +229,11 @@ def _save_cache(ticker: str, data: dict):
 def fetch_insider_data(ticker: str, use_cache: bool = True) -> dict | None:
     """Fetch insider trading data for a single ticker from SEC EDGAR.
 
-    Returns the same dict structure as the frozen data file, or None.
+    Returns dict with same structure as frozen data file, plus provenance metadata.
+
+    Note: conviction_score and quality are set to None. The frozen snapshot contains
+    these values but the live fetcher does not compute them — they require additional
+    scoring logic not present in this module.
     """
     ticker = ticker.upper()
     if use_cache:
@@ -270,7 +274,7 @@ def fetch_insider_data(ticker: str, use_cache: bool = True) -> dict | None:
         logger.info(f"No purchase transactions found for {ticker}")
         return None
 
-    # Build insider summary
+    # Build insider summary (counts insiders and value over 120-day window)
     recent_purchases = [
         t for t in all_purchases
         if t.get("transaction_date", "") >= (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
@@ -289,8 +293,19 @@ def fetch_insider_data(ticker: str, use_cache: bool = True) -> dict | None:
         names = "; ".join(list(unique_names)[:3])
         insider_summary = f"{n_insiders} insider(s) bought ${total_value:,.0f} in last 120 days ({names})"
 
-    # Cluster detection
+    # Cluster detection (uses 90-day lookback, 30-day window — see _detect_clusters)
     cluster = _detect_clusters(all_purchases)
+
+    # Extract cluster membership figures for conviction scoring
+    # These are the 90-day cluster's own counts, distinct from the 120-day n_insiders/total_value
+    cluster_trades = cluster.get("details", [])
+    if cluster["cluster_detected"] and cluster_trades:
+        distinct_ciks = set(t.get("cik") for t in cluster_trades if t.get("cik"))
+        cluster_n_insiders = len(distinct_ciks)
+        cluster_total_value = sum(t.get("value", 0) for t in cluster_trades)
+    else:
+        cluster_n_insiders = 0
+        cluster_total_value = 0
 
     # Share count change
     shares_data = _fetch_shares_outstanding(cik)
@@ -299,16 +314,22 @@ def fetch_insider_data(ticker: str, use_cache: bool = True) -> dict | None:
     result = {
         "ticker": ticker,
         "in_universe": True,
-        "conviction_score": None,
-        "quality": None,
+        "conviction_score": None,  # Not computed by live fetcher
+        "quality": None,  # Not computed by live fetcher
         "cluster_detected": cluster["cluster_detected"],
         "n_insiders": n_insiders,
         "total_value": total_value,
+        "cluster_n_insiders": cluster_n_insiders,  # 90-day cluster membership
+        "cluster_total_value": cluster_total_value,  # 90-day cluster value
         "share_delta_4q": share_delta["delta_4q"],
         "share_delta_qoq": share_delta["delta_qoq"],
         "share_trend": share_delta["trend"],
         "latest_transaction_date": latest_txn_date,
         "insider_summary": insider_summary,
+        "source": "live_edgar",
+        "as_of": datetime.now().strftime("%Y-%m-%d"),
+        "cluster_window_days": 90,  # lookback_days in _detect_clusters
+        "count_window_days": 120,  # window for n_insiders and total_value
     }
 
     _save_cache(ticker, result)

@@ -7,6 +7,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Winsorization cap for excess returns (±200%).
+# The distribution of excess_ret_12m is heavily right-skewed: 13 rows exceed +1000%
+# (WGS +4307%, SEZL +3560%, GME +3116%, etc.), and those extreme tails otherwise
+# dominate sector-level means. Capping at ±200% keeps the observations in the sample
+# but prevents multi-thousand-percent outliers from setting whole sectors' favorability bands.
+EXCESS_RETURN_CAP = 200.0
+
 _THIS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _THIS_FILE.parents[3]  # packages/tracker/signals/historical_hit_rate.py → repo root
 
@@ -54,9 +61,13 @@ def compute_hit_rates(csv_path=None):
             n = len(group)
             wins = int((group["excess_ret_12m"] > 0).sum())
             win_rate = wins / n if n > 0 else 0
-            avg_excess = group["excess_ret_12m"].mean()
-            best = group["excess_ret_12m"].max()
-            worst = group["excess_ret_12m"].min()
+
+            # Winsorize excess returns for avg/best/worst calculations
+            # (win_rate is a sign test and remains untouched)
+            winsorized = group["excess_ret_12m"].clip(-EXCESS_RETURN_CAP, EXCESS_RETURN_CAP)
+            avg_excess = winsorized.mean()
+            best = winsorized.max()
+            worst = winsorized.min()
 
             result[ticker] = {
                 "n_clusters": n,
@@ -85,8 +96,10 @@ def get_sector_hit_rates(csv_path=None):
 
         result = {}
         for sector, group in df.groupby("sector"):
+            # Winsorize excess returns for avg calculation (win_rate is a sign test and remains untouched)
+            winsorized = group["excess_ret_12m"].clip(-EXCESS_RETURN_CAP, EXCESS_RETURN_CAP)
             result[sector] = {
-                "avg_excess_12m": round(group["excess_ret_12m"].mean(), 2),
+                "avg_excess_12m": round(winsorized.mean(), 2),
                 "n_clusters": len(group),
                 "win_rate": round((group["excess_ret_12m"] > 0).mean(), 3)
             }

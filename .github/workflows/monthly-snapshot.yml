@@ -98,13 +98,27 @@ jobs:
           cd packages/tracker
           python run_expanded_pipeline.py
 
-      # ── Common: sync, compress, publish ──
+      # ── Common: backfill, backtest, sync, compress, publish ──
+      - name: Backfill pre-2021 prices
+        timeout-minutes: 20
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/backfill_prices.py
+
       - name: Run historical backtest
         timeout-minutes: 30
         continue-on-error: true
         run: |
           cd packages/tracker
           python backtest/historical_backtest.py
+
+      - name: Export frozen insider snapshot
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/export_frozen_insider.py
 
       - name: Sync data/ from tracker output
         run: |
@@ -114,6 +128,9 @@ jobs:
           fi
           if [ -f packages/tracker/output/historical_clusters.csv ]; then
             cp packages/tracker/output/historical_clusters.csv data/historical_clusters.csv
+          fi
+          if [ -f packages/tracker/output/insider_frozen.json.gz ]; then
+            cp packages/tracker/output/insider_frozen.json.gz data/insider_frozen.json.gz
           fi
 
       - name: Compress DB
@@ -140,8 +157,11 @@ jobs:
           if [ -f data/historical_clusters.csv ]; then
             ASSETS="$ASSETS data/historical_clusters.csv"
           fi
+          if [ -f data/insider_frozen.json.gz ]; then
+            ASSETS="$ASSETS data/insider_frozen.json.gz"
+          fi
           gh release create "${{ steps.tag.outputs.tag }}" \
             $ASSETS \
             --repo ${{ github.repository }} \
             --title "Monthly DB snapshot — ${{ steps.tag.outputs.tag }}" \
-            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV and historical hit rate clusters. Generated automatically by the monthly-snapshot workflow ($MODE mode)."
+            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV, historical hit rate clusters, and frozen insider snapshot. Generated automatically by the monthly-snapshot workflow ($MODE mode)."

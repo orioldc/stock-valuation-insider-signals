@@ -19,31 +19,58 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-FROZEN_PATH = Path(
-    os.environ.get(
-        "INSIDER_FROZEN_DATA",
-        Path(__file__).resolve().parent / "insider_frozen.json.gz",
-    )
-)
-
-# Lazy-loaded frozen data
+# Lazy-loaded frozen data with mtime tracking
 _frozen_data: dict | None = None
+_frozen_mtime: float | None = None
+_frozen_path: Path | None = None
+
+
+def _resolve_frozen_path() -> Path:
+    """Resolve frozen path at call time: env override → data/ (runtime) → committed fallback."""
+    if "INSIDER_FROZEN_DATA" in os.environ:
+        return Path(os.environ["INSIDER_FROZEN_DATA"])
+
+    # Prefer downloaded data/ copy (from install.sh release asset)
+    repo_root = Path(__file__).resolve().parents[3]  # packages/valuation/data/insider_signals.py → repo root
+    data_path = repo_root / "data" / "insider_frozen.json.gz"
+    if data_path.exists():
+        return data_path
+
+    # Fall back to committed copy
+    return Path(__file__).resolve().parent / "insider_frozen.json.gz"
 
 
 def _load_frozen() -> dict:
-    """Load and cache the entire frozen data file."""
-    global _frozen_data
-    if _frozen_data is not None:
-        return _frozen_data
-    if not FROZEN_PATH.exists():
+    """Load and cache the entire frozen data file, invalidating on mtime change."""
+    global _frozen_data, _frozen_mtime, _frozen_path
+
+    current_path = _resolve_frozen_path()
+
+    # Check if file exists
+    if not current_path.exists():
+        _frozen_data = {}
+        _frozen_mtime = None
+        _frozen_path = current_path
         return {}
+
+    # Check if we need to reload (different path, no cache, or mtime changed)
+    current_mtime = current_path.stat().st_mtime
+    if (_frozen_data is not None
+        and _frozen_path == current_path
+        and _frozen_mtime == current_mtime):
+        return _frozen_data
+
     try:
-        with gzip.open(FROZEN_PATH, "rt") as f:
+        with gzip.open(current_path, "rt") as f:
             _frozen_data = json.load(f)
-        logger.info(f"Loaded {len(_frozen_data)} tickers from frozen insider data")
+        _frozen_mtime = current_mtime
+        _frozen_path = current_path
+        logger.info(f"Loaded {len(_frozen_data)} tickers from frozen insider data ({current_path})")
     except Exception as e:
         logger.warning(f"Failed to load frozen insider data: {e}")
         _frozen_data = {}
+        _frozen_mtime = None
+        _frozen_path = current_path
     return _frozen_data
 
 
@@ -85,8 +112,9 @@ def get_signal_for_ticker(ticker: str, use_cache: bool = True) -> dict | None:
             # Augment with provenance metadata
             entry["source"] = "frozen_snapshot"
             # Use frozen file mtime as approximation of build date
-            if FROZEN_PATH.exists():
-                entry["as_of"] = datetime.fromtimestamp(FROZEN_PATH.stat().st_mtime).strftime("%Y-%m-%d")
+            frozen_path = _resolve_frozen_path()
+            if frozen_path.exists():
+                entry["as_of"] = datetime.fromtimestamp(frozen_path.stat().st_mtime).strftime("%Y-%m-%d")
             else:
                 entry["as_of"] = "unknown"
             entry["cluster_window_days"] = 90

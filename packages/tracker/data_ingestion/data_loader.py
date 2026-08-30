@@ -7,6 +7,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from edgar_client import fetch_company_tickers, fetch_form4_filings, parse_form4_xml, _get
+from bulk_edgar import normalize_transaction_date
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -301,6 +302,10 @@ def ingest_incremental(ticker, ticker_map=None):
         )
         for txn in transactions:
             try:
+                normalized_date = normalize_transaction_date(
+                    txn["transaction_date"],
+                    filing["filing_date"]
+                )
                 conn.execute("""
                     INSERT OR IGNORE INTO insider_transactions
                     (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
@@ -309,7 +314,7 @@ def ingest_incremental(ticker, ticker_map=None):
                 """, (
                     company_id,
                     filing["filing_date"],
-                    txn["transaction_date"],
+                    normalized_date,
                     txn["insider_name"],
                     txn["insider_cik"],
                     txn["transaction_code"],
@@ -378,6 +383,10 @@ def ingest_insider_trades(ticker, ticker_map=None):
         )
         for txn in transactions:
             try:
+                normalized_date = normalize_transaction_date(
+                    txn["transaction_date"],
+                    filing["filing_date"]
+                )
                 conn.execute("""
                     INSERT OR IGNORE INTO insider_transactions
                     (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
@@ -386,7 +395,7 @@ def ingest_insider_trades(ticker, ticker_map=None):
                 """, (
                     company_id,
                     filing["filing_date"],
-                    txn["transaction_date"],
+                    normalized_date,
                     txn["insider_name"],
                     txn["insider_cik"],
                     txn["transaction_code"],

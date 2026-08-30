@@ -46,6 +46,86 @@ def _parse_sec_date(d):
             return None
 
 
+def normalize_transaction_date(transaction_date, filing_date):
+    """Normalize malformed transaction_date values.
+
+    Handles two known malformations:
+    1. Trailing timezone offset (e.g., '2024-06-27-05:00') → truncate to date part
+    2. Two-digit year (e.g., '24-02-12') → expand century using filing_date
+
+    Future dates beyond today are rejected as corrupt with no recoverable signal.
+    Already-valid ISO dates pass through unchanged, even if transaction_date > filing_date
+    (the relationship between two fields is unreliable - we cannot determine which is wrong).
+
+    Args:
+        transaction_date: Raw transaction date string from SEC filing
+        filing_date: Filing date string (YYYY-MM-DD), used to disambiguate century
+
+    Returns:
+        Normalized YYYY-MM-DD string, or None if irreparably malformed
+    """
+    if not transaction_date or not transaction_date.strip():
+        return None
+
+    raw = transaction_date.strip()
+
+    # Case 1: Trailing timezone offset like '2024-06-27-05:00'
+    if len(raw) > 10 and raw[10] == '-':
+        candidate = raw[:10]
+        # Validate it's a proper date
+        try:
+            datetime.strptime(candidate, "%Y-%m-%d")
+            logger.debug(f"Normalized timezone-suffixed date: {raw} → {candidate}")
+            return candidate
+        except ValueError:
+            pass
+
+    # Case 2: Two-digit year like '24-02-12' or '25-07-25'
+    if len(raw) == 8 and raw[2] == '-' and raw[5] == '-':
+        yy, mm, dd = raw.split('-')
+        if filing_date:
+            try:
+                filing_year = int(filing_date[:4])
+                # Try both 20xx and 19xx
+                for century in [2000, 1900]:
+                    year = century + int(yy)
+                    candidate = f"{year:04d}-{mm}-{dd}"
+                    # Validate date is parseable
+                    try:
+                        txn_dt = datetime.strptime(candidate, "%Y-%m-%d")
+                        filing_dt = datetime.strptime(filing_date, "%Y-%m-%d")
+                        # Transaction must precede filing and be within ~5 years of it
+                        if txn_dt <= filing_dt and abs((txn_dt - filing_dt).days) <= 1825:
+                            logger.debug(f"Normalized two-digit year: {raw} → {candidate} (filing: {filing_date})")
+                            return candidate
+                    except ValueError:
+                        continue
+            except (ValueError, IndexError):
+                pass
+        logger.warning(f"Cannot normalize two-digit year date: {raw} (filing: {filing_date})")
+        return None
+
+    # Case 3: Already YYYY-MM-DD - validate and accept if <= today
+    if len(raw) == 10 and raw[4] == '-' and raw[7] == '-':
+        try:
+            txn_dt = datetime.strptime(raw, "%Y-%m-%d")
+            today = datetime.now()
+
+            # Reject future dates beyond today - corrupt with no recoverable signal
+            if txn_dt > today:
+                logger.warning(f"Future date beyond today: {raw}, setting to NULL")
+                return None
+
+            # Transaction is parseable and <= today, accept it
+            return raw
+        except ValueError:
+            pass
+
+    # Unrecognized format
+    logger.warning(f"Unrecognized transaction_date format: {raw}")
+    return None
+
+
 def _read_tsv_from_zip(zip_path, tsv_name):
     """Read a TSV file from a ZIP archive, yielding dicts."""
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -185,8 +265,9 @@ def ingest_quarter(year, quarter, ticker_filter=None):
         shares = _safe_float(txn.get("TRANS_SHARES"))
         price = _safe_float(txn.get("TRANS_PRICEPERSHARE"))
         shares_after = _safe_float(txn.get("SHRS_OWND_FOLWNG_TRANS"))
-        txn_date = _parse_sec_date(txn.get("TRANS_DATE", ""))
         filing_date = sub["filing_date"]
+        txn_date_raw = _parse_sec_date(txn.get("TRANS_DATE", ""))
+        txn_date = normalize_transaction_date(txn_date_raw, filing_date)
         acq_disp = txn.get("TRANS_ACQUIRED_DISP_CD", "").strip()
         
         # Get owner info

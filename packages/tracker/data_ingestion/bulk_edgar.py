@@ -27,6 +27,9 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.d
 BULK_DIR = os.path.join(os.path.dirname(__file__), "..", "bulk_data")
 CHECKPOINT_FILE = os.path.join(BULK_DIR, "ingested_quarters.json")
 
+# SEC fair-access policy requires a descriptive UA with contact info.
+SEC_USER_AGENT = "stock-valuation-insider-signals oriol.diaz@ozoneproject.com"
+
 
 def _parse_sec_date(d):
     """Parse SEC date format (DD-MON-YYYY or YYYY-MM-DD) to YYYY-MM-DD."""
@@ -43,7 +46,11 @@ def _parse_sec_date(d):
         try:
             return datetime.strptime(d, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            return None
+            # YY-MM-DD (2-digit year, e.g. "24-05-23" -> "2024-05-23")
+            try:
+                return datetime.strptime(d, "%y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return None
 
 
 def normalize_transaction_date(transaction_date, filing_date):
@@ -336,7 +343,7 @@ def download_quarter(year, quarter, use_wayback=False):
     if use_wayback:
         urls.append(f"https://web.archive.org/web/2026/https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/{filename}")
     
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    headers = {"User-Agent": SEC_USER_AGENT}
     
     for url in urls:
         try:
@@ -365,27 +372,49 @@ def ingest_all_bulk(start_year=2020, ticker_filter=None, force=False):
         force: Re-ingest already-processed quarters
     """
     ingested_set = _load_checkpoint() if not force else set()
-    
+
     end_year = datetime.now().year
     end_quarter = (datetime.now().month - 1) // 3 + 1
-    
+    current_key = f"{end_year}q{end_quarter}"
+
     total_txns = 0
     results = []
-    
+
     for year in range(start_year, end_year + 1):
         max_q = end_quarter if year == end_year else 4
         for q in range(1, max_q + 1):
             key = f"{year}q{q}"
-            
-            if key in ingested_set and not force:
+            is_current = (key == current_key)
+
+            # The current (open) quarter is still being published by SEC, so never
+            # skip it and always pull a fresh copy from live SEC (not Wayback).
+            if key in ingested_set and not force and not is_current:
                 logger.info(f"Skipping {key} (already ingested)")
                 continue
-            
-            # Download if needed
+
             zip_path = os.path.join(BULK_DIR, f"{key}_form345.zip")
-            if not os.path.exists(zip_path):
+            if is_current:
+                # The open quarter is still being published; always fetch fresh from live SEC.
+                # Rename the stale copy aside so download_quarter can write to zip_path,
+                # then remove the backup only after a successful download.
+                stale_path = zip_path + ".stale"
+                # Recover from a prior interrupted run that left only the .stale backup.
+                if os.path.exists(stale_path) and not os.path.exists(zip_path):
+                    os.rename(stale_path, zip_path)
+                if os.path.exists(zip_path):
+                    os.rename(zip_path, stale_path)
+                download_quarter(year, q, use_wayback=False)
+                if os.path.exists(zip_path):
+                    # Fresh download succeeded; discard the stale backup.
+                    if os.path.exists(stale_path):
+                        os.remove(stale_path)
+                elif os.path.exists(stale_path):
+                    # Download failed; restore the stale copy so ingest can still proceed.
+                    logger.warning(f"Live SEC download failed for {key}; falling back to cached copy")
+                    os.rename(stale_path, zip_path)
+            elif not os.path.exists(zip_path):
                 download_quarter(year, q, use_wayback=True)
-            
+
             if not os.path.exists(zip_path):
                 results.append({"quarter": key, "status": "download_failed"})
                 continue

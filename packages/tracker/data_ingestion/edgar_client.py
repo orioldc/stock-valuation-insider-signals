@@ -5,6 +5,7 @@ import logging
 import time
 import xml.etree.ElementTree as ET
 from typing import Optional
+from bulk_edgar import _parse_sec_date
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -207,14 +208,16 @@ def fetch_form4_filings(cik, limit=150, since_date="2020-01-01"):
         fname = file_info.get("name", "")
         if not fname:
             continue
+        # Pages are ordered newest-first with non-overlapping date ranges. Once a
+        # page ends entirely before since_date, all remaining pages are older too.
+        filing_to = file_info.get("filingTo", "")
+        if filing_to and filing_to < since_date:
+            break
         older_url = f"https://data.sec.gov/submissions/{fname}"
         try:
             older_resp = _get(older_url)
             older_data = older_resp.json()
-            older_form4s = _extract_form4s(older_data)
-            if not older_form4s:
-                break
-            results.extend(older_form4s)
+            results.extend(_extract_form4s(older_data))
         except Exception as e:
             logger.warning(f"Failed to fetch older filings {fname} for CIK {cik}: {e}")
             continue
@@ -320,7 +323,10 @@ def parse_form4_xml(cik, accession_number, primary_doc):
     
     for txn in transactions:
         try:
-            txn_date = find_text(txn, "transactionDate.value", "")
+            txn_date = _parse_sec_date(find_text(txn, "transactionDate.value", ""))
+            if txn_date is None:
+                logger.warning(f"Skipping transaction with unparseable date in {url}")
+                continue
             txn_code = find_text(txn, "transactionCoding.transactionCode", "")
             
             amounts = find(txn, "transactionAmounts")

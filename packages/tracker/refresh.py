@@ -220,9 +220,20 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
             else:
                 logger.info("  All tickers have sector data")
 
-    # ── Phase 2.6: Refresh market cap from prices × shares ──
+    # ── Phase 2.6: Refresh prices ──
     logger.info("=" * 60)
-    logger.info("PHASE 2.6: Refreshing market cap from latest prices and shares")
+    logger.info("PHASE 2.6: Price refresh (yfinance)")
+    logger.info("=" * 60)
+    try:
+        from backtest.simple_backtest import fetch_prices
+        fetch_prices(tickers)
+        logger.info("Prices refreshed")
+    except Exception as e:
+        logger.warning(f"Price refresh failed: {e}")
+
+    # ── Phase 2.7: Refresh market cap from prices × shares ──
+    logger.info("=" * 60)
+    logger.info("PHASE 2.7: Refreshing market cap from latest prices and shares")
     logger.info("=" * 60)
 
     conn = get_db()
@@ -304,7 +315,7 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
 
     conn.commit()
     conn.close()
-    logger.info(f"Phase 2.6 complete: {updated_count} market caps refreshed, {preserved_stale} preserved (no price/shares data)")
+    logger.info(f"Phase 2.7 complete: {updated_count} market caps refreshed, {preserved_stale} preserved (no price/shares data)")
 
     # ── Phase 3: Re-run scoring ──
     logger.info("=" * 60)

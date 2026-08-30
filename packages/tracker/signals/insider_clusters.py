@@ -1,4 +1,4 @@
-"""Detect insider buying clusters — multiple insiders purchasing within a rolling window."""
+"""Detect insider buying clusters - multiple insiders purchasing within a rolling window."""
 
 import sqlite3
 import json
@@ -197,9 +197,14 @@ def detect_clusters(ticker, lookback_days=90, window_days=30):
     if not rows:
         return {"cluster_detected": False, "score": 0.0, "details": []}
 
-    # Parse trades
+    # Parse trades; skip any row whose date cannot be parsed as YYYY-MM-DD so
+    # that a single malformed legacy row does not crash the entire monthly job.
     trades = []
     for r in rows:
+        try:
+            dt = datetime.strptime(r["transaction_date"][:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
         raw = json.loads(r["raw_json"]) if r["raw_json"] else {}
         relationship = raw.get("relationship", "")
         price = r["price"] or 0
@@ -216,7 +221,7 @@ def detect_clusters(ticker, lookback_days=90, window_days=30):
             "seniority_weight": _get_seniority_weight(relationship),
         })
 
-    # Use canonical cluster finder
+    # Use canonical cluster finder (optimized O(n) sliding window)
     best_cluster, best_score = _find_best_cluster(trades, window_days)
 
     return {

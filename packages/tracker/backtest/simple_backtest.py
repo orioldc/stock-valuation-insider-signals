@@ -42,58 +42,73 @@ def _ensure_prices_table(conn):
 
 
 def fetch_prices(tickers, period="5y"):
-    """Download daily prices for tickers + SPY into SQLite."""
+    """Download/refresh daily prices for tickers + SPY into SQLite (incremental top-up).
+
+    New tickers (no prior rows) fetch the full period; existing tickers fetch only
+    from their last stored date forward. INSERT OR IGNORE dedupes overlap.
+    """
     conn = sqlite3.connect(DB_PATH)
     _ensure_prices_table(conn)
 
-    all_tickers = list(set(tickers) | {"SPY"})
+    all_tickers = sorted(set(tickers) | {"SPY"})
 
-    # Check which tickers already have data
-    existing = set()
-    for row in conn.execute("SELECT DISTINCT ticker FROM prices"):
-        existing.add(row[0])
+    last_dates = {}
+    for t, mx in conn.execute("SELECT ticker, MAX(date) FROM prices GROUP BY ticker"):
+        last_dates[t] = mx
 
-    to_fetch = [t for t in all_tickers if t not in existing]
-    if not to_fetch:
-        print(f"  Prices already cached for {len(all_tickers)} tickers.")
-        conn.close()
-        return
+    new_tickers = [t for t in all_tickers if last_dates.get(t) is None]
+    existing_tickers = [t for t in all_tickers if last_dates.get(t) is not None]
+    print(f"  Refreshing prices: {len(existing_tickers)} existing (incremental), "
+          f"{len(new_tickers)} new (full {period})...")
 
-    print(f"  Fetching prices for {len(to_fetch)} tickers...")
     batch_size = 20
-    for i in range(0, len(to_fetch), batch_size):
-        batch = to_fetch[i:i + batch_size]
-        tickers_str = " ".join(batch)
-        try:
-            data = yf.download(tickers_str, period=period, interval="1d",
-                               group_by="ticker", progress=False, threads=True)
-        except Exception as e:
-            print(f"    Error fetching batch: {e}")
-            continue
+    total_rows = 0
 
+    def _store(batch, data):
+        nonlocal total_rows
         rows = []
         for t in batch:
             try:
-                if len(batch) == 1:
-                    closes = data["Close"].dropna()
-                else:
-                    closes = data[t]["Close"].dropna()
+                closes = data["Close"].dropna() if len(batch) == 1 else data[t]["Close"].dropna()
                 for dt, price in closes.items():
                     if pd.notna(price) and price > 0:
                         rows.append((t, dt.strftime("%Y-%m-%d"), float(price)))
             except Exception:
                 print(f"    Warning: no data for {t}")
-
         if rows:
             conn.executemany(
-                "INSERT OR IGNORE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
-                rows
+                "INSERT OR IGNORE INTO prices (ticker, date, close) VALUES (?, ?, ?)", rows
             )
             conn.commit()
-        print(f"    Fetched {i + len(batch)}/{len(to_fetch)} tickers ({len(rows)} rows)")
+            total_rows += len(rows)
+
+    # New tickers: full history
+    for i in range(0, len(new_tickers), batch_size):
+        batch = new_tickers[i:i + batch_size]
+        try:
+            data = yf.download(" ".join(batch), period=period, interval="1d",
+                               group_by="ticker", progress=False, threads=True)
+        except Exception as e:
+            print(f"    Error fetching new batch: {e}")
+            continue
+        _store(batch, data)
+        time.sleep(0.5)
+
+    # Existing tickers: incremental from the oldest last-stored date in each batch
+    for i in range(0, len(existing_tickers), batch_size):
+        batch = existing_tickers[i:i + batch_size]
+        start = min(last_dates[t] for t in batch)
+        try:
+            data = yf.download(" ".join(batch), start=start, interval="1d",
+                               group_by="ticker", progress=False, threads=True)
+        except Exception as e:
+            print(f"    Error fetching incremental batch: {e}")
+            continue
+        _store(batch, data)
         time.sleep(0.5)
 
     conn.close()
+    print(f"  Price refresh complete: {total_rows} rows added.")
 
 
 def _load_prices_df():

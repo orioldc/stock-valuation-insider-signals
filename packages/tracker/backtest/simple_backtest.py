@@ -23,7 +23,7 @@ from scipy import stats as scipy_stats
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db")
+DB_PATH = os.environ.get("INSIDER_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db"))
 
 # ──────────────────────────────────────────────
 # Price data management

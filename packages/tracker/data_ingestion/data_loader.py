@@ -12,7 +12,7 @@ from bulk_edgar import normalize_transaction_date
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db")
+DB_PATH = os.environ.get("INSIDER_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db"))
 
 
 def load_universe():

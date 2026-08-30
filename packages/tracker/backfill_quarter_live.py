@@ -119,6 +119,7 @@ def run_backfill(since):
                             filing["cik"],
                             filing["accession_number"],
                             filing["primary_doc"],
+                            filing["filing_date"],
                         )
                     except Exception as e:
                         logger.warning(
@@ -157,11 +158,22 @@ def run_backfill(since):
 
                 conn.commit()
                 total_inserted += company_inserted
-                if filings and parse_failures == len(filings) and company_inserted == 0:
-                    logger.error(f"{ticker} ({cik}): all {len(filings)} filings failed to parse - marking complete to avoid infinite retry")
-                    errors += 1
-                completed.add(company_key)
-                processed += 1
+
+                # Parse failures are treated as transient (like backfill_prices.py):
+                # a systematic parse issue (SEC schema change, malformed XML for one
+                # issuer) should be diagnosable and fixable, so we do NOT checkpoint
+                # parse failures as permanent. Only checkpoint successes.
+                if company_inserted > 0 or parse_failures < len(filings):
+                    # Either we inserted transactions OR at least some filings succeeded
+                    completed.add(company_key)
+                    processed += 1
+                else:
+                    # All filings failed to parse - treat as transient, retry next run
+                    logger.warning(
+                        f"{ticker} ({cik}): all {len(filings)} filings failed to parse - "
+                        f"treating as transient, will retry next run"
+                    )
+                    transient_errors += 1
 
             except Exception as e:
                 err_str = str(e)

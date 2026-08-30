@@ -49,6 +49,16 @@ interface ClusterData {
     start_date?: string;
     end_date?: string;
     buyback?: BuybackInfo;
+    frozen?: {
+      in_snapshot: boolean;
+      cluster_detected: boolean | null;
+      score_raw: number | null;
+      cluster_adjusted: number | null;
+      release: string | null;
+      as_of: string | null;
+      as_of_source: string;
+      age_days: number | null;
+    };
   };
   activity: {
     transactions?: Transaction[];
@@ -123,6 +133,7 @@ function ClusterView({ data, hostContext }: { data: ClusterData; hostContext?: M
   const totalValue = cluster.total_value ?? txns.reduce((s, t) => s + (t.value ?? 0), 0);
   const uniqueInsiders = cluster.unique_insiders ?? new Set(txns.map((t) => t.insider_name)).size;
   const buyback = cluster.buyback;
+  const frozen = cluster.frozen;
   const fmtPct = (v: number | null | undefined) =>
     typeof v === "number" ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "n/a";
 
@@ -164,8 +175,34 @@ function ClusterView({ data, hostContext }: { data: ClusterData; hostContext?: M
         <div className={styles.headerRight}>
           <span className={styles.score}>{score.toFixed(1)}</span>
           <span className={`${styles.badge} ${detected ? styles.badgeCluster : styles.badgeNone}`}>
-            {detected ? "🔥 CLUSTER" : "NO CLUSTER"}
+            {detected ? "🔥 LIVE 90d: CLUSTER" : "LIVE 90d: NO CLUSTER"}
           </span>
+          {frozen && (() => {
+            if (!frozen.in_snapshot) {
+              return (
+                <span className={`${styles.badge} ${styles.badgeNone}`} style={{ fontSize: "10px" }}>
+                  Snapshot: not in {frozen.release ?? "release"}
+                </span>
+              );
+            }
+            const frozenDetected = frozen.cluster_detected ?? false;
+            const disagree = detected !== frozenDetected;
+            const dateLabel = frozen.as_of_source === "file_mtime" ? "~" : "";
+            const note = disagree
+              ? detected
+                ? " (newly appeared)"
+                : " (signal expired)"
+              : "";
+            return (
+              <span
+                className={`${styles.badge} ${frozenDetected ? styles.badgeCluster : styles.badgeNone}`}
+                style={{ fontSize: "10px", fontWeight: disagree ? 700 : 600 }}
+              >
+                Snapshot {frozen.release ?? "?"} ({dateLabel}{frozen.as_of ?? "?"}
+                {typeof frozen.age_days === "number" ? `, ${frozen.age_days}d old` : ""}): {frozenDetected ? "CLUSTER" : "NO CLUSTER"}{note}
+              </span>
+            );
+          })()}
           {buyback && (
             <span className={`${styles.badge} ${buyback.is_buyback ? styles.badgeCluster : styles.badgeNone}`}>
               {buyback.is_buyback ? "💰 BUYBACK" : "NO BUYBACK"}

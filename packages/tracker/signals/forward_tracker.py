@@ -6,7 +6,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db")
+DB_PATH = os.environ.get("INSIDER_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db"))
 
 CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS active_signals (

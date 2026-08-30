@@ -34,6 +34,8 @@ def main():
     parser = argparse.ArgumentParser(description="Clean up malformed transaction_date values")
     parser.add_argument("--write", action="store_true",
                         help="Apply fixes to database (default: dry-run only)")
+    parser.add_argument("--delete-duplicates", action="store_true",
+                        help="Delete genuine duplicates (rows whose normalized value already exists)")
     parser.add_argument("--db", default=DB_PATH,
                         help=f"Database path (default: {DB_PATH})")
     args = parser.parse_args()
@@ -63,8 +65,10 @@ def main():
         "nulled": 0,
     }
     updates = []
+    duplicates = []  # Genuine duplicates to delete
     txn_after_filing = []
 
+    # First pass: categorize all rows
     for row_id, txn_date, filing_date in rows:
         normalized = normalize_transaction_date(txn_date, filing_date)
 
@@ -78,12 +82,48 @@ def main():
             stats["nulled"] += 1
             updates.append((row_id, None, txn_date, filing_date))
         else:
-            # Categorize the fix type
-            if len(txn_date) > 10 and txn_date[10] == '-':
-                stats["timezone_offset"] += 1
-            elif len(txn_date) == 8 and txn_date[2] == '-' and txn_date[5] == '-':
-                stats["two_digit_year"] += 1
-            updates.append((row_id, normalized, txn_date, filing_date))
+            # Check if normalized value already exists in a correctly-formatted row
+            # Fetch the row details for BOTH unique constraints
+            cur.execute("""
+                SELECT company_id, reporting_cik, reporting_name,
+                       transaction_type, shares_transacted, price
+                FROM insider_transactions WHERE id = ?
+            """, (row_id,))
+            row = cur.fetchone()
+            company_id, reporting_cik, reporting_name, txn_type, shares, price = row
+
+            # Check BOTH unique constraints:
+            # 1. Table constraint: (company_id, transaction_date, reporting_cik, transaction_type, shares_transacted)
+            cur.execute("""
+                SELECT id, transaction_date FROM insider_transactions
+                WHERE company_id = ? AND transaction_date = ?
+                  AND reporting_cik = ? AND transaction_type = ?
+                  AND shares_transacted = ?
+                  AND id != ?
+            """, (company_id, normalized, reporting_cik, txn_type, shares, row_id))
+            existing_cik = cur.fetchone()
+
+            # 2. Unique index: (company_id, transaction_date, reporting_name, transaction_type, shares_transacted, price)
+            cur.execute("""
+                SELECT id, transaction_date FROM insider_transactions
+                WHERE company_id = ? AND transaction_date = ?
+                  AND reporting_name = ? AND transaction_type = ?
+                  AND shares_transacted = ? AND price = ?
+                  AND id != ?
+            """, (company_id, normalized, reporting_name, txn_type, shares, price, row_id))
+            existing_name = cur.fetchone()
+
+            if existing_cik or existing_name:
+                # Genuine duplicate: normalized value already exists
+                existing = existing_cik or existing_name
+                duplicates.append((row_id, txn_date, normalized, existing[0]))
+            else:
+                # Safe to update
+                if len(txn_date) > 10 and txn_date[10] == '-':
+                    stats["timezone_offset"] += 1
+                elif len(txn_date) == 8 and txn_date[2] == '-' and txn_date[5] == '-':
+                    stats["two_digit_year"] += 1
+                updates.append((row_id, normalized, txn_date, filing_date))
 
     # Report
     print("Results:")
@@ -91,7 +131,8 @@ def main():
     print(f"  Fixed (timezone offset):    {stats['timezone_offset']}")
     print(f"  Fixed (two-digit year):     {stats['two_digit_year']}")
     print(f"  Nulled (future dates):      {stats['nulled']}")
-    print(f"  Total fixes:                {len(updates)}")
+    print(f"  Genuine duplicates:         {len(duplicates)}")
+    print(f"  Total updates:              {len(updates)}")
 
     # Data quality findings (not fixed, just reported)
     if txn_after_filing:
@@ -105,36 +146,100 @@ def main():
 
     # Show sample fixes
     if updates:
-        print(f"\nSample fixes (showing up to 10):")
+        print(f"\nSample updates (showing up to 10):")
         for row_id, new_val, old_val, filing in updates[:10]:
             print(f"  ID {row_id}: {old_val} → {new_val} (filing: {filing})")
+
+    if duplicates:
+        print(f"\nSample duplicates (showing up to 10):")
+        for row_id, old_val, norm_val, existing_id in duplicates[:10]:
+            print(f"  ID {row_id}: {old_val} → would delete (duplicate of ID {existing_id} with {norm_val})")
 
     # Apply updates
     if args.write and updates:
         print(f"\nApplying {len(updates)} updates to database...")
         applied = 0
-        skipped = 0
-        for row_id, new_val, _, _ in updates:
+        failed = 0
+        for row_id, new_val, old_val, filing in updates:
             try:
                 cur.execute(
                     "UPDATE insider_transactions SET transaction_date = ? WHERE id = ?",
                     (new_val, row_id)
                 )
+                conn.commit()  # Commit each update immediately
                 applied += 1
             except sqlite3.IntegrityError as e:
-                # Skip updates that would violate UNIQUE constraint
-                # (normalized value already exists for this company/insider/type/shares)
-                skipped += 1
-        conn.commit()
-        print(f"Done! Applied {applied} updates, skipped {skipped} duplicates.")
+                # Should not happen since we pre-checked, but log it
+                print(f"  WARNING: Failed to update ID {row_id} ({old_val} → {new_val}): {e}")
+                failed += 1
+                conn.rollback()
+        print(f"Done! Applied {applied} updates, {failed} failed.")
+    elif not args.write and updates:
+        print(f"\nDRY RUN: Would update {len(updates)} rows.")
+        print("Run with --write to apply changes.")
 
-        # Verify
+    # Delete duplicates
+    if args.delete_duplicates and duplicates:
+        print(f"\nDeleting {len(duplicates)} duplicate rows...")
+        deleted = 0
+        for row_id, old_val, norm_val, existing_id in duplicates:
+            # Double-check the correctly-dated twin still exists
+            cur.execute("SELECT id FROM insider_transactions WHERE id = ?", (existing_id,))
+            if cur.fetchone():
+                cur.execute("DELETE FROM insider_transactions WHERE id = ?", (row_id,))
+                conn.commit()
+                print(f"  Deleted ID {row_id} ({old_val}, duplicate of ID {existing_id} with {norm_val})")
+                deleted += 1
+            else:
+                print(f"  WARNING: Skipped ID {row_id} - twin ID {existing_id} no longer exists")
+        print(f"Done! Deleted {deleted} duplicates.")
+    elif duplicates and not args.delete_duplicates:
+        print(f"\nDRY RUN: Would delete {len(duplicates)} duplicate rows.")
+        print("Run with --delete-duplicates to remove them.")
+
+    # Final verification
+    if args.write or args.delete_duplicates:
+        print("\nFinal verification:")
+
+        # Check MAX(transaction_date)
         cur.execute("SELECT MAX(transaction_date) FROM insider_transactions")
         max_date = cur.fetchone()[0]
-        print(f"\nVerification: MAX(transaction_date) = {max_date}")
-    elif not args.write and updates:
-        print(f"\nDRY RUN: Would have updated {len(updates)} rows.")
-        print("Run with --write to apply changes.")
+        print(f"  MAX(transaction_date) = {max_date}")
+
+        # Validate it's a proper ISO date
+        max_is_valid = False
+        if max_date:
+            try:
+                from datetime import datetime
+                datetime.strptime(max_date, "%Y-%m-%d")
+                max_is_valid = len(max_date) == 10
+            except ValueError:
+                pass
+
+        if not max_is_valid:
+            print(f"  ❌ FAILED: MAX(transaction_date) is not a valid ISO date")
+        else:
+            print(f"  ✓ MAX(transaction_date) is valid")
+
+        # Check for remaining malformed rows
+        cur.execute("""
+            SELECT COUNT(*) FROM insider_transactions
+            WHERE transaction_date IS NOT NULL
+              AND transaction_date NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+        """)
+        malformed_count = cur.fetchone()[0]
+        print(f"  Remaining malformed rows: {malformed_count}")
+
+        if malformed_count > 0:
+            print(f"  ❌ FAILED: {malformed_count} malformed rows remain")
+        else:
+            print(f"  ✓ No malformed rows remain")
+
+        # Overall status
+        if max_is_valid and malformed_count == 0:
+            print("\n✓ SUCCESS: All goals met")
+        else:
+            print("\n❌ INCOMPLETE: Some issues remain")
 
     conn.close()
 

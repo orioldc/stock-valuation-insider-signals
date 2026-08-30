@@ -32,25 +32,48 @@ SEC_USER_AGENT = "stock-valuation-insider-signals oriol.diaz@ozoneproject.com"
 
 
 def _parse_sec_date(d):
-    """Parse SEC date format (DD-MON-YYYY or YYYY-MM-DD) to YYYY-MM-DD."""
+    """Parse SEC date format to YYYY-MM-DD, passing through ambiguous formats.
+
+    Handles unambiguous formats only:
+    - DD-MON-YYYY (e.g., "15-JUN-2024") -> "2024-06-15"
+    - YYYY-MM-DD (pass through)
+
+    Passes through formats that normalize_transaction_date can handle:
+    - Two-digit years (YY-MM-DD) - need filing_date anchor for century
+    - Timezone suffixes (YYYY-MM-DD-HH:MM) - need truncation
+    """
     if not d or not d.strip():
         return None
     d = d.strip()
-    # Already YYYY-MM-DD
+
+    # Already YYYY-MM-DD - pass through
     if len(d) == 10 and d[4] == '-' and d[7] == '-':
         return d
-    # DD-MON-YYYY
+
+    # Timezone suffix (YYYY-MM-DD-HH:MM) - pass through for normalize_transaction_date
+    # to truncate
+    if len(d) > 10 and d[10] == '-' and d[4] == '-' and d[7] == '-':
+        return d
+
+    # Two-digit year (YY-MM-DD) - pass through for normalize_transaction_date
+    # to disambiguate using filing_date anchor
+    if len(d) == 8 and d[2] == '-' and d[5] == '-':
+        return d
+
+    # DD-MON-YYYY - parse and reformat
     try:
         return datetime.strptime(d, "%d-%b-%Y").strftime("%Y-%m-%d")
     except ValueError:
-        try:
-            return datetime.strptime(d, "%Y-%m-%d").strftime("%Y-%m-%d")
-        except ValueError:
-            # YY-MM-DD (2-digit year, e.g. "24-05-23" -> "2024-05-23")
-            try:
-                return datetime.strptime(d, "%y-%m-%d").strftime("%Y-%m-%d")
-            except ValueError:
-                return None
+        pass
+
+    # YYYY-MM-DD variant - parse and reformat (handles edge cases)
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # Unrecognized format
+    return None
 
 
 def normalize_transaction_date(transaction_date, filing_date):
@@ -63,6 +86,13 @@ def normalize_transaction_date(transaction_date, filing_date):
     Future dates beyond today are rejected as corrupt with no recoverable signal.
     Already-valid ISO dates pass through unchanged, even if transaction_date > filing_date
     (the relationship between two fields is unreliable - we cannot determine which is wrong).
+
+    DELIBERATE ASYMMETRY: Case 2 (two-digit years) enforces txn_date <= filing_date
+    and rejects candidates that violate it, because without an anchor we cannot choose
+    a century at all. Case 3 (complete unambiguous dates) does NOT enforce this
+    relationship — we have a valid date and choose not to null it on an unverified
+    assumption about which field is wrong. This is intentional: losing data on a guess
+    is worse than keeping a possibly-inconsistent but well-formed date.
 
     Args:
         transaction_date: Raw transaction date string from SEC filing

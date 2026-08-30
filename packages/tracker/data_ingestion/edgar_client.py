@@ -5,7 +5,7 @@ import logging
 import time
 import xml.etree.ElementTree as ET
 from typing import Optional
-from bulk_edgar import _parse_sec_date
+from bulk_edgar import _parse_sec_date, normalize_transaction_date
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -229,10 +229,16 @@ def fetch_form4_filings(cik, limit=150, since_date="2020-01-01"):
     return results
 
 
-def parse_form4_xml(cik, accession_number, primary_doc):
+def parse_form4_xml(cik, accession_number, primary_doc, filing_date=None):
     """
     Fetch and parse a Form 4 XML filing from www.sec.gov archives.
     Returns list of transaction dicts.
+
+    Args:
+        cik: Company CIK
+        accession_number: SEC accession number
+        primary_doc: Primary document filename
+        filing_date: Optional filing date (YYYY-MM-DD) for transaction date validation
     """
     acc_no_dashes = accession_number.replace("-", "")
     xml_filename = primary_doc.split("/")[-1] if "/" in primary_doc else primary_doc
@@ -323,7 +329,8 @@ def parse_form4_xml(cik, accession_number, primary_doc):
     
     for txn in transactions:
         try:
-            txn_date = _parse_sec_date(find_text(txn, "transactionDate.value", ""))
+            txn_date_raw = _parse_sec_date(find_text(txn, "transactionDate.value", ""))
+            txn_date = normalize_transaction_date(txn_date_raw, filing_date)
             if txn_date is None:
                 logger.warning(f"Skipping transaction with unparseable date in {url}")
                 continue

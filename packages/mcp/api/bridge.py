@@ -1107,10 +1107,8 @@ def get_health():
         "SELECT COUNT(*) FROM companies WHERE market_cap IS NOT NULL"
     ).fetchone()[0]
 
-    # Check signals CSV freshness
+    # Check signals CSV row count
     if os.path.exists(SIGNALS_CSV):
-        mtime = os.path.getmtime(SIGNALS_CSV)
-        stats["signals_last_updated"] = datetime.fromtimestamp(mtime).isoformat()
         with open(SIGNALS_CSV) as f:
             stats["signals_count"] = sum(1 for _ in f) - 1
     conn.close()
@@ -1119,25 +1117,40 @@ def get_health():
     release_tag = _get_installed_release()
     meta = _snapshot_metadata(release_tag)
 
+    # Align signals_last_updated with snapshot as_of (data vintage, not download time)
+    # Preserves field for backward compatibility but uses release date when available
+    if meta["as_of"]:
+        stats["signals_last_updated"] = meta["as_of"]
+    elif os.path.exists(SIGNALS_CSV):
+        # Fallback to file mtime when release date unavailable
+        mtime = os.path.getmtime(SIGNALS_CSV)
+        stats["signals_last_updated"] = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+
     # Fetch latest release from GitHub (cached, non-blocking)
     _fetch_github_releases()
     latest = _GITHUB_RELEASE_CACHE.get("latest_tag")
 
-    # Compute releases_behind (None if either tag is missing)
+    # Compute releases_behind (months behind with monthly cadence; None if unparseable)
     releases_behind = None
     if release_tag and latest:
-        try:
-            # Extract YYYY-MM from "data-YYYY-MM" tags
-            installed_parts = release_tag.split("-")
-            latest_parts = latest.split("-")
-            if len(installed_parts) == 3 and len(latest_parts) == 3:
-                installed_ym = (int(installed_parts[1]), int(installed_parts[2]))
-                latest_ym = (int(latest_parts[1]), int(latest_parts[2]))
-                # Rough month diff (ignores day precision)
-                months_behind = (latest_ym[0] - installed_ym[0]) * 12 + (latest_ym[1] - installed_ym[1])
-                releases_behind = max(0, months_behind)
-        except (ValueError, IndexError):
-            pass
+        # If identical tags, we're current
+        if release_tag == latest:
+            releases_behind = 0
+        else:
+            try:
+                # Extract YYYY-MM from "data-YYYY-MM" tags, ignoring any suffix
+                # (e.g., "data-2026-08-0830" → parse "data-2026-08")
+                installed_parts = release_tag.split("-")
+                latest_parts = latest.split("-")
+                if len(installed_parts) >= 3 and len(latest_parts) >= 3:
+                    installed_ym = (int(installed_parts[1]), int(installed_parts[2]))
+                    latest_ym = (int(latest_parts[1]), int(latest_parts[2]))
+                    # Rough month diff (ignores day precision)
+                    months_behind = (latest_ym[0] - installed_ym[0]) * 12 + (latest_ym[1] - installed_ym[1])
+                    releases_behind = max(0, months_behind)
+            except (ValueError, IndexError):
+                # Unparseable tag format; degrade gracefully
+                pass
 
     snapshot = {
         "installed_release": release_tag,

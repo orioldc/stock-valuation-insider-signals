@@ -164,12 +164,12 @@ def detect_clusters(purchases_df, window_days=30, min_insiders=2):
 
 def load_prices_from_db(tickers):
     """
-    Load daily close prices from DB for all tickers + SPY.
+    Load daily close prices from DB for all tickers + benchmark ETFs.
 
-    DB prices table has everything needed: 3.5M rows, 3K tickers, 2021-2026,
-    including SPY for benchmark returns. No network access required.
+    DB prices table has everything needed: 3.5M rows, 3K tickers, 2019-2026,
+    including SPY/IWM/MDY for size-matched benchmark returns. No network access required.
     """
-    all_tickers = list(set(tickers) | {"SPY"})
+    all_tickers = list(set(tickers) | {"SPY", "IWM", "MDY"})
     logger.info(f"Loading price data for {len(all_tickers)} tickers from DB...")
 
     conn = get_db()
@@ -193,28 +193,103 @@ def load_prices_from_db(tickers):
     for ticker, group in df.groupby('ticker'):
         prices[ticker] = group.set_index('date')['close'].sort_index()
 
-    logger.info(f"Loaded price data for {len(prices)} tickers (including SPY)")
+    logger.info(f"Loaded price data for {len(prices)} tickers (including benchmarks: SPY, IWM, MDY)")
     return prices
+
+
+def compute_historical_market_cap(ticker, signal_date, prices):
+    """
+    Compute market cap at signal_date using historical shares_outstanding and prices.
+
+    Returns (market_cap, data_source) where data_source indicates how it was computed.
+    Falls back to companies.market_cap if historical data unavailable.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Get company_id
+    cur.execute("SELECT id, market_cap FROM companies WHERE ticker = ?", (ticker,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return (None, "missing")
+
+    company_id, fallback_mcap = row
+
+    # Get latest shares_outstanding as of signal_date
+    cur.execute(
+        """
+        SELECT shares
+        FROM shares_outstanding
+        WHERE company_id = ? AND date <= ?
+        ORDER BY date DESC
+        LIMIT 1
+        """,
+        (company_id, signal_date),
+    )
+    shares_row = cur.fetchone()
+
+    conn.close()
+
+    if not shares_row:
+        # Fall back to companies.market_cap
+        return (fallback_mcap, "fallback")
+
+    shares = shares_row[0]
+
+    # Get price at signal_date
+    ticker_prices = prices.get(ticker)
+    if ticker_prices is None:
+        return (fallback_mcap, "fallback")
+
+    # Find the latest price on or before signal_date
+    signal_ts = pd.Timestamp(signal_date)
+    valid_dates = ticker_prices.index[ticker_prices.index <= signal_ts]
+    if len(valid_dates) == 0:
+        return (fallback_mcap, "fallback")
+
+    price = ticker_prices[valid_dates[-1]]
+    market_cap = shares * price
+
+    return (market_cap, "historical")
+
+
+def get_benchmark_for_tier(tier):
+    """Map market cap tier to benchmark ETF."""
+    if tier in ["micro", "small"]:
+        return "IWM"
+    elif tier == "mid":
+        return "MDY"
+    elif tier in ["large", "mega"]:
+        return "SPY"
+    else:  # unknown
+        return "SPY"
 
 
 def compute_forward_returns(clusters_df, prices):
     """
     Compute forward returns for each cluster signal.
 
-    Calculates excess returns vs SPY benchmark at 3m and 12m horizons,
-    which are the key inputs for historical hit rate analysis.
+    Calculates excess returns vs size-matched benchmarks (IWM/MDY/SPY) at 3m and 12m horizons,
+    plus SPY-based excess returns for comparison. Uses historical market cap at signal_date
+    to assign the appropriate benchmark.
     """
+    from signals.size_adjustment import get_tier
+
     periods = {
         'ret_3m': 63,
         'ret_12m': 252,
     }
 
-    spy_prices = prices.get('SPY')
-    if spy_prices is None:
-        logger.error("SPY prices not found in DB - cannot compute excess returns")
-        return pd.DataFrame()
+    # Verify all benchmarks present
+    for benchmark in ['SPY', 'IWM', 'MDY']:
+        if benchmark not in prices:
+            logger.error(f"{benchmark} prices not found in DB - cannot compute size-matched returns")
+            return pd.DataFrame()
 
     results = []
+    tier_stats = {"historical": 0, "fallback": 0, "missing": 0}
+    alignment_drops = 0
 
     for _, cluster in clusters_df.iterrows():
         ticker = cluster['ticker']
@@ -231,70 +306,199 @@ def compute_forward_returns(clusters_df, prices):
         entry_date = valid_dates[0]
         entry_price = ticker_prices[entry_date]
 
-        # SPY entry
+        # Compute historical market cap at signal_date
+        market_cap, mcap_source = compute_historical_market_cap(ticker, str(signal_date.date()), prices)
+        tier_stats[mcap_source] += 1
+
+        # Assign tier and benchmark
+        tier = get_tier(market_cap)
+        benchmark_ticker = get_benchmark_for_tier(tier)
+
+        # Get benchmark prices
+        benchmark_prices = prices[benchmark_ticker]
+        spy_prices = prices['SPY']
+
+        # Benchmark entry - reject if too far from signal_date (max 5 trading days tolerance)
+        # This prevents silently comparing non-overlapping windows when benchmark coverage has gaps
+        MAX_ENTRY_LAG_DAYS = 7  # ~5 trading days tolerance for weekends/holidays
+
+        benchmark_valid = benchmark_prices.index[benchmark_prices.index >= signal_date]
         spy_valid = spy_prices.index[spy_prices.index >= signal_date]
-        if len(spy_valid) == 0:
+
+        if len(benchmark_valid) == 0 or len(spy_valid) == 0:
             continue
-        spy_entry = spy_prices[spy_valid[0]]
+
+        # Check alignment - benchmark must be within tolerance
+        benchmark_entry_date = benchmark_valid[0]
+        spy_entry_date = spy_valid[0]
+
+        if (benchmark_entry_date - signal_date).days > MAX_ENTRY_LAG_DAYS:
+            # Benchmark too far in future - would misalign windows
+            alignment_drops += 1
+            continue
+
+        if (spy_entry_date - signal_date).days > MAX_ENTRY_LAG_DAYS:
+            # SPY too far in future - would misalign windows
+            alignment_drops += 1
+            continue
+
+        benchmark_entry = benchmark_prices[benchmark_entry_date]
+        spy_entry = spy_prices[spy_entry_date]
 
         row = cluster.to_dict()
         row['entry_date'] = str(entry_date.date())
         row['entry_price'] = entry_price
+        row['market_cap_at_signal'] = market_cap
+        row['tier'] = tier
+        row['benchmark'] = benchmark_ticker
 
         for period_name, days in periods.items():
             future = ticker_prices.index[(ticker_prices.index > entry_date)]
+            benchmark_future = benchmark_prices.index[(benchmark_prices.index > entry_date)]
             spy_future = spy_prices.index[(spy_prices.index > entry_date)]
 
-            if len(future) >= days and len(spy_future) >= days:
+            if len(future) >= days and len(benchmark_future) >= days and len(spy_future) >= days:
                 exit_date = future[days - 1]
                 exit_price = ticker_prices[exit_date]
+                benchmark_exit = benchmark_prices[benchmark_future[days - 1]]
                 spy_exit = spy_prices[spy_future[days - 1]]
 
                 stock_ret = (exit_price / entry_price - 1) * 100
+                benchmark_ret = (benchmark_exit / benchmark_entry - 1) * 100
                 spy_ret = (spy_exit / spy_entry - 1) * 100
-                excess = stock_ret - spy_ret
+
+                # Size-matched excess return (primary metric)
+                excess = stock_ret - benchmark_ret
+
+                # SPY excess return (for comparison)
+                excess_spy = stock_ret - spy_ret
 
                 row[period_name] = round(stock_ret, 2)
                 row[f'excess_{period_name}'] = round(excess, 2)
+                row[f'excess_{period_name}_spy'] = round(excess_spy, 2)
             else:
                 row[period_name] = None
                 row[f'excess_{period_name}'] = None
+                row[f'excess_{period_name}_spy'] = None
 
         results.append(row)
 
     df = pd.DataFrame(results)
     logger.info(f"Computed forward returns for {len(df)} clusters")
+    logger.info(f"Market cap sources: {tier_stats['historical']} historical, "
+               f"{tier_stats['fallback']} fallback, {tier_stats['missing']} missing")
+    if alignment_drops > 0:
+        logger.warning(f"Dropped {alignment_drops} clusters due to benchmark misalignment (>7 days lag)")
+
     return df
 
 
 def generate_summary(results_df):
-    """Generate summary statistics."""
+    """Generate summary statistics with size-matched benchmarking."""
     lines = []
     lines.append("=" * 70)
-    lines.append("INSIDER CLUSTER BACKTEST — HISTORICAL ANALYSIS")
+    lines.append("INSIDER CLUSTER BACKTEST — SIZE-MATCHED BENCHMARKS")
     lines.append("=" * 70)
     lines.append(f"\nTotal clusters detected: {len(results_df)}")
     lines.append(f"Unique tickers: {results_df['ticker'].nunique()}")
     lines.append(f"Date range: {results_df['signal_date'].min()} to {results_df['signal_date'].max()}")
 
+    # Market cap distribution
+    valid_mcap = results_df.dropna(subset=['market_cap_at_signal'])
+    if len(valid_mcap) > 0:
+        lines.append(f"\nMarket cap at signal (n={len(valid_mcap)}):")
+        lines.append(f"  Median: ${valid_mcap['market_cap_at_signal'].median() / 1e9:.2f}B")
+        lines.append(f"  Mean: ${valid_mcap['market_cap_at_signal'].mean() / 1e9:.2f}B")
+        under_2b = (valid_mcap['market_cap_at_signal'] < 2e9).mean() * 100
+        over_10b = (valid_mcap['market_cap_at_signal'] >= 10e9).mean() * 100
+        lines.append(f"  Share under $2B: {under_2b:.1f}%")
+        lines.append(f"  Share over $10B: {over_10b:.1f}%")
+
+    # Benchmark usage
+    if 'benchmark' in results_df.columns:
+        benchmark_counts = results_df['benchmark'].value_counts()
+        lines.append(f"\nBenchmark usage:")
+        for benchmark, count in benchmark_counts.items():
+            lines.append(f"  {benchmark}: {count} ({count/len(results_df)*100:.1f}%)")
+
     for period in ['ret_3m', 'ret_12m']:
         period_label = period.replace('ret_', '').upper()
         col = period
         excess_col = f'excess_{period}'
+        excess_spy_col = f'excess_{period}_spy'
 
         valid = results_df.dropna(subset=[col, excess_col])
+        valid_spy = results_df.dropna(subset=[col, excess_spy_col])
         if len(valid) == 0:
             continue
 
-        lines.append(f"\n{'─' * 50}")
+        lines.append(f"\n{'─' * 70}")
         lines.append(f"FORWARD {period_label} RETURNS (n={len(valid)})")
-        lines.append(f"{'─' * 50}")
-        lines.append(f"  Avg stock return:    {valid[col].mean():>7.2f}%")
-        lines.append(f"  Median stock return: {valid[col].median():>7.2f}%")
-        lines.append(f"  Avg excess return:   {valid[excess_col].mean():>7.2f}%")
-        lines.append(f"  Median excess:       {valid[excess_col].median():>7.2f}%")
-        lines.append(f"  Hit rate (>0%):      {(valid[col] > 0).mean()*100:>7.1f}%")
-        lines.append(f"  Hit rate (>SPY):     {(valid[excess_col] > 0).mean()*100:>7.1f}%")
+        lines.append(f"{'─' * 70}")
+        lines.append(f"  Avg stock return:          {valid[col].mean():>7.2f}%")
+        lines.append(f"  Median stock return:       {valid[col].median():>7.2f}%")
+        lines.append(f"  Hit rate (>0%):            {(valid[col] > 0).mean()*100:>7.1f}%")
+
+        lines.append(f"\n  SIZE-MATCHED BENCHMARK:")
+        lines.append(f"    Avg excess return:       {valid[excess_col].mean():>7.2f}%")
+        lines.append(f"    Median excess:           {valid[excess_col].median():>7.2f}%")
+        lines.append(f"    Hit rate (>benchmark):   {(valid[excess_col] > 0).mean()*100:>7.1f}%")
+
+        if len(valid_spy) > 0:
+            lines.append(f"\n  SPY BENCHMARK (for comparison):")
+            lines.append(f"    Avg excess return:       {valid_spy[excess_spy_col].mean():>7.2f}%")
+            lines.append(f"    Median excess:           {valid_spy[excess_spy_col].median():>7.2f}%")
+            lines.append(f"    Hit rate (>SPY):         {(valid_spy[excess_spy_col] > 0).mean()*100:>7.1f}%")
+
+    # By tier
+    lines.append(f"\n{'=' * 70}")
+    lines.append("BY MARKET CAP TIER (12M EXCESS RETURN)")
+    lines.append(f"{'=' * 70}")
+    valid = results_df.dropna(subset=['excess_ret_12m', 'tier'])
+    if len(valid) > 0:
+        from signals.size_adjustment import TIER_ORDER
+        valid['signal_date_ts'] = pd.to_datetime(valid['signal_date'])
+        for tier in TIER_ORDER + ['unknown']:
+            subset = valid[valid['tier'] == tier]
+            if len(subset) == 0:
+                continue
+
+            benchmark = subset.iloc[0]['benchmark'] if 'benchmark' in subset.columns else '?'
+            avg_excess = subset['excess_ret_12m'].mean()
+            med_excess = subset['excess_ret_12m'].median()
+            hit_rate = (subset['excess_ret_12m'] > 0).mean() * 100
+
+            # Signal date range and pre-2021 count
+            min_signal = subset['signal_date_ts'].min().strftime('%Y-%m-%d')
+            max_signal = subset['signal_date_ts'].max().strftime('%Y-%m-%d')
+            pre_2021 = (subset['signal_date_ts'] < '2021-01-01').sum()
+
+            # SPY comparison
+            if f'excess_ret_12m_spy' in subset.columns:
+                spy_subset = subset.dropna(subset=['excess_ret_12m_spy'])
+                if len(spy_subset) > 0:
+                    avg_excess_spy = spy_subset['excess_ret_12m_spy'].mean()
+                    hit_rate_spy = (spy_subset['excess_ret_12m_spy'] > 0).mean() * 100
+                    lines.append(
+                        f"  {tier:<8} ({benchmark}): avg {avg_excess:>7.2f}%  med {med_excess:>7.2f}%  "
+                        f"hit {hit_rate:>4.0f}%  n={len(subset):>4}  pre-2021={pre_2021:>3}"
+                    )
+                    lines.append(
+                        f"            dates: {min_signal} → {max_signal}  "
+                        f"(vs SPY: avg {avg_excess_spy:>7.2f}%, hit {hit_rate_spy:>4.0f}%)"
+                    )
+                else:
+                    lines.append(
+                        f"  {tier:<8} ({benchmark}): avg {avg_excess:>7.2f}%  med {med_excess:>7.2f}%  "
+                        f"hit {hit_rate:>4.0f}%  n={len(subset):>4}  pre-2021={pre_2021:>3}"
+                    )
+                    lines.append(f"            dates: {min_signal} → {max_signal}")
+            else:
+                lines.append(
+                    f"  {tier:<8} ({benchmark}): avg {avg_excess:>7.2f}%  med {med_excess:>7.2f}%  "
+                    f"hit {hit_rate:>4.0f}%  n={len(subset):>4}  pre-2021={pre_2021:>3}"
+                )
+                lines.append(f"            dates: {min_signal} → {max_signal}")
 
     # By cluster size
     lines.append(f"\n{'=' * 50}")
@@ -336,15 +540,12 @@ def generate_summary(results_df):
 
 def investigate_negative_skew(results_df):
     """
-    Investigate the negative median excess return to determine if it's real or a bug.
+    Compare size-matched vs SPY benchmarking to determine if underperformance was a size artifact.
 
-    Checks:
-    1. Are stock and SPY returns measured over same calendar span?
-    2. What's the raw ret_12m distribution vs SPY distribution?
-    3. Are winners being silently dropped (missing prices after run-ups)?
+    Reports distributions and winner/loser breakdowns for both benchmark approaches.
     """
     logger.info("\n" + "=" * 70)
-    logger.info("INVESTIGATING NEGATIVE MEDIAN EXCESS RETURN")
+    logger.info("SIZE-MATCHED vs SPY BENCHMARKING COMPARISON")
     logger.info("=" * 70)
 
     valid_12m = results_df.dropna(subset=['ret_12m', 'excess_ret_12m']).copy()
@@ -356,36 +557,61 @@ def investigate_negative_skew(results_df):
     logger.info(f"\nRaw 12m stock returns: mean={valid_12m['ret_12m'].mean():.2f}%, "
                f"median={valid_12m['ret_12m'].median():.2f}%")
 
-    # Reconstruct SPY returns from excess
-    valid_12m['spy_ret_12m'] = valid_12m['ret_12m'] - valid_12m['excess_ret_12m']
-    logger.info(f"SPY 12m returns: mean={valid_12m['spy_ret_12m'].mean():.2f}%, "
-               f"median={valid_12m['spy_ret_12m'].median():.2f}%")
-    logger.info(f"Excess 12m: mean={valid_12m['excess_ret_12m'].mean():.2f}%, "
+    # Size-matched benchmark
+    valid_12m['benchmark_ret_12m'] = valid_12m['ret_12m'] - valid_12m['excess_ret_12m']
+    logger.info(f"Size-matched benchmark 12m: mean={valid_12m['benchmark_ret_12m'].mean():.2f}%, "
+               f"median={valid_12m['benchmark_ret_12m'].median():.2f}%")
+    logger.info(f"Excess vs size-matched: mean={valid_12m['excess_ret_12m'].mean():.2f}%, "
                f"median={valid_12m['excess_ret_12m'].median():.2f}%")
 
-    # 2. Check for missing winners (tickers that might have delisted after big runs)
-    all_signals = results_df['ticker'].unique()
-    signals_with_12m = valid_12m['ticker'].unique()
-    missing_12m = set(all_signals) - set(signals_with_12m)
-    logger.info(f"\nSignals missing 12m data: {len(missing_12m)} tickers")
-    if len(missing_12m) > 0 and len(missing_12m) < 20:
-        logger.info(f"  Sample: {sorted(list(missing_12m))[:10]}")
+    # SPY comparison
+    if 'excess_ret_12m_spy' in valid_12m.columns:
+        valid_spy = valid_12m.dropna(subset=['excess_ret_12m_spy'])
+        if len(valid_spy) > 0:
+            valid_spy['spy_ret_12m'] = valid_spy['ret_12m'] - valid_spy['excess_ret_12m_spy']
+            logger.info(f"\nSPY 12m returns: mean={valid_spy['spy_ret_12m'].mean():.2f}%, "
+                       f"median={valid_spy['spy_ret_12m'].median():.2f}%")
+            logger.info(f"Excess vs SPY: mean={valid_spy['excess_ret_12m_spy'].mean():.2f}%, "
+                       f"median={valid_spy['excess_ret_12m_spy'].median():.2f}%")
 
-    # 3. Distribution by quintile
-    logger.info(f"\n12m excess return distribution:")
+    # 2. Distribution by quintile
+    logger.info(f"\n12m excess return distribution (size-matched):")
     logger.info(f"  10th percentile: {valid_12m['excess_ret_12m'].quantile(0.1):.2f}%")
     logger.info(f"  25th percentile: {valid_12m['excess_ret_12m'].quantile(0.25):.2f}%")
     logger.info(f"  50th percentile: {valid_12m['excess_ret_12m'].quantile(0.50):.2f}%")
     logger.info(f"  75th percentile: {valid_12m['excess_ret_12m'].quantile(0.75):.2f}%")
     logger.info(f"  90th percentile: {valid_12m['excess_ret_12m'].quantile(0.90):.2f}%")
 
-    # 4. Winners vs losers
+    # 3. Winners vs losers (size-matched)
     winners = valid_12m[valid_12m['excess_ret_12m'] > 0]
     losers = valid_12m[valid_12m['excess_ret_12m'] <= 0]
-    logger.info(f"\nWinners (>SPY): {len(winners)} ({len(winners)/len(valid_12m)*100:.1f}%), "
+    logger.info(f"\nWinners (>size-matched benchmark): {len(winners)} ({len(winners)/len(valid_12m)*100:.1f}%), "
                f"avg excess: {winners['excess_ret_12m'].mean():.2f}%")
-    logger.info(f"Losers (<=SPY): {len(losers)} ({len(losers)/len(valid_12m)*100:.1f}%), "
+    logger.info(f"Losers (<=size-matched benchmark): {len(losers)} ({len(losers)/len(valid_12m)*100:.1f}%), "
                f"avg excess: {losers['excess_ret_12m'].mean():.2f}%")
+
+    # 4. SPY comparison
+    if 'excess_ret_12m_spy' in valid_12m.columns:
+        valid_spy = valid_12m.dropna(subset=['excess_ret_12m_spy'])
+        if len(valid_spy) > 0:
+            winners_spy = valid_spy[valid_spy['excess_ret_12m_spy'] > 0]
+            losers_spy = valid_spy[valid_spy['excess_ret_12m_spy'] <= 0]
+            logger.info(f"\nWinners (>SPY): {len(winners_spy)} ({len(winners_spy)/len(valid_spy)*100:.1f}%), "
+                       f"avg excess: {winners_spy['excess_ret_12m_spy'].mean():.2f}%")
+            logger.info(f"Losers (<=SPY): {len(losers_spy)} ({len(losers_spy)/len(valid_spy)*100:.1f}%), "
+                       f"avg excess: {losers_spy['excess_ret_12m_spy'].mean():.2f}%")
+
+    # 5. Outlier check (exclude >1000% for mean comparison)
+    valid_no_outliers = valid_12m[valid_12m['excess_ret_12m'].abs() <= 1000]
+    logger.info(f"\nExcluding outliers (|excess| > 1000%):")
+    logger.info(f"  Excluded: {len(valid_12m) - len(valid_no_outliers)} clusters")
+    logger.info(f"  Mean excess (size-matched): {valid_no_outliers['excess_ret_12m'].mean():.2f}%")
+
+    if 'excess_ret_12m_spy' in valid_no_outliers.columns:
+        valid_spy_no_outliers = valid_no_outliers.dropna(subset=['excess_ret_12m_spy'])
+        valid_spy_no_outliers = valid_spy_no_outliers[valid_spy_no_outliers['excess_ret_12m_spy'].abs() <= 1000]
+        if len(valid_spy_no_outliers) > 0:
+            logger.info(f"  Mean excess (SPY): {valid_spy_no_outliers['excess_ret_12m_spy'].mean():.2f}%")
 
 
 def run_backtest():

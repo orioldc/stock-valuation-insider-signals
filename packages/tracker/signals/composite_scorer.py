@@ -18,7 +18,7 @@ from signals.size_adjustment import (
     get_tier, TIER_WEIGHTS, TIER_ORDER, size_adjusted_score, bucket_percentile_rank,
 )
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db")
+DB_PATH = os.environ.get("INSIDER_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db"))
 
 
 def _load_market_caps(tickers):

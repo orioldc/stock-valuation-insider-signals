@@ -221,10 +221,15 @@ def get_target_tickers(conn):
         if t not in failed_tickers and t not in tickers_with_coverage
     ]
 
-    # Add SPY if it needs backfilling (even if no purchases)
-    if 'SPY' not in failed_tickers and 'SPY' not in tickers_with_coverage:
-        if 'SPY' not in tickers_needing_backfill:
-            tickers_needing_backfill.append('SPY')
+    # Add benchmark ETFs unconditionally if they need backfilling
+    # Benchmarks have no insider purchases, so they're skipped by the above query,
+    # but they're required for size-matched backtesting - missing benchmarks
+    # silently corrupt excess return calculations, so make them unconditional
+    BENCHMARK_ETFS = ['SPY', 'IWM', 'MDY']
+    for benchmark in BENCHMARK_ETFS:
+        if benchmark not in failed_tickers and benchmark not in tickers_with_coverage:
+            if benchmark not in tickers_needing_backfill:
+                tickers_needing_backfill.append(benchmark)
 
     logger.info(f"Candidates with purchases in gap: {len(candidates)}")
     logger.info(f"Tickers needing backfill: {len(tickers_needing_backfill)}")

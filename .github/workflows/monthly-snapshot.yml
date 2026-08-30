@@ -88,13 +88,6 @@ jobs:
           cd packages/tracker
           python migrate_txn_dedup.py
 
-      - name: Backfill current quarter (full-universe live XML)
-        if: ${{ github.event.inputs.force_full_rebuild != 'true' && github.event.inputs.backfill_current_quarter == 'true' }}
-        timeout-minutes: 240
-        run: |
-          cd packages/tracker
-          python backfill_quarter_live.py
-
       - name: Run incremental refresh (~5-15 min)
         if: ${{ github.event.inputs.force_full_rebuild != 'true' }}
         timeout-minutes: 60
@@ -118,6 +111,102 @@ jobs:
           python run_expanded_pipeline.py
 
       # ── Common: backfill, backtest, sync, compress, publish ──
+      - name: Backfill current quarter if data volume is incomplete
+        if: ${{ github.event.inputs.force_full_rebuild != 'true' }}
+        timeout-minutes: 120
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+
+          # Determine the most recent complete month (ended at least 5 days ago)
+          # to avoid evaluating partial months where Form 4s are still trickling in.
+          EVAL_MONTH=$(python3 -c "
+          from datetime import datetime, timedelta
+          today = datetime.now()
+          # Last day of previous month
+          first_of_this_month = datetime(today.year, today.month, 1)
+          last_month_end = first_of_this_month - timedelta(days=1)
+
+          if (today - last_month_end).days >= 5:
+              print(f'{last_month_end.year:04d}-{last_month_end.month:02d}')
+          else:
+              # Too close to month boundary, go back one more month
+              first_of_last_month = datetime(last_month_end.year, last_month_end.month, 1)
+              two_months_ago_end = first_of_last_month - timedelta(days=1)
+              print(f'{two_months_ago_end.year:04d}-{two_months_ago_end.month:02d}')
+          ")
+
+          TARGET_YEAR="${EVAL_MONTH%-*}"
+          TARGET_MONTH="${EVAL_MONTH#*-}"
+          echo "Evaluating completeness for $TARGET_YEAR-$TARGET_MONTH"
+
+          # Get transaction count for target month in current year
+          CURRENT_COUNT=$(sqlite3 db/insider_signals.db "
+            SELECT COUNT(*) FROM insider_transactions
+            WHERE strftime('%Y', transaction_date) = '$TARGET_YEAR'
+              AND strftime('%m', transaction_date) = '$TARGET_MONTH'
+              AND transaction_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+          ")
+
+          # Get counts for same calendar month in prior 3 years (for robust baseline)
+          PRIOR_YEAR_1=$((TARGET_YEAR - 1))
+          PRIOR_YEAR_2=$((TARGET_YEAR - 2))
+          PRIOR_YEAR_3=$((TARGET_YEAR - 3))
+
+          PRIOR_COUNTS=$(sqlite3 db/insider_signals.db "
+            SELECT strftime('%Y', transaction_date) as year, COUNT(*) as cnt
+            FROM insider_transactions
+            WHERE strftime('%m', transaction_date) = '$TARGET_MONTH'
+              AND transaction_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+              AND strftime('%Y', transaction_date) IN ('$PRIOR_YEAR_1', '$PRIOR_YEAR_2', '$PRIOR_YEAR_3')
+            GROUP BY year
+            ORDER BY year
+          ")
+
+          echo "Current count: $CURRENT_COUNT"
+          echo "Prior years for month $TARGET_MONTH:"
+          echo "$PRIOR_COUNTS"
+
+          # Calculate median of prior years as baseline
+          BASELINE=$(python3 -c "
+          import sys
+          counts = [int(line.split('|')[1]) for line in '''$PRIOR_COUNTS'''.strip().split('\n') if line]
+          if not counts:
+              print(0)
+          else:
+              counts.sort()
+              median = counts[len(counts)//2]
+              print(median)
+          ")
+
+          echo "Baseline (median of prior years): $BASELINE"
+
+          # Apply 70% completeness threshold: catches severely incomplete quarters
+          # (pre-backfill was 25%) while avoiding false positives on normal variance.
+          if [ "$BASELINE" -eq 0 ]; then
+            echo "No baseline data available, running backfill as a precaution"
+            python backfill_quarter_live.py
+          else
+            THRESHOLD=70
+            PERCENTAGE=$(python3 -c "print(int(100 * $CURRENT_COUNT / $BASELINE))")
+            echo "Current month is at $PERCENTAGE% of baseline (threshold: $THRESHOLD%)"
+
+            if [ "$PERCENTAGE" -lt "$THRESHOLD" ]; then
+              echo "Data volume incomplete ($PERCENTAGE% < $THRESHOLD%), running current-quarter backfill"
+              python backfill_quarter_live.py
+            else
+              echo "Data volume complete ($PERCENTAGE% >= $THRESHOLD%), skipping backfill"
+            fi
+          fi
+
+      - name: Backfill current quarter (manual force, full universe)
+        if: ${{ github.event.inputs.force_full_rebuild != 'true' && github.event.inputs.backfill_current_quarter == 'true' }}
+        timeout-minutes: 240
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python backfill_quarter_live.py
+
       - name: Backfill pre-2021 prices
         timeout-minutes: 20
         continue-on-error: true
@@ -172,6 +261,11 @@ jobs:
           if [ "${{ github.event.inputs.force_full_rebuild }}" = "true" ]; then
             MODE="full rebuild"
           fi
+
+          TAG="${{ steps.tag.outputs.tag }}"
+          TITLE="Monthly DB snapshot — $TAG"
+          NOTES="Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV, historical hit rate clusters, and frozen insider snapshot. Generated automatically by the monthly-snapshot workflow ($MODE mode)."
+
           ASSETS="data/insider_signals.db.xz data/latest_signals.csv"
           if [ -f data/historical_clusters.csv ]; then
             ASSETS="$ASSETS data/historical_clusters.csv"
@@ -179,8 +273,21 @@ jobs:
           if [ -f data/insider_frozen.json.gz ]; then
             ASSETS="$ASSETS data/insider_frozen.json.gz"
           fi
-          gh release create "${{ steps.tag.outputs.tag }}" \
-            $ASSETS \
-            --repo ${{ github.repository }} \
-            --title "Monthly DB snapshot — ${{ steps.tag.outputs.tag }}" \
-            --notes "Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV, historical hit rate clusters, and frozen insider snapshot. Generated automatically by the monthly-snapshot workflow ($MODE mode)."
+
+          # Check if release already exists
+          if gh release view "$TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets with --clobber"
+            gh release upload "$TAG" $ASSETS \
+              --repo ${{ github.repository }} \
+              --clobber
+            gh release edit "$TAG" \
+              --repo ${{ github.repository }} \
+              --notes "$NOTES"
+          else
+            echo "Creating new release $TAG"
+            gh release create "$TAG" \
+              $ASSETS \
+              --repo ${{ github.repository }} \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi

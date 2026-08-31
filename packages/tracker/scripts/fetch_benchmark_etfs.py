@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-Fetch benchmark ETF prices (IWM, MDY) for size-matched backtesting.
+Fetch benchmark ETF prices for multi-benchmark backtesting.
 
 Reuses the batched yfinance fetching from backfill_prices.py to download
-IWM (Russell 2000) and MDY (S&P MidCap 400) over the full price coverage
-window. SPY is already present, so this completes the benchmark suite.
+benchmark indices over the full price coverage window:
+- IWM (Russell 2000 small-cap)
+- MDY (S&P MidCap 400)
+- QQQ (Nasdaq-100)
+- ^IXIC (Nasdaq Composite)
+- URTH (iShares MSCI World)
+- ACWI (MSCI All-Country World)
+
+SPY (S&P 500) is already present. Together these enable measuring cluster
+performance against size-matched, tech-focused, and global benchmarks.
 """
 
 import sys
@@ -32,7 +40,7 @@ from pipeline.provenance import record_run
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-BENCHMARK_ETFS = ["IWM", "MDY"]  # SPY already exists
+BENCHMARK_ETFS = ["IWM", "MDY", "QQQ", "^IXIC", "URTH", "ACWI"]  # SPY already exists
 
 
 def _ensure_failures_table(conn):
@@ -188,7 +196,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Fetch benchmark ETF prices (IWM, MDY) for size-matched backtesting"
+        description="Fetch benchmark ETF prices (IWM, MDY, QQQ, ^IXIC, URTH, ACWI) for multi-benchmark backtesting"
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Report what would be fetched"

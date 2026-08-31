@@ -162,14 +162,38 @@ def detect_clusters(purchases_df, window_days=30, min_insiders=2):
     return df
 
 
+def load_split_events():
+    """
+    Load all split events from DB into a dict keyed by ticker.
+
+    Returns dict mapping ticker -> list of (date, ratio) sorted by date.
+    Each entry represents a split: forward k:1 has ratio=k, reverse 1:k has ratio=1/k.
+    """
+    conn = get_db()
+    df = pd.read_sql_query("""
+        SELECT ticker, date, ratio
+        FROM split_events
+        ORDER BY ticker, date
+    """, conn)
+    conn.close()
+
+    splits_by_ticker = {}
+    for ticker, group in df.groupby('ticker'):
+        splits_by_ticker[ticker] = list(group[['date', 'ratio']].itertuples(index=False, name=None))
+
+    logger.info(f"Loaded {len(df)} split events for {len(splits_by_ticker)} tickers")
+    return splits_by_ticker
+
+
 def load_prices_from_db(tickers):
     """
     Load daily close prices from DB for all tickers + benchmark ETFs.
 
     DB prices table has everything needed: 3.5M rows, 3K tickers, 2019-2026,
-    including SPY/IWM/MDY for size-matched benchmark returns. No network access required.
+    including all benchmarks (SPY/IWM/MDY/QQQ/^IXIC/URTH/ACWI). No network access required.
     """
-    all_tickers = list(set(tickers) | {"SPY", "IWM", "MDY"})
+    all_benchmarks = {"SPY", "IWM", "MDY", "QQQ", "^IXIC", "URTH", "ACWI"}
+    all_tickers = list(set(tickers) | all_benchmarks)
     logger.info(f"Loading price data for {len(all_tickers)} tickers from DB...")
 
     conn = get_db()
@@ -193,28 +217,53 @@ def load_prices_from_db(tickers):
     for ticker, group in df.groupby('ticker'):
         prices[ticker] = group.set_index('date')['close'].sort_index()
 
-    logger.info(f"Loaded price data for {len(prices)} tickers (including benchmarks: SPY, IWM, MDY)")
+    loaded_benchmarks = [b for b in all_benchmarks if b in prices]
+    logger.info(f"Loaded price data for {len(prices)} tickers (including benchmarks: {', '.join(sorted(loaded_benchmarks))})")
     return prices
 
 
-def compute_historical_market_cap(ticker, signal_date, prices):
+def compute_historical_market_cap(ticker, signal_date, prices, split_events):
     """
-    Compute market cap at signal_date using historical shares_outstanding and prices.
+    Compute market cap at signal_date using historical shares_outstanding and split-adjusted prices.
 
-    Returns (market_cap, data_source) where data_source indicates how it was computed.
+    Correct formula: market_cap = adjusted_price * shares_as_filed * PROD(split_ratio for splits after signal_date)
+
+    The prices table stores back-adjusted prices (adjusted to a recent reference date).
+    shares_outstanding stores as-filed share counts (not adjusted for future splits).
+    To get the true market cap at signal_date, we must undo the forward adjustments by
+    multiplying by the cumulative split ratio for all splits that occurred AFTER signal_date.
+
+    Example: stock at $3 today after 1:100 reverse split shows $300 adjusted price at signal_date.
+    If shares_as_filed = 1M at signal_date, true market_cap = $300 * 1M * 0.01 = $3M, not $300M.
+
+    Ratio guard: The reconstruction error is directional - missing reverse-split ratios and
+    ordinary/ADS confusion both INFLATE the historical figure. So we anchor against current
+    market cap: if historical/current > 50x, the reconstruction is untrustworthy.
+
+    Threshold rationale: 50x allows for genuine 98% multi-year drawdowns (1/0.02 = 50x)
+    while rejecting penny-stock reverse-split contamination (which shows ratios in the
+    hundreds or thousands). A tighter threshold (e.g. 20x) would discard real crashes.
+
+    Returns (market_cap, data_source, current_market_cap) where data_source indicates how it was computed.
     Falls back to companies.market_cap if historical data unavailable.
+    Returns (None, "unknown", current_mcap) if computed market cap is implausible or ratio guard triggers.
     """
+    # Plausibility bounds
+    MIN_PLAUSIBLE = 1e6   # $1M
+    MAX_PLAUSIBLE = 5e12  # $5T (matches scripts/recompute_market_caps.py convention)
+    MAX_RATIO = 50.0      # historical/current ratio threshold
+
     conn = get_db()
     cur = conn.cursor()
 
-    # Get company_id
+    # Get company_id and current market cap
     cur.execute("SELECT id, market_cap FROM companies WHERE ticker = ?", (ticker,))
     row = cur.fetchone()
     if not row:
         conn.close()
-        return (None, "missing")
+        return (None, "missing", None)
 
-    company_id, fallback_mcap = row
+    company_id, current_mcap = row
 
     # Get latest shares_outstanding as of signal_date
     cur.execute(
@@ -233,25 +282,47 @@ def compute_historical_market_cap(ticker, signal_date, prices):
 
     if not shares_row:
         # Fall back to companies.market_cap
-        return (fallback_mcap, "fallback")
+        return (current_mcap, "fallback", current_mcap)
 
     shares = shares_row[0]
 
     # Get price at signal_date
     ticker_prices = prices.get(ticker)
     if ticker_prices is None:
-        return (fallback_mcap, "fallback")
+        return (current_mcap, "fallback", current_mcap)
 
     # Find the latest price on or before signal_date
     signal_ts = pd.Timestamp(signal_date)
     valid_dates = ticker_prices.index[ticker_prices.index <= signal_ts]
     if len(valid_dates) == 0:
-        return (fallback_mcap, "fallback")
+        return (current_mcap, "fallback", current_mcap)
 
     price = ticker_prices[valid_dates[-1]]
-    market_cap = shares * price
 
-    return (market_cap, "historical")
+    # Compute cumulative split ratio for all splits AFTER signal_date
+    # Forward k:1 split has ratio=k; reverse 1:k split has ratio=1/k
+    # Cumulative ratio is the product of all ratios
+    cumulative_ratio = 1.0
+    ticker_splits = split_events.get(ticker, [])
+    for split_date, ratio in ticker_splits:
+        if split_date > signal_date:
+            cumulative_ratio *= ratio
+
+    # Apply correction: market_cap = adjusted_price * shares_as_filed * cumulative_split_ratio
+    market_cap = shares * price * cumulative_ratio
+
+    # Ratio guard: if historical/current exceeds threshold, reconstruction is untrustworthy
+    # This catches incomplete split_events and ordinary/ADS basis switches
+    if current_mcap and current_mcap > 0:
+        ratio = market_cap / current_mcap
+        if ratio > MAX_RATIO:
+            return (None, "unknown", current_mcap)
+
+    # Plausibility guard: reject nonsensical absolute values
+    if market_cap < MIN_PLAUSIBLE or market_cap > MAX_PLAUSIBLE:
+        return (None, "unknown", current_mcap)
+
+    return (market_cap, "historical", current_mcap)
 
 
 def get_benchmark_for_tier(tier):
@@ -266,13 +337,22 @@ def get_benchmark_for_tier(tier):
         return "SPY"
 
 
-def compute_forward_returns(clusters_df, prices):
+def compute_forward_returns(clusters_df, prices, split_events):
     """
-    Compute forward returns for each cluster signal.
+    Compute forward returns for each cluster signal against multiple benchmarks.
 
-    Calculates excess returns vs size-matched benchmarks (IWM/MDY/SPY) at 3m and 12m horizons,
-    plus SPY-based excess returns for comparison. Uses historical market cap at signal_date
-    to assign the appropriate benchmark.
+    Calculates excess returns vs:
+    - Size-matched benchmarks (IWM/MDY/SPY) - stored as excess_ret_3m/12m
+    - SPY - stored as excess_ret_3m/12m_spy
+    - QQQ - stored as excess_ret_3m/12m_qqq
+    - ^IXIC - stored as excess_ret_3m/12m_ixic
+    - URTH - stored as excess_ret_3m/12m_urth
+    - ACWI - stored as excess_ret_3m/12m_acwi
+
+    Uses historical market cap at signal_date to assign size-matched benchmark.
+    Market cap computation now accounts for split adjustments to avoid directional bias.
+    Requires both stock and benchmark to have same 252 or 63 trading days.
+    Refuses to compute when benchmark has no price near signal_date (>7 days lag).
     """
     from signals.size_adjustment import get_tier
 
@@ -281,15 +361,30 @@ def compute_forward_returns(clusters_df, prices):
         'ret_12m': 252,
     }
 
-    # Verify all benchmarks present
-    for benchmark in ['SPY', 'IWM', 'MDY']:
-        if benchmark not in prices:
-            logger.error(f"{benchmark} prices not found in DB - cannot compute size-matched returns")
-            return pd.DataFrame()
+    # All benchmarks to compare against
+    additional_benchmarks = ['QQQ', '^IXIC', 'URTH', 'ACWI']
+    benchmark_suffixes = {
+        'SPY': 'spy',
+        'QQQ': 'qqq',
+        '^IXIC': 'ixic',
+        'URTH': 'urth',
+        'ACWI': 'acwi',
+    }
+
+    # Verify required benchmarks present
+    required = ['SPY', 'IWM', 'MDY'] + additional_benchmarks
+    missing = [b for b in required if b not in prices]
+    if missing:
+        logger.error(f"Missing benchmark prices: {missing}")
+        return pd.DataFrame()
 
     results = []
-    tier_stats = {"historical": 0, "fallback": 0, "missing": 0}
+    tier_stats = {"historical": 0, "fallback": 0, "missing": 0, "unknown": 0}
     alignment_drops = 0
+    benchmark_alignment_drops = {b: 0 for b in required}
+
+    # Max lag tolerance for benchmark entry vs signal_date
+    MAX_ENTRY_LAG_DAYS = 7  # ~5 trading days tolerance for weekends/holidays
 
     for _, cluster in clusters_df.iterrows():
         ticker = cluster['ticker']
@@ -307,101 +402,137 @@ def compute_forward_returns(clusters_df, prices):
         entry_price = ticker_prices[entry_date]
 
         # Compute historical market cap at signal_date
-        market_cap, mcap_source = compute_historical_market_cap(ticker, str(signal_date.date()), prices)
+        market_cap, mcap_source, current_mcap = compute_historical_market_cap(ticker, str(signal_date.date()), prices, split_events)
         tier_stats[mcap_source] += 1
 
-        # Assign tier and benchmark
+        # Assign tier and size-matched benchmark
         tier = get_tier(market_cap)
         benchmark_ticker = get_benchmark_for_tier(tier)
 
-        # Get benchmark prices
-        benchmark_prices = prices[benchmark_ticker]
-        spy_prices = prices['SPY']
+        # Get all benchmark prices and check alignment
+        benchmark_data = {}
+        skip_cluster = False
 
-        # Benchmark entry - reject if too far from signal_date (max 5 trading days tolerance)
-        # This prevents silently comparing non-overlapping windows when benchmark coverage has gaps
-        MAX_ENTRY_LAG_DAYS = 7  # ~5 trading days tolerance for weekends/holidays
+        for bench in required:
+            bench_prices = prices[bench]
+            bench_valid = bench_prices.index[bench_prices.index >= signal_date]
 
-        benchmark_valid = benchmark_prices.index[benchmark_prices.index >= signal_date]
-        spy_valid = spy_prices.index[spy_prices.index >= signal_date]
+            if len(bench_valid) == 0:
+                skip_cluster = True
+                break
 
-        if len(benchmark_valid) == 0 or len(spy_valid) == 0:
-            continue
+            bench_entry_date = bench_valid[0]
+            if (bench_entry_date - signal_date).days > MAX_ENTRY_LAG_DAYS:
+                benchmark_alignment_drops[bench] += 1
+                skip_cluster = True
+                break
 
-        # Check alignment - benchmark must be within tolerance
-        benchmark_entry_date = benchmark_valid[0]
-        spy_entry_date = spy_valid[0]
+            benchmark_data[bench] = {
+                'prices': bench_prices,
+                'entry_date': bench_entry_date,
+                'entry_price': bench_prices[bench_entry_date],
+            }
 
-        if (benchmark_entry_date - signal_date).days > MAX_ENTRY_LAG_DAYS:
-            # Benchmark too far in future - would misalign windows
+        if skip_cluster:
             alignment_drops += 1
             continue
-
-        if (spy_entry_date - signal_date).days > MAX_ENTRY_LAG_DAYS:
-            # SPY too far in future - would misalign windows
-            alignment_drops += 1
-            continue
-
-        benchmark_entry = benchmark_prices[benchmark_entry_date]
-        spy_entry = spy_prices[spy_entry_date]
 
         row = cluster.to_dict()
         row['entry_date'] = str(entry_date.date())
         row['entry_price'] = entry_price
         row['market_cap_at_signal'] = market_cap
+        row['current_market_cap'] = current_mcap
+        row['market_cap_source'] = mcap_source
         row['tier'] = tier
         row['benchmark'] = benchmark_ticker
 
         for period_name, days in periods.items():
             future = ticker_prices.index[(ticker_prices.index > entry_date)]
-            benchmark_future = benchmark_prices.index[(benchmark_prices.index > entry_date)]
-            spy_future = spy_prices.index[(spy_prices.index > entry_date)]
 
-            if len(future) >= days and len(benchmark_future) >= days and len(spy_future) >= days:
-                exit_date = future[days - 1]
-                exit_price = ticker_prices[exit_date]
-                benchmark_exit = benchmark_prices[benchmark_future[days - 1]]
-                spy_exit = spy_prices[spy_future[days - 1]]
-
-                stock_ret = (exit_price / entry_price - 1) * 100
-                benchmark_ret = (benchmark_exit / benchmark_entry - 1) * 100
-                spy_ret = (spy_exit / spy_entry - 1) * 100
-
-                # Size-matched excess return (primary metric)
-                excess = stock_ret - benchmark_ret
-
-                # SPY excess return (for comparison)
-                excess_spy = stock_ret - spy_ret
-
-                row[period_name] = round(stock_ret, 2)
-                row[f'excess_{period_name}'] = round(excess, 2)
-                row[f'excess_{period_name}_spy'] = round(excess_spy, 2)
-            else:
+            if len(future) < days:
+                # Stock doesn't have enough future data
                 row[period_name] = None
                 row[f'excess_{period_name}'] = None
-                row[f'excess_{period_name}_spy'] = None
+                for bench, suffix in benchmark_suffixes.items():
+                    row[f'excess_{period_name}_{suffix}'] = None
+                continue
+
+            exit_date = future[days - 1]
+            exit_price = ticker_prices[exit_date]
+            stock_ret = (exit_price / entry_price - 1) * 100
+
+            row[period_name] = round(stock_ret, 2)
+
+            # Compute excess returns for each benchmark
+            for bench, suffix in benchmark_suffixes.items():
+                bench_info = benchmark_data[bench]
+                bench_future = bench_info['prices'].index[
+                    bench_info['prices'].index > bench_info['entry_date']
+                ]
+
+                if len(bench_future) >= days:
+                    bench_exit_date = bench_future[days - 1]
+                    bench_exit_price = bench_info['prices'][bench_exit_date]
+                    bench_ret = (bench_exit_price / bench_info['entry_price'] - 1) * 100
+                    excess = stock_ret - bench_ret
+                    row[f'excess_{period_name}_{suffix}'] = round(excess, 2)
+                else:
+                    row[f'excess_{period_name}_{suffix}'] = None
+
+            # Size-matched excess return (primary metric, kept as excess_ret_3m/12m for backward compat)
+            size_matched_bench = benchmark_ticker
+            if size_matched_bench in benchmark_data:
+                bench_info = benchmark_data[size_matched_bench]
+                bench_future = bench_info['prices'].index[
+                    bench_info['prices'].index > bench_info['entry_date']
+                ]
+                if len(bench_future) >= days:
+                    bench_exit_date = bench_future[days - 1]
+                    bench_exit_price = bench_info['prices'][bench_exit_date]
+                    bench_ret = (bench_exit_price / bench_info['entry_price'] - 1) * 100
+                    excess = stock_ret - bench_ret
+                    row[f'excess_{period_name}'] = round(excess, 2)
+                else:
+                    row[f'excess_{period_name}'] = None
+            else:
+                row[f'excess_{period_name}'] = None
 
         results.append(row)
 
     df = pd.DataFrame(results)
     logger.info(f"Computed forward returns for {len(df)} clusters")
     logger.info(f"Market cap sources: {tier_stats['historical']} historical, "
-               f"{tier_stats['fallback']} fallback, {tier_stats['missing']} missing")
+               f"{tier_stats['fallback']} fallback (today's value for historical signal), "
+               f"{tier_stats['unknown']} unknown (implausible), {tier_stats['missing']} missing")
     if alignment_drops > 0:
         logger.warning(f"Dropped {alignment_drops} clusters due to benchmark misalignment (>7 days lag)")
+        for bench, count in benchmark_alignment_drops.items():
+            if count > 0:
+                logger.warning(f"  {bench}: {count} clusters dropped")
 
     return df
 
 
 def generate_summary(results_df):
-    """Generate summary statistics with size-matched benchmarking."""
+    """Generate summary statistics with multi-benchmark comparison."""
     lines = []
-    lines.append("=" * 70)
-    lines.append("INSIDER CLUSTER BACKTEST — SIZE-MATCHED BENCHMARKS")
-    lines.append("=" * 70)
+    lines.append("=" * 80)
+    lines.append("INSIDER CLUSTER BACKTEST — MULTI-BENCHMARK COMPARISON")
+    lines.append("=" * 80)
     lines.append(f"\nTotal clusters detected: {len(results_df)}")
     lines.append(f"Unique tickers: {results_df['ticker'].nunique()}")
     lines.append(f"Date range: {results_df['signal_date'].min()} to {results_df['signal_date'].max()}")
+
+    # Market cap provenance
+    if 'market_cap_source' in results_df.columns:
+        lines.append(f"\nMarket cap provenance:")
+        provenance_counts = results_df['market_cap_source'].value_counts()
+        for source in ['historical', 'fallback', 'unknown', 'missing']:
+            count = provenance_counts.get(source, 0)
+            pct = count / len(results_df) * 100 if len(results_df) > 0 else 0
+            lines.append(f"  {source:12s}: {count:4d} ({pct:5.1f}%)")
+        lines.append(f"\nNOTE: 'fallback' uses today's market cap for signals up to 6 years old (look-ahead error).")
+        lines.append(f"      'unknown' = computed value implausible (outside $1M-$5T range).")
 
     # Market cap distribution
     valid_mcap = results_df.dropna(subset=['market_cap_at_signal'])
@@ -414,91 +545,170 @@ def generate_summary(results_df):
         lines.append(f"  Share under $2B: {under_2b:.1f}%")
         lines.append(f"  Share over $10B: {over_10b:.1f}%")
 
-    # Benchmark usage
+    # Benchmark usage (size-matched)
     if 'benchmark' in results_df.columns:
         benchmark_counts = results_df['benchmark'].value_counts()
-        lines.append(f"\nBenchmark usage:")
+        lines.append(f"\nSize-matched benchmark usage:")
         for benchmark, count in benchmark_counts.items():
             lines.append(f"  {benchmark}: {count} ({count/len(results_df)*100:.1f}%)")
+
+    # Show mega and large tier membership lists for eyeballing
+    if 'tier' in results_df.columns:
+        mega = results_df[results_df['tier'] == 'mega']
+        if len(mega) > 0:
+            mega_tickers = sorted(mega['ticker'].unique())
+            lines.append(f"\nMEGA tier members (n={len(mega_tickers)}):")
+            for ticker in mega_tickers:
+                ticker_rows = mega[mega['ticker'] == ticker]
+                hist_mcap = ticker_rows.iloc[0]['market_cap_at_signal']
+                curr_mcap = ticker_rows.iloc[0].get('current_market_cap')
+                if hist_mcap:
+                    hist_str = f"hist ${hist_mcap/1e9:.1f}B"
+                else:
+                    hist_str = "hist unknown"
+                if curr_mcap:
+                    curr_str = f"curr ${curr_mcap/1e9:.1f}B"
+                else:
+                    curr_str = "curr unknown"
+                lines.append(f"  {ticker:6s}: {hist_str:20s} {curr_str}")
+
+        large = results_df[results_df['tier'] == 'large']
+        if len(large) > 0:
+            large_tickers = sorted(large['ticker'].unique())
+            lines.append(f"\nLARGE tier members (n={len(large_tickers)}):")
+            for ticker in large_tickers:
+                ticker_rows = large[large['ticker'] == ticker]
+                hist_mcap = ticker_rows.iloc[0]['market_cap_at_signal']
+                curr_mcap = ticker_rows.iloc[0].get('current_market_cap')
+                if hist_mcap:
+                    hist_str = f"hist ${hist_mcap/1e9:.1f}B"
+                else:
+                    hist_str = "hist unknown"
+                if curr_mcap:
+                    curr_str = f"curr ${curr_mcap/1e9:.1f}B"
+                else:
+                    curr_str = "curr unknown"
+                lines.append(f"  {ticker:6s}: {hist_str:20s} {curr_str}")
+
+    # Multi-benchmark comparison for each period
+    benchmarks_to_report = [
+        ('spy', 'SPY (S&P 500)'),
+        ('qqq', 'QQQ (Nasdaq-100)'),
+        ('ixic', '^IXIC (Nasdaq Composite)'),
+        ('urth', 'URTH (MSCI World)'),
+        ('acwi', 'ACWI (MSCI All-Country World)'),
+        (None, 'Size-matched (IWM/MDY/SPY)')  # None = excess_ret_3m/12m
+    ]
 
     for period in ['ret_3m', 'ret_12m']:
         period_label = period.replace('ret_', '').upper()
         col = period
-        excess_col = f'excess_{period}'
-        excess_spy_col = f'excess_{period}_spy'
 
-        valid = results_df.dropna(subset=[col, excess_col])
-        valid_spy = results_df.dropna(subset=[col, excess_spy_col])
-        if len(valid) == 0:
+        # Stock returns summary
+        valid_stock = results_df.dropna(subset=[col])
+        if len(valid_stock) == 0:
             continue
 
-        lines.append(f"\n{'─' * 70}")
-        lines.append(f"FORWARD {period_label} RETURNS (n={len(valid)})")
-        lines.append(f"{'─' * 70}")
-        lines.append(f"  Avg stock return:          {valid[col].mean():>7.2f}%")
-        lines.append(f"  Median stock return:       {valid[col].median():>7.2f}%")
-        lines.append(f"  Hit rate (>0%):            {(valid[col] > 0).mean()*100:>7.1f}%")
+        lines.append(f"\n{'=' * 80}")
+        lines.append(f"FORWARD {period_label} RETURNS")
+        lines.append(f"{'=' * 80}")
+        lines.append(f"  Stock returns (n={len(valid_stock)}):")
+        lines.append(f"    Median:     {valid_stock[col].median():>7.2f}%")
+        lines.append(f"    Mean:       {valid_stock[col].mean():>7.2f}%")
+        lines.append(f"    Hit rate:   {(valid_stock[col] > 0).mean()*100:>7.1f}%")
 
-        lines.append(f"\n  SIZE-MATCHED BENCHMARK:")
-        lines.append(f"    Avg excess return:       {valid[excess_col].mean():>7.2f}%")
-        lines.append(f"    Median excess:           {valid[excess_col].median():>7.2f}%")
-        lines.append(f"    Hit rate (>benchmark):   {(valid[excess_col] > 0).mean()*100:>7.1f}%")
+        # Benchmark comparisons
+        lines.append(f"\n  Excess returns vs benchmarks:")
+        for suffix, label in benchmarks_to_report:
+            if suffix is None:
+                # Size-matched benchmark
+                excess_col = f'excess_{period}'
+            else:
+                excess_col = f'excess_{period}_{suffix}'
 
-        if len(valid_spy) > 0:
-            lines.append(f"\n  SPY BENCHMARK (for comparison):")
-            lines.append(f"    Avg excess return:       {valid_spy[excess_spy_col].mean():>7.2f}%")
-            lines.append(f"    Median excess:           {valid_spy[excess_spy_col].median():>7.2f}%")
-            lines.append(f"    Hit rate (>SPY):         {(valid_spy[excess_spy_col] > 0).mean()*100:>7.1f}%")
+            valid = results_df.dropna(subset=[excess_col])
+            if len(valid) == 0:
+                lines.append(f"\n    {label}: NO DATA")
+                continue
 
-    # By tier
-    lines.append(f"\n{'=' * 70}")
-    lines.append("BY MARKET CAP TIER (12M EXCESS RETURN)")
-    lines.append(f"{'=' * 70}")
-    valid = results_df.dropna(subset=['excess_ret_12m', 'tier'])
+            # Compute statistics
+            median_excess = valid[excess_col].median()
+            mean_excess = valid[excess_col].mean()
+            win_rate = (valid[excess_col] > 0).mean() * 100
+
+            # Exclude outliers (|excess| > 1000%) for cleaner mean
+            valid_no_outliers = valid[valid[excess_col].abs() <= 1000]
+            mean_no_outliers = valid_no_outliers[excess_col].mean()
+            n_outliers = len(valid) - len(valid_no_outliers)
+
+            lines.append(f"\n    {label}:")
+            lines.append(f"      Median excess:      {median_excess:>7.2f}%")
+            lines.append(f"      Win rate:           {win_rate:>7.1f}%")
+            lines.append(f"      Mean excess:        {mean_excess:>7.2f}%")
+            if n_outliers > 0:
+                lines.append(f"      Mean (no outliers): {mean_no_outliers:>7.2f}%  ({n_outliers} outliers excluded)")
+            lines.append(f"      n={len(valid)}")
+
+    # By tier - report each benchmark
+    lines.append(f"\n{'=' * 80}")
+    lines.append("BY MARKET CAP TIER (12M EXCESS RETURN VS EACH BENCHMARK)")
+    lines.append(f"{'=' * 80}")
+    valid = results_df.dropna(subset=['tier'])
     if len(valid) > 0:
         from signals.size_adjustment import TIER_ORDER
         valid['signal_date_ts'] = pd.to_datetime(valid['signal_date'])
+
+        benchmarks_for_tier = [
+            (None, 'Size-matched'),
+            ('spy', 'SPY'),
+            ('qqq', 'QQQ'),
+            ('ixic', '^IXIC'),
+            ('urth', 'URTH'),
+            ('acwi', 'ACWI'),
+        ]
+
         for tier in TIER_ORDER + ['unknown']:
             subset = valid[valid['tier'] == tier]
             if len(subset) == 0:
                 continue
 
-            benchmark = subset.iloc[0]['benchmark'] if 'benchmark' in subset.columns else '?'
-            avg_excess = subset['excess_ret_12m'].mean()
-            med_excess = subset['excess_ret_12m'].median()
-            hit_rate = (subset['excess_ret_12m'] > 0).mean() * 100
-
-            # Signal date range and pre-2021 count
+            # Tier summary line with provenance breakdown
+            size_matched_bench = subset.iloc[0]['benchmark'] if 'benchmark' in subset.columns else '?'
             min_signal = subset['signal_date_ts'].min().strftime('%Y-%m-%d')
             max_signal = subset['signal_date_ts'].max().strftime('%Y-%m-%d')
             pre_2021 = (subset['signal_date_ts'] < '2021-01-01').sum()
 
-            # SPY comparison
-            if f'excess_ret_12m_spy' in subset.columns:
-                spy_subset = subset.dropna(subset=['excess_ret_12m_spy'])
-                if len(spy_subset) > 0:
-                    avg_excess_spy = spy_subset['excess_ret_12m_spy'].mean()
-                    hit_rate_spy = (spy_subset['excess_ret_12m_spy'] > 0).mean() * 100
-                    lines.append(
-                        f"  {tier:<8} ({benchmark}): avg {avg_excess:>7.2f}%  med {med_excess:>7.2f}%  "
-                        f"hit {hit_rate:>4.0f}%  n={len(subset):>4}  pre-2021={pre_2021:>3}"
-                    )
-                    lines.append(
-                        f"            dates: {min_signal} → {max_signal}  "
-                        f"(vs SPY: avg {avg_excess_spy:>7.2f}%, hit {hit_rate_spy:>4.0f}%)"
-                    )
-                else:
-                    lines.append(
-                        f"  {tier:<8} ({benchmark}): avg {avg_excess:>7.2f}%  med {med_excess:>7.2f}%  "
-                        f"hit {hit_rate:>4.0f}%  n={len(subset):>4}  pre-2021={pre_2021:>3}"
-                    )
-                    lines.append(f"            dates: {min_signal} → {max_signal}")
+            # Provenance breakdown within tier
+            if 'market_cap_source' in subset.columns:
+                hist_count = (subset['market_cap_source'] == 'historical').sum()
+                fallback_count = (subset['market_cap_source'] == 'fallback').sum()
+                unknown_count = (subset['market_cap_source'] == 'unknown').sum()
+                provenance_str = f"hist={hist_count}, fallback={fallback_count}, unknown={unknown_count}"
             else:
+                provenance_str = "provenance unknown"
+
+            lines.append(f"\n  {tier.upper()} (n={len(subset)}, {provenance_str}, pre-2021={pre_2021}, size-matched={size_matched_bench})")
+            lines.append(f"    Signal dates: {min_signal} → {max_signal}")
+
+            # Report stats for each benchmark
+            for suffix, label in benchmarks_for_tier:
+                if suffix is None:
+                    excess_col = 'excess_ret_12m'
+                else:
+                    excess_col = f'excess_ret_12m_{suffix}'
+
+                bench_subset = subset.dropna(subset=[excess_col])
+                if len(bench_subset) == 0:
+                    continue
+
+                med_excess = bench_subset[excess_col].median()
+                win_rate = (bench_subset[excess_col] > 0).mean() * 100
+                mean_excess = bench_subset[excess_col].mean()
+
                 lines.append(
-                    f"  {tier:<8} ({benchmark}): avg {avg_excess:>7.2f}%  med {med_excess:>7.2f}%  "
-                    f"hit {hit_rate:>4.0f}%  n={len(subset):>4}  pre-2021={pre_2021:>3}"
+                    f"      {label:12s}: med {med_excess:>7.2f}%  win {win_rate:>4.0f}%  "
+                    f"mean {mean_excess:>7.2f}%"
                 )
-                lines.append(f"            dates: {min_signal} → {max_signal}")
 
     # By cluster size
     lines.append(f"\n{'=' * 50}")
@@ -536,6 +746,88 @@ def generate_summary(results_df):
                            f"med: {subset['excess_ret_3m'].median():>7.2f}%  n={len(subset)}")
 
     return "\n".join(lines)
+
+
+def verify_price_series_consistency(split_events, prices):
+    """
+    Verify that price series are internally consistent (back-adjusted to single reference).
+
+    Checks whether prices exhibit discontinuities at split dates that would indicate
+    the series was built from chunks fetched at different times (split between fetches).
+
+    A consistent back-adjusted series should NOT show price changes proportional to
+    the split ratio at split dates — the entire history is already adjusted.
+
+    Returns dict with findings for each ticker checked.
+    """
+    test_tickers = ['XXII', 'WINT', 'ASTI']
+    logger.info("\n" + "=" * 70)
+    logger.info("PRICE SERIES CONSISTENCY CHECK")
+    logger.info("=" * 70)
+    logger.info("Checking for discontinuities at split dates (would indicate")
+    logger.info("price series built from chunks fetched at different times).")
+    logger.info("")
+
+    findings = {}
+
+    for ticker in test_tickers:
+        ticker_splits = split_events.get(ticker, [])
+        ticker_prices = prices.get(ticker)
+
+        if not ticker_splits or ticker_prices is None:
+            logger.info(f"{ticker}: No splits or no price data, skipping")
+            findings[ticker] = "no_data"
+            continue
+
+        discontinuities = []
+
+        for split_date, ratio in ticker_splits:
+            # Find price before and after split
+            split_ts = pd.Timestamp(split_date)
+
+            before_dates = ticker_prices.index[ticker_prices.index < split_ts]
+            after_dates = ticker_prices.index[ticker_prices.index >= split_ts]
+
+            if len(before_dates) == 0 or len(after_dates) == 0:
+                continue
+
+            price_before = ticker_prices[before_dates[-1]]
+            price_after = ticker_prices[after_dates[0]]
+            date_before = before_dates[-1]
+            date_after = after_dates[0]
+
+            # Price ratio at split (should NOT match split ratio if back-adjusted consistently)
+            price_ratio = price_after / price_before if price_before != 0 else 0
+            ratio_error = abs(price_ratio - ratio)
+
+            # Discontinuity detected if price_ratio ~= ratio (within 10% tolerance)
+            # A properly back-adjusted series has price_ratio unrelated to split ratio
+            is_discontinuous = ratio_error < abs(ratio) * 0.1
+
+            if is_discontinuous:
+                discontinuities.append({
+                    'split_date': split_date,
+                    'split_ratio': ratio,
+                    'price_before': price_before,
+                    'price_after': price_after,
+                    'price_ratio': price_ratio,
+                    'date_before': str(date_before.date()),
+                    'date_after': str(date_after.date()),
+                })
+
+        if discontinuities:
+            findings[ticker] = "DISCONTINUITY_DETECTED"
+            logger.warning(f"\n{ticker}: DISCONTINUITY DETECTED at {len(discontinuities)} split(s)!")
+            for d in discontinuities[:3]:  # Show first 3
+                logger.warning(f"  {d['split_date']}: price {d['price_before']:.2f} → {d['price_after']:.2f} "
+                             f"(ratio {d['price_ratio']:.4f} ~= split ratio {d['split_ratio']:.4f})")
+        else:
+            findings[ticker] = "consistent"
+            logger.info(f"{ticker}: CONSISTENT — {len(ticker_splits)} split(s) checked, "
+                       f"no discontinuities (price series properly back-adjusted)")
+
+    logger.info("")
+    return findings
 
 
 def investigate_negative_skew(results_df):
@@ -636,26 +928,32 @@ def run_backtest():
         logger.warning("No clusters detected.")
         return
 
-    # Step 3: Load prices from DB (offline, no network)
+    # Step 3: Load split events (once, for all tickers)
+    split_events = load_split_events()
+
+    # Step 4: Load prices from DB (offline, no network)
     tickers = clusters['ticker'].unique().tolist()
     prices = load_prices_from_db(tickers)
 
-    # Step 4: Compute forward returns
-    results = compute_forward_returns(clusters, prices)
+    # Step 5: Verify price series consistency (check for discontinuities at splits)
+    verify_price_series_consistency(split_events, prices)
+
+    # Step 6: Compute forward returns
+    results = compute_forward_returns(clusters, prices, split_events)
 
     if len(results) == 0:
         logger.warning("No results with valid forward returns.")
         return
 
-    # Step 5: Investigate negative skew
+    # Step 7: Investigate negative skew
     investigate_negative_skew(results)
 
-    # Step 6: Save results with required columns for historical_hit_rate.py
+    # Step 8: Save results with required columns for historical_hit_rate.py
     csv_path = os.path.join(OUTPUT_DIR, "historical_clusters.csv")
     results.to_csv(csv_path, index=False)
     logger.info(f"\nSaved {len(results)} cluster results to {csv_path}")
 
-    # Step 7: Summary
+    # Step 9: Summary
     summary = generate_summary(results)
     summary_path = os.path.join(OUTPUT_DIR, "backtest_summary.txt")
     with open(summary_path, 'w') as f:

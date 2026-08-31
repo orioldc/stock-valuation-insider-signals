@@ -55,3 +55,9 @@ build/
 data/SHA256SUMS
 data/validation.txt
 data/validation.json
+
+# Generated artifacts (published as release assets, not tracked)
+packages/tracker/bulk_data/
+packages/tracker/output/*.txt
+data/*.json.gz
+packages/tracker/output/*.json.gz

@@ -257,6 +257,16 @@ jobs:
           cd packages/tracker
           python backtest/historical_backtest.py
 
+      - name: Train base-rate model
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          # Pipefail stops tee from masking a non-zero exit so the step is marked failed and visible.
+          # Non-fatal by design; publication is blocked downstream by the CRITICAL base_rates.tables_exist contract check.
+          set -o pipefail
+          python scoring/train_base_rates.py | tee output/training.log
+
       - name: Export frozen insider snapshot
         timeout-minutes: 10
         continue-on-error: true

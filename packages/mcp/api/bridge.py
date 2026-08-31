@@ -10,12 +10,16 @@ the install script can populate them from a release artifact.
 
 import csv
 import json
+import logging
 import os
 import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
 _THIS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _THIS_FILE.parents[3]  # packages/mcp/api/bridge.py → repo root
@@ -441,6 +445,62 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
             "age_days": snapshot_meta["age_days"],
         })
 
+    # Batch-compute base rates for all unique (sector, tier) combinations
+    # to avoid N DB round trips (there are ~40 combinations across 500 rows)
+    try:
+        from scoring.base_rates import score_cluster
+
+        # Collect unique (sector, tier) pairs
+        segment_keys = set()
+        for result in results:
+            segment_keys.add((result["sector"], result["tier"]))
+
+        # Query base rates for all segments
+        base_rate_cache = {}
+        for sector_val, tier_val in segment_keys:
+            try:
+                base_rate_cache[(sector_val, tier_val)] = score_cluster(DB_PATH, sector_val, tier_val)
+            except Exception as e:
+                logger.exception(f"Failed to score segment ({sector_val}, {tier_val})")
+                base_rate_cache[(sector_val, tier_val)] = {
+                    "base_rate": None,
+                    "ci_lower": None,
+                    "ci_upper": None,
+                    "n_samples": 0,
+                    "level_used": None,
+                    "suppressed": True,
+                    "reason": f"scoring failed: {type(e).__name__}",
+                    "spy_beat_rate": None,
+                    "qqq_beat_rate": None,
+                }
+
+        # Attach base rates to each result
+        for result in results:
+            segment_key = (result["sector"], result["tier"])
+            conviction = base_rate_cache.get(segment_key, {})
+            result["base_rate"] = conviction.get("base_rate")
+            result["base_rate_ci_lower"] = conviction.get("ci_lower")
+            result["base_rate_ci_upper"] = conviction.get("ci_upper")
+            result["base_rate_n_samples"] = conviction.get("n_samples")
+            result["base_rate_level_used"] = conviction.get("level_used")
+            result["base_rate_suppressed"] = conviction.get("suppressed")
+            result["base_rate_reason"] = conviction.get("reason")
+            result["spy_beat_rate"] = conviction.get("spy_beat_rate")
+            result["qqq_beat_rate"] = conviction.get("qqq_beat_rate")
+    except Exception as e:
+        logger.exception("Failed to batch-compute base rates for scanner")
+        # If batch computation fails, populate all results with error fields
+        for result in results:
+            result["base_rate"] = None
+            result["base_rate_ci_lower"] = None
+            result["base_rate_ci_upper"] = None
+            result["base_rate_n_samples"] = 0
+            result["base_rate_level_used"] = None
+            result["base_rate_suppressed"] = True
+            result["base_rate_reason"] = f"batch scoring failed: {type(e).__name__}"
+            result["spy_beat_rate"] = None
+            result["qqq_beat_rate"] = None
+
     results.sort(key=lambda x: x["composite_score"], reverse=True)
     return results[:limit]
 
@@ -604,6 +664,9 @@ def get_cluster(ticker):
             "age_days": snapshot_meta["age_days"],
         }
 
+    # Compute base-rate conviction for live signal
+    conviction_data = _compute_conviction_live(ticker, result, release_tag)
+
     return {
         "ticker": ticker,
         "cluster_detected": result["cluster_detected"],
@@ -620,6 +683,16 @@ def get_cluster(ticker):
         "trades": trade_list,
         "buyback": bb,
         "frozen": frozen,
+        # Base-rate conviction fields
+        "base_rate": conviction_data.get("base_rate"),
+        "base_rate_ci_lower": conviction_data.get("base_rate_ci_lower"),
+        "base_rate_ci_upper": conviction_data.get("base_rate_ci_upper"),
+        "base_rate_n_samples": conviction_data.get("base_rate_n_samples"),
+        "base_rate_level_used": conviction_data.get("base_rate_level_used"),
+        "base_rate_suppressed": conviction_data.get("base_rate_suppressed"),
+        "base_rate_reason": conviction_data.get("base_rate_reason"),
+        "spy_beat_rate": conviction_data.get("spy_beat_rate"),
+        "qqq_beat_rate": conviction_data.get("qqq_beat_rate"),
     }
 
 
@@ -687,156 +760,143 @@ def _money(x, digits=2):
 
 
 def _compute_conviction_live(ticker: str, insider: dict, hit_rates_release: str | None) -> dict:
-    """Compute conviction score and quality for a live insider signal.
+    """Compute base-rate conviction for a live insider signal.
 
-    Returns dict with conviction_score, quality, conviction_source, hit_rates_release,
-    conviction_max_achievable, conviction_missing_components, or empty dict if computation fails.
+    Returns dict with base_rate, ci_lower, ci_upper, n_samples, level_used, suppressed, reason,
+    spy_beat_rate, qqq_beat_rate, conviction_score (deprecated). Never returns empty dict;
+    always includes base_rate_reason describing any failure.
     """
-    # Lazy imports to defer CSV read and cluster detection
     try:
-        from signals.conviction_scorer import score_signal
-        from signals.insider_clusters import detect_clusters
-        from signals.historical_hit_rate import compute_hit_rates, get_sector_hit_rates
-    except Exception:
-        return {}
+        from scoring.base_rates import score_cluster
+        from signals.size_adjustment import get_tier
+    except Exception as e:
+        logger.exception("Failed to import scoring modules")
+        return {
+            "base_rate": None,
+            "base_rate_ci_lower": None,
+            "base_rate_ci_upper": None,
+            "base_rate_n_samples": 0,
+            "base_rate_level_used": None,
+            "base_rate_suppressed": True,
+            "base_rate_reason": f"import failed: {type(e).__name__}",
+            "spy_beat_rate": None,
+            "qqq_beat_rate": None,
+            "conviction_score": None,
+            "conviction_source": "base_rate_model",
+            "conviction_deprecated": True,
+            "conviction_deprecation_note": "Use base_rate fields instead; conviction_score will be removed in next release",
+        }
 
-    # Get 90-day cluster counts: prefer live EDGAR figures when present, fall back to DB
-    # This ensures the cluster verdict and the cluster score come from the same source.
-    # Live fetches (after this fix) surface cluster_n_insiders/cluster_total_value.
-    # Older cached payloads and frozen snapshots lack those keys, so we fall back to
-    # querying the tracker DB via detect_clusters(ticker).
-    if insider.get("cluster_n_insiders") is not None and insider.get("cluster_total_value") is not None:
-        # Live path: use the cluster figures from the same EDGAR fetch that produced cluster_detected
-        cluster_detected = insider.get("cluster_detected", False)
-        num_insiders_cluster = insider.get("cluster_n_insiders", 0)
-        total_value_cluster = insider.get("cluster_total_value", 0)
-    else:
-        # Fallback path: cached payload or frozen snapshot lacks live cluster figures
-        # Query the tracker DB (monthly snapshot) to get cluster counts
-        try:
-            cluster_result = detect_clusters(ticker)
-            cluster_detected = cluster_result.get("cluster_detected", False)
-            cluster_trades = cluster_result.get("details", [])
-
-            # Count distinct insiders and total value from the cluster itself
-            if cluster_detected and cluster_trades:
-                distinct_ciks = set(t.get("cik") for t in cluster_trades if t.get("cik"))
-                num_insiders_cluster = len(distinct_ciks)
-                total_value_cluster = sum(t.get("value", 0) for t in cluster_trades)
-            else:
-                # No cluster = 0/0, so classify_cluster grades honestly
-                num_insiders_cluster = 0
-                total_value_cluster = 0
-        except Exception:
-            # Defensive: if cluster detection fails, use 0/0
-            cluster_detected = insider.get("cluster_detected", False)
-            num_insiders_cluster = 0
-            total_value_cluster = 0
-
-    # Assemble row for scorer using 90-day cluster window values
-    row = {
-        "ticker": ticker,
-        "cluster_detected": cluster_detected,
-        "num_insiders": num_insiders_cluster,
-        "total_value": total_value_cluster,
-        "share_delta_4q": insider.get("share_delta_4q"),
-    }
-
-    # Get sector from companies table
+    # Get sector and market cap for tier derivation
     try:
         conn = get_db()
-        sector_row = conn.execute(
-            "SELECT sector FROM companies WHERE ticker = ?", (ticker,)
+        row = conn.execute(
+            "SELECT sector, market_cap FROM companies WHERE ticker = ?", (ticker,)
         ).fetchone()
-        row["sector"] = sector_row["sector"] if sector_row else "Unknown"
-    except Exception:
-        row["sector"] = "Unknown"
-    finally:
-        if 'conn' in locals():
+        if not row:
             conn.close()
+            return {
+                "base_rate": None,
+                "base_rate_ci_lower": None,
+                "base_rate_ci_upper": None,
+                "base_rate_n_samples": 0,
+                "base_rate_level_used": None,
+                "base_rate_suppressed": True,
+                "base_rate_reason": f"ticker {ticker} not found in database",
+                "spy_beat_rate": None,
+                "qqq_beat_rate": None,
+                "conviction_score": None,
+                "conviction_source": "base_rate_model",
+                "conviction_deprecated": True,
+                "conviction_deprecation_note": "Use base_rate fields instead; conviction_score will be removed in next release",
+            }
+        sector = row["sector"] if row["sector"] else None
+        market_cap = float(row["market_cap"]) if row["market_cap"] else None
+        conn.close()
+    except Exception as e:
+        logger.exception(f"DB lookup failed for {ticker}")
+        return {
+            "base_rate": None,
+            "base_rate_ci_lower": None,
+            "base_rate_ci_upper": None,
+            "base_rate_n_samples": 0,
+            "base_rate_level_used": None,
+            "base_rate_suppressed": True,
+            "base_rate_reason": f"database lookup failed: {type(e).__name__}",
+            "spy_beat_rate": None,
+            "qqq_beat_rate": None,
+            "conviction_score": None,
+            "conviction_source": "base_rate_model",
+            "conviction_deprecated": True,
+            "conviction_deprecation_note": "Use base_rate fields instead; conviction_score will be removed in next release",
+        }
 
-    # Derive has_ceo / has_officer from insider_transactions.raw_json
-    # Use 90-day window to match cluster detection
+    # Require market cap for tier assignment, but allow NULL sector (tier fallback)
+    if not market_cap:
+        return {
+            "base_rate": None,
+            "base_rate_ci_lower": None,
+            "base_rate_ci_upper": None,
+            "base_rate_n_samples": 0,
+            "base_rate_level_used": None,
+            "base_rate_suppressed": True,
+            "base_rate_reason": f"market_cap missing for {ticker}",
+            "spy_beat_rate": None,
+            "qqq_beat_rate": None,
+            "conviction_score": None,
+            "conviction_source": "base_rate_model",
+            "conviction_deprecated": True,
+            "conviction_deprecation_note": "Use base_rate fields instead; conviction_score will be removed in next release",
+        }
+
+    # Derive size tier from market cap
+    size_tier = get_tier(market_cap)
+
+    # Score using base-rate model (handles NULL sector with tier fallback)
     try:
-        conn = get_db()
-        cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-        trades = conn.execute("""
-            SELECT it.raw_json
-            FROM insider_transactions it
-            JOIN companies c ON it.company_id = c.id
-            WHERE c.ticker = ? AND it.transaction_type = 'P'
-              AND it.transaction_date >= ?
-        """, (ticker, cutoff)).fetchall()
+        result = score_cluster(DB_PATH, sector, size_tier)
+    except Exception as e:
+        logger.exception(f"score_cluster failed for {ticker}")
+        return {
+            "base_rate": None,
+            "base_rate_ci_lower": None,
+            "base_rate_ci_upper": None,
+            "base_rate_n_samples": 0,
+            "base_rate_level_used": None,
+            "base_rate_suppressed": True,
+            "base_rate_reason": f"scoring failed: {type(e).__name__}",
+            "spy_beat_rate": None,
+            "qqq_beat_rate": None,
+            "conviction_score": None,
+            "conviction_source": "base_rate_model",
+            "conviction_deprecated": True,
+            "conviction_deprecation_note": "Use base_rate fields instead; conviction_score will be removed in next release",
+        }
 
-        has_ceo = False
-        has_officer = False
-        for t in trades:
-            raw = json.loads(t["raw_json"]) if t["raw_json"] else {}
-            rel = (raw.get("relationship") or "").upper()
-            if any(k in rel for k in ["CEO", "CFO", "COO", "CHIEF", "PRESIDENT"]):
-                has_ceo = True
-            if any(k in rel for k in ["VP", "SVP", "EVP", "OFFICER"]) or has_ceo:
-                has_officer = True
-            if has_ceo and has_officer:
-                break
-
-        row["has_ceo"] = has_ceo
-        row["has_officer"] = has_officer
-    except Exception:
-        row["has_ceo"] = False
-        row["has_officer"] = False
-    finally:
-        if 'conn' in locals():
-            conn.close()
-
-    # Defensive: if any required field is missing, bail
-    if row["sector"] is None or row["share_delta_4q"] is None:
-        return {}
-
-    # Score the signal
-    try:
-        scored = score_signal(row)
-    except Exception:
-        return {}
-
-    # Determine max achievable score and missing components based on what actually resolved.
-    # Even when the artifact exists, coverage is partial: not all tickers/sectors will be present.
-    try:
-        hit_rates = compute_hit_rates()
-        sector_rates = get_sector_hit_rates()
-    except Exception:
-        hit_rates = {}
-        sector_rates = {}
-
-    missing_components = []
-    max_achievable = 100
-
-    # Historical accuracy: three bands based on n_clusters
-    # - ticker absent: 0 points earned, 20 unreachable
-    # - n_clusters 1-2: max 10 points, 10 unreachable
-    # - n_clusters >= 3: max 20 points, 0 unreachable
-    if ticker not in hit_rates:
-        max_achievable -= 20
-        missing_components.append("historical_accuracy")
+    # Legacy conviction_score (deprecated): map base_rate to 0-100 scale
+    # This maintains API compatibility for one release cycle
+    if result['base_rate'] is not None:
+        # Simple linear mapping: 50% base_rate = 50 points, 100% = 100 points, 0% = 0 points
+        conviction_score_deprecated = result['base_rate'] * 100
     else:
-        n_clusters = hit_rates[ticker].get("n_clusters", 0)
-        if n_clusters < 3:
-            max_achievable -= 10
-            missing_components.append("historical_accuracy_partial")
-
-    # Sector favorability: 8 points unreachable when sector not in sector_rates
-    # (it falls back to 7 out of 15, so 15 - 7 = 8 points unreachable)
-    if row["sector"] not in sector_rates:
-        max_achievable -= 8
-        missing_components.append("sector_favorability")
+        conviction_score_deprecated = None
 
     return {
-        "conviction_score": scored["total"],
-        "quality": scored["breakdown"].get("quality"),
-        "conviction_source": "computed_live",
-        "hit_rates_release": hit_rates_release,
-        "conviction_max_achievable": max_achievable,
-        "conviction_missing_components": missing_components,
+        # New base-rate fields (primary)
+        "base_rate": result['base_rate'],
+        "base_rate_ci_lower": result['ci_lower'],
+        "base_rate_ci_upper": result['ci_upper'],
+        "base_rate_n_samples": result['n_samples'],
+        "base_rate_level_used": result['level_used'],
+        "base_rate_suppressed": result['suppressed'],
+        "base_rate_reason": result['reason'],
+        "spy_beat_rate": result['spy_beat_rate'],
+        "qqq_beat_rate": result['qqq_beat_rate'],
+        # Legacy fields (deprecated, for backward compatibility)
+        "conviction_score": conviction_score_deprecated,
+        "conviction_source": "base_rate_model",
+        "conviction_deprecated": True,
+        "conviction_deprecation_note": "Use base_rate fields instead; conviction_score will be removed in next release",
     }
 
 
@@ -909,18 +969,47 @@ def _build_summary_text(p):
         lines.append("")
         lines.append("## Insider Signal")
         parts = [f"Cluster detected: {insider.get('cluster_detected')}"]
-        if insider.get("conviction_score") is not None:
-            # Show conviction out of max achievable, with missing components if any
+
+        # Show base-rate information if available
+        if insider.get("base_rate") is not None:
+            br = insider['base_rate']
+            ci_lower = insider.get('base_rate_ci_lower')
+            ci_upper = insider.get('base_rate_ci_upper')
+            n_samples = insider.get('base_rate_n_samples')
+            level_used = insider.get('base_rate_level_used')
+            suppressed = insider.get('base_rate_suppressed')
+
+            rate_str = f"Base rate: {br:.1%}"
+            if ci_lower is not None and ci_upper is not None:
+                rate_str += f" [{ci_lower:.1%}-{ci_upper:.1%}]"
+            if n_samples:
+                rate_str += f", n={n_samples}"
+            if suppressed:
+                rate_str += f" (tier fallback)"
+            elif level_used == 'segment':
+                rate_str += f" (sector+size)"
+            parts.append(rate_str)
+
+            # Show SPY/QQQ beat rates
+            if insider.get("spy_beat_rate") is not None:
+                parts.append(f"SPY beat: {insider['spy_beat_rate']:.1%}")
+            if insider.get("qqq_beat_rate") is not None:
+                parts.append(f"QQQ beat: {insider['qqq_beat_rate']:.1%}")
+        elif insider.get("base_rate_reason"):
+            # No base rate available, show reason
+            parts.append(f"Base rate: {insider['base_rate_reason']}")
+        elif insider.get("conviction_score") is not None:
+            # Fallback to deprecated conviction_score for old snapshots
             max_ach = insider.get("conviction_max_achievable")
             if max_ach is None:
-                # Frozen snapshot: scale unknown
-                conv_str = f"Conviction: {insider['conviction_score']:.1f} (scale unknown, from snapshot)"
+                conv_str = f"Conviction: {insider['conviction_score']:.1f} (deprecated, from snapshot)"
             else:
-                conv_str = f"Conviction: {insider['conviction_score']:.1f}/{max_ach}"
+                conv_str = f"Conviction: {insider['conviction_score']:.1f}/{max_ach} (deprecated)"
                 missing = insider.get("conviction_missing_components")
                 if missing:
                     conv_str += f" ({', '.join(missing)} unavailable)"
             parts.append(conv_str)
+
         if insider.get("quality"):
             parts.append(f"Quality: {insider['quality']}")
         lines.append("  |  ".join(parts))
@@ -1051,15 +1140,28 @@ def run_valuation(ticker):
 
         payload["insider_signal"] = {
             "cluster_detected": bool(insider.get("cluster_detected")),
+            # Base-rate fields (primary)
+            "base_rate": _to_native(insider.get("base_rate")),
+            "base_rate_ci_lower": _to_native(insider.get("base_rate_ci_lower")),
+            "base_rate_ci_upper": _to_native(insider.get("base_rate_ci_upper")),
+            "base_rate_n_samples": _to_native(insider.get("base_rate_n_samples")),
+            "base_rate_level_used": insider.get("base_rate_level_used"),
+            "base_rate_suppressed": insider.get("base_rate_suppressed"),
+            "base_rate_reason": insider.get("base_rate_reason"),
+            "spy_beat_rate": _to_native(insider.get("spy_beat_rate")),
+            "qqq_beat_rate": _to_native(insider.get("qqq_beat_rate")),
+            # Legacy fields (deprecated)
             "conviction_score": conviction,
+            "conviction_deprecated": insider.get("conviction_deprecated"),
+            "conviction_deprecation_note": insider.get("conviction_deprecation_note"),
+            "conviction_source": insider.get("conviction_source"),
+            "conviction_max_achievable": insider.get("conviction_max_achievable"),
+            "conviction_missing_components": insider.get("conviction_missing_components"),
+            # Other fields
             "insider_count": insider_count,
             "quality": insider.get("quality"),
             "total_value": _to_native(insider.get("total_value")),
             "latest_transaction_date": insider.get("latest_transaction_date"),
-            "conviction_source": insider.get("conviction_source"),
-            "hit_rates_release": insider.get("hit_rates_release"),
-            "conviction_max_achievable": insider.get("conviction_max_achievable"),
-            "conviction_missing_components": insider.get("conviction_missing_components"),
             "source": insider.get("source"),
             "as_of": insider.get("as_of"),
             "count_window_days": insider.get("count_window_days"),

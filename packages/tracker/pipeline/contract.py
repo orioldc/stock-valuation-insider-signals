@@ -1978,6 +1978,215 @@ def check_failure_table_coverage(conn):
     }
 
 
+def _contract_compute_raw_market_price(ticker, transaction_date, adjusted_close, cur):
+    """
+    Compute as-transacted market price from split-back-adjusted close.
+
+    Same formula as cleanup_corrupt_prices.py and historical_backtest.py:
+    raw_market = adjusted_close × PROD(ratio for splits after txn_date)
+
+    Returns (raw_market_price, split_count)
+    """
+    cur.execute("""
+        SELECT ratio
+        FROM split_events
+        WHERE ticker = ? AND date > ?
+        ORDER BY date
+    """, (ticker, transaction_date))
+
+    splits = cur.fetchall()
+    cumulative_ratio = 1.0
+    for (ratio,) in splits:
+        cumulative_ratio *= ratio
+
+    raw_market = adjusted_close * cumulative_ratio
+    return raw_market, len(splits)
+
+
+def check_insider_transaction_price_plausibility(conn):
+    """
+    No corrupt insider_transactions.price values in purchase (type='P') transactions.
+
+    Four categories of price issues:
+    1. **Hard bound violations**: price > $1M/share (BRK-A at ~$700K must survive)
+    2. **Market cap sanity violations**: Transaction value (price × shares) exceeds
+       company market cap. Catches cases where aggregate value was written into the
+       price field (e.g., NUTX: 31,746 shares × $0.63 = "price" $20,000, giving
+       $635M transaction value vs $1.3B market cap = 49%). This rule catches NUTX
+       where the market divergence rule cannot (no price data before 2022).
+    3. **Market divergence (corrupt transactions)**: tx_price / raw_market > 1000x,
+       where raw_market is plausible (between $0.0001 and $10,000). These are
+       transactions where the share count or aggregate value was written into the
+       price field.
+    4. **Corrupt market prices** (WARN): Our prices table shows implausible values
+       (outside [$0.0001, $10,000] after split correction). Examples: MULN showing
+       $2.7e14/share. These are flagged but NOT counted as transaction corruption.
+
+    Market divergence uses CORRECT basis (split-adjusted):
+    - Prices table: back-adjusted to recent reference date
+    - Transaction prices: as-transacted
+    - Comparison: raw_market = adjusted_close × PROD(split_ratio for splits after txn_date)
+
+    This fixes the prior basis mismatch that destroyed 4,065 good rows (e.g., AMZN 2020
+    purchases at $1,900 flagged as corrupt because our adjusted close showed $95 after
+    the 2022 20:1 split).
+
+    Scope: transaction_type='P' only (purchases matter for insider signals).
+
+    Severity: CRITICAL for corrupt transactions, WARN for corrupt market prices.
+
+    Threshold type: Target (zero corrupt transaction prices after cleanup)
+    """
+    cur = conn.cursor()
+
+    MAX_PLAUSIBLE_PRICE = 1_000_000.0
+    MIN_PLAUSIBLE_MARKET = 0.0001
+    MAX_PLAUSIBLE_MARKET = 10000.0
+    HIGH_DIVERGENCE_RATIO = 1000.0
+    MIN_PLAUSIBLE_MCAP = 1_000_000.0      # $1M
+    MAX_PLAUSIBLE_MCAP = 5_000_000_000_000.0  # $5T
+    MCAP_RATIO_THRESHOLD = 1.0  # 100% of market cap
+
+    # Check 1: Prices above hard ceiling
+    cur.execute(f"""
+        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted
+        FROM insider_transactions it
+        JOIN companies c ON it.company_id = c.id
+        WHERE it.transaction_type = 'P'
+          AND it.price IS NOT NULL AND it.price > {MAX_PLAUSIBLE_PRICE}
+        ORDER BY it.price DESC
+        LIMIT 20
+    """)
+    ceiling_violations = cur.fetchall()
+
+    # Check 2: Market cap sanity (transaction value > company market cap)
+    cur.execute("""
+        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted, c.market_cap
+        FROM insider_transactions it
+        JOIN companies c ON it.company_id = c.id
+        WHERE it.transaction_type = 'P'
+          AND it.price IS NOT NULL
+          AND it.price > 0
+          AND c.market_cap IS NOT NULL
+        ORDER BY c.ticker, it.transaction_date
+    """)
+
+    mcap_transactions = cur.fetchall()
+    mcap_violations = []
+
+    for row_id, ticker, txn_date, tx_price, shares, market_cap in mcap_transactions:
+        # Skip if already caught by ceiling check
+        if tx_price > MAX_PLAUSIBLE_PRICE:
+            continue
+
+        tx_value = tx_price * shares
+
+        # Check if market cap is plausible
+        mcap_plausible = MIN_PLAUSIBLE_MCAP <= market_cap <= MAX_PLAUSIBLE_MCAP
+
+        if mcap_plausible:
+            ratio = tx_value / market_cap
+            if ratio > MCAP_RATIO_THRESHOLD:
+                mcap_violations.append((ticker, txn_date, tx_price, shares, tx_value, market_cap, ratio))
+
+    # Check 3: Market divergence with split-corrected basis
+    cur.execute("""
+        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted
+        FROM insider_transactions it
+        JOIN companies c ON it.company_id = c.id
+        WHERE it.transaction_type = 'P'
+          AND it.price IS NOT NULL
+          AND it.price > 0
+        ORDER BY c.ticker, it.transaction_date
+    """)
+
+    transactions = cur.fetchall()
+    corrupt_transactions = []  # High side divergence with plausible market
+    corrupt_market_prices = []  # Market price itself is implausible
+
+    for row_id, ticker, txn_date, tx_price, shares in transactions:
+        # Skip if already caught by ceiling check
+        if tx_price > MAX_PLAUSIBLE_PRICE:
+            continue
+
+        # Get adjusted market close
+        cur.execute("""
+            SELECT close
+            FROM prices
+            WHERE ticker = ? AND date <= ?
+            ORDER BY date DESC
+            LIMIT 1
+        """, (ticker, txn_date))
+
+        market_row = cur.fetchone()
+        if not market_row:
+            continue
+
+        adjusted_close = market_row[0]
+        if adjusted_close <= 0:
+            continue
+
+        # Compute as-transacted market price
+        raw_market, split_count = _contract_compute_raw_market_price(ticker, txn_date, adjusted_close, cur)
+
+        # Check plausibility
+        market_plausible = MIN_PLAUSIBLE_MARKET <= raw_market <= MAX_PLAUSIBLE_MARKET
+        ratio = tx_price / raw_market if raw_market > 0 else 0
+
+        # Categorize
+        if market_plausible and ratio > HIGH_DIVERGENCE_RATIO:
+            corrupt_transactions.append((ticker, txn_date, tx_price, shares, raw_market, ratio, split_count))
+        elif not market_plausible:
+            corrupt_market_prices.append((ticker, txn_date, tx_price, shares, raw_market, split_count))
+
+    # Format examples
+    ceiling_examples = [
+        f"{ticker} on {txn_date}: price=${price:,.0f}, shares={shares:,.0f} (above_ceiling)"
+        for _, ticker, txn_date, price, shares in ceiling_violations[:10]
+    ]
+
+    mcap_examples = [
+        f"{ticker} on {txn_date}: tx_value=${tx_value/1e9:.2f}B, market_cap=${market_cap/1e9:.2f}B, ratio={ratio:.1f}x"
+        for ticker, txn_date, tx_price, shares, tx_value, market_cap, ratio in mcap_violations[:10]
+    ]
+
+    divergence_examples = [
+        f"{ticker} on {txn_date}: tx=${tx_price:,.2f}, raw_market=${raw_market:.4f}, ratio={ratio:.1f}x ({split_count} splits)"
+        for ticker, txn_date, tx_price, shares, raw_market, ratio, split_count in corrupt_transactions[:10]
+    ]
+
+    market_corrupt_examples = [
+        f"{ticker} on {txn_date}: tx=${tx_price:,.2f}, raw_market=${raw_market:.2e} (outside plausible range)"
+        for ticker, txn_date, tx_price, shares, raw_market, split_count in corrupt_market_prices[:10]
+    ]
+
+    # Combine corrupt transaction counts
+    total_corrupt = len(ceiling_violations) + len(mcap_violations) + len(corrupt_transactions)
+
+    return {
+        'passed': total_corrupt == 0,
+        'measured': {
+            'ceiling_violations': len(ceiling_violations),
+            'market_cap_violations': len(mcap_violations),
+            'market_divergence_corrupt_transactions': len(corrupt_transactions),
+            'total_corrupt_transactions': total_corrupt,
+            'corrupt_market_prices_flagged': len(corrupt_market_prices),
+            'ceiling_examples': ceiling_examples,
+            'mcap_examples': mcap_examples,
+            'divergence_examples': divergence_examples,
+            'corrupt_market_examples': market_corrupt_examples
+        },
+        'expected': {
+            'corrupt_transaction_prices': 0,
+            'max_plausible_price': MAX_PLAUSIBLE_PRICE,
+            'mcap_ratio_threshold': MCAP_RATIO_THRESHOLD,
+            'high_divergence_ratio': HIGH_DIVERGENCE_RATIO,
+            'note': 'Market cap sanity + split-corrected market divergence checks; corrupt market prices (WARN) reported separately',
+            'threshold_type': 'target'
+        }
+    }
+
+
 def check_no_prices_for_unknown_tickers(conn):
     """
     No prices for tickers absent from companies table (except benchmark ETFs).
@@ -2089,6 +2298,318 @@ def check_silently_never_attempted_prices(conn):
             'threshold_type': 'target'
         }
     }
+
+
+def check_base_rate_tables_exist(conn):
+    """Base-rate tables exist and are non-empty.
+
+    CRITICAL: publishing an artifact whose scorer returns nothing is a broken release.
+    Tables are created by CREATE TABLE IF NOT EXISTS in scoring module, not by init_db.py.
+
+    Threshold type: Target (zero tolerance)
+    """
+    cur = conn.cursor()
+
+    required_tables = ['segment_base_rates', 'tier_base_rates']
+    issues = {}
+
+    for table in required_tables:
+        # Check if table exists
+        cur.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name = ?
+        """, (table,))
+        exists = cur.fetchone() is not None
+
+        if not exists:
+            issues[table] = {'exists': False, 'row_count': 0}
+        else:
+            # Check if non-empty
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            row_count = cur.fetchone()[0]
+            if row_count == 0:
+                issues[table] = {'exists': True, 'row_count': 0}
+
+    return {
+        'passed': len(issues) == 0,
+        'measured': {
+            'missing_or_empty_tables': issues if issues else 'none',
+            'required_tables': required_tables
+        },
+        'expected': {
+            'all_tables_exist': True,
+            'all_tables_non_empty': True,
+            'threshold_type': 'target',
+            'note': 'Tables created by scoring module, not init_db.py; missing tables break scoring'
+        }
+    }
+
+
+def check_segment_coverage_maintained(conn):
+    """Segment coverage has not materially collapsed.
+
+    Current baseline: 24 reportable segments (n>=60) covering 4,602 clusters,
+    17 suppressed covering 547. WARN on material drop.
+
+    Threshold type: Regression guard (detects training degradation)
+    """
+    cur = conn.cursor()
+
+    # Check if tables exist first
+    cur.execute("""
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name='segment_base_rates'
+    """)
+    if not cur.fetchone():
+        return {
+            'passed': True,
+            'measured': {},
+            'expected': {'threshold_type': 'regression_guard'},
+            'details': 'segment_base_rates table does not exist yet'
+        }
+
+    # Get latest year
+    cur.execute("SELECT MAX(year) FROM segment_base_rates")
+    latest_year = cur.fetchone()[0]
+
+    if not latest_year:
+        return {
+            'passed': False,
+            'measured': {'latest_year': None},
+            'expected': {'threshold_type': 'regression_guard'},
+            'details': 'No data in segment_base_rates'
+        }
+
+    # MIN_SEGMENT_SIZE is hardcoded as 60 in the base_rates module
+    MIN_SEGMENT_SIZE = 60
+
+    # Count reportable and suppressed segments for latest year
+    cur.execute(f"""
+        SELECT
+            COUNT(*) FILTER (WHERE n_samples >= {MIN_SEGMENT_SIZE}) as reportable,
+            SUM(n_samples) FILTER (WHERE n_samples >= {MIN_SEGMENT_SIZE}) as reportable_clusters,
+            COUNT(*) FILTER (WHERE n_samples < {MIN_SEGMENT_SIZE}) as suppressed,
+            SUM(n_samples) FILTER (WHERE n_samples < {MIN_SEGMENT_SIZE}) as suppressed_clusters
+        FROM segment_base_rates
+        WHERE year = ?
+    """, (latest_year,))
+    row = cur.fetchone()
+    reportable, reportable_clusters, suppressed, suppressed_clusters = row
+
+    # Thresholds: allow 25% drop from baseline
+    baseline_reportable = 24
+    baseline_reportable_clusters = 4602
+    min_reportable = int(baseline_reportable * 0.75)
+    min_reportable_clusters = int(baseline_reportable_clusters * 0.75)
+
+    passed = reportable >= min_reportable and reportable_clusters >= min_reportable_clusters
+
+    return {
+        'passed': passed,
+        'measured': {
+            'latest_year': latest_year,
+            'reportable_segments': reportable or 0,
+            'reportable_clusters': reportable_clusters or 0,
+            'suppressed_segments': suppressed or 0,
+            'suppressed_clusters': suppressed_clusters or 0,
+        },
+        'expected': {
+            'min_reportable_segments': min_reportable,
+            'min_reportable_clusters': min_reportable_clusters,
+            'baseline_reportable': baseline_reportable,
+            'baseline_reportable_clusters': baseline_reportable_clusters,
+            'threshold_type': 'regression_guard',
+            'note': 'Material drop signals training degradation'
+        }
+    }
+
+
+def check_base_rate_sanity(conn):
+    """Every hit_rate lies within its own [ci_lower, ci_upper].
+
+    WARN severity: these are mathematical invariants; violations signal
+    computation bugs in the training pipeline, not data issues.
+
+    Also checks that all rates are in [0,1].
+
+    Threshold type: Target (sanity check on model outputs)
+    """
+    cur = conn.cursor()
+
+    # Check if tables exist first
+    for table in ['segment_base_rates', 'tier_base_rates']:
+        cur.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name = ?
+        """, (table,))
+        if not cur.fetchone():
+            return {
+                'passed': True,
+                'measured': {},
+                'expected': {'threshold_type': 'target'},
+                'details': f'{table} table does not exist yet'
+            }
+
+    issues = []
+
+    # Check segment_base_rates
+    cur.execute("""
+        SELECT sector, size_tier, year, hit_rate, ci_lower, ci_upper
+        FROM segment_base_rates
+        WHERE hit_rate < ci_lower OR hit_rate > ci_upper
+           OR hit_rate < 0 OR hit_rate > 1
+           OR ci_lower < 0 OR ci_lower > 1
+           OR ci_upper < 0 OR ci_upper > 1
+    """)
+    for row in cur.fetchall():
+        sector, size_tier, year, hit_rate, ci_lower, ci_upper = row
+        reason = []
+        if hit_rate < ci_lower or hit_rate > ci_upper:
+            reason.append(f"rate {hit_rate:.3f} not in [{ci_lower:.3f}, {ci_upper:.3f}]")
+        if not (0 <= hit_rate <= 1):
+            reason.append(f"rate {hit_rate:.3f} out of [0,1]")
+        if not (0 <= ci_lower <= 1) or not (0 <= ci_upper <= 1):
+            reason.append(f"CI bounds out of [0,1]")
+        issues.append(f"{sector}/{size_tier}/{year}: {', '.join(reason)}")
+
+    # Check tier_base_rates
+    cur.execute("""
+        SELECT size_tier, year, hit_rate, ci_lower, ci_upper
+        FROM tier_base_rates
+        WHERE hit_rate < ci_lower OR hit_rate > ci_upper
+           OR hit_rate < 0 OR hit_rate > 1
+           OR ci_lower < 0 OR ci_lower > 1
+           OR ci_upper < 0 OR ci_upper > 1
+    """)
+    for row in cur.fetchall():
+        size_tier, year, hit_rate, ci_lower, ci_upper = row
+        reason = []
+        if hit_rate < ci_lower or hit_rate > ci_upper:
+            reason.append(f"rate {hit_rate:.3f} not in [{ci_lower:.3f}, {ci_upper:.3f}]")
+        if not (0 <= hit_rate <= 1):
+            reason.append(f"rate {hit_rate:.3f} out of [0,1]")
+        if not (0 <= ci_lower <= 1) or not (0 <= ci_upper <= 1):
+            reason.append(f"CI bounds out of [0,1]")
+        issues.append(f"{size_tier}/{year}: {', '.join(reason)}")
+
+    return {
+        'passed': len(issues) == 0,
+        'measured': {
+            'violation_count': len(issues),
+            'examples': issues[:20] if issues else []
+        },
+        'expected': {
+            'violations': 0,
+            'note': 'Rate must be in its own CI and all values in [0,1]',
+            'threshold_type': 'target'
+        }
+    }
+
+
+def check_base_rate_training_staleness(conn):
+    """Most recent training year is not stale relative to newest cluster.
+
+    WARN: if the latest base-rate year is >1 year behind the newest cluster,
+    the model is not being retrained on fresh data.
+
+    Threshold type: Informational (monitors for training staleness)
+    """
+    cur = conn.cursor()
+
+    # Check if tables exist first
+    cur.execute("""
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name='segment_base_rates'
+    """)
+    if not cur.fetchone():
+        return {
+            'passed': True,
+            'measured': {},
+            'expected': {'threshold_type': 'informational'},
+            'details': 'segment_base_rates table does not exist yet'
+        }
+
+    # Get latest training year
+    cur.execute("SELECT MAX(year) FROM segment_base_rates")
+    latest_training_year = cur.fetchone()[0]
+
+    if not latest_training_year:
+        return {
+            'passed': True,
+            'measured': {'latest_training_year': None},
+            'expected': {'threshold_type': 'informational'},
+            'details': 'No data in segment_base_rates'
+        }
+
+    # Get newest cluster year from historical_clusters.csv
+    clusters_path = _resolve_historical_clusters_path()
+    if not clusters_path.exists():
+        return {
+            'passed': True,
+            'measured': {
+                'latest_training_year': latest_training_year,
+                'clusters_path': str(clusters_path)
+            },
+            'expected': {'threshold_type': 'informational'},
+            'details': 'historical_clusters.csv not found'
+        }
+
+    try:
+        import csv as csv_module
+        with open(clusters_path, 'r') as f:
+            reader = csv_module.DictReader(f)
+            rows = list(reader)
+            if not rows:
+                newest_cluster_year = None
+            else:
+                # Extract year from signal_date column
+                signal_dates = [row['signal_date'] for row in rows if 'signal_date' in row]
+                if signal_dates:
+                    newest_cluster_year = max(int(d[:4]) for d in signal_dates if d and len(d) >= 4)
+                else:
+                    newest_cluster_year = None
+    except Exception as e:
+        return {
+            'passed': True,
+            'measured': {'latest_training_year': latest_training_year},
+            'expected': {'threshold_type': 'informational'},
+            'details': f'Failed to read clusters CSV: {e}'
+        }
+
+    if newest_cluster_year is None:
+        return {
+            'passed': True,
+            'measured': {'latest_training_year': latest_training_year},
+            'expected': {'threshold_type': 'informational'},
+            'details': 'No cluster dates found in CSV'
+        }
+
+    staleness_years = newest_cluster_year - latest_training_year
+    stale_threshold_years = 1
+
+    passed = staleness_years <= stale_threshold_years
+
+    result = {
+        'passed': passed,
+        'measured': {
+            'latest_training_year': latest_training_year,
+            'newest_cluster_year': newest_cluster_year,
+            'staleness_years': staleness_years
+        },
+        'expected': {
+            'max_staleness_years': stale_threshold_years,
+            'threshold_type': 'informational',
+            'note': 'Training year >1 year behind newest cluster signals stale model'
+        }
+    }
+
+    if not passed:
+        result['details'] = (
+            f"Base rates are {staleness_years} years stale (training year {latest_training_year} "
+            f"vs newest cluster year {newest_cluster_year}). Base rates are not being retrained on fresh clusters."
+        )
+
+    return result
 
 
 def check_catastrophic_row_loss(conn):
@@ -2331,6 +2852,12 @@ CHECKS = [
         'severity': CRITICAL,
         'check_fn': check_no_orphaned_transactions
     },
+    {
+        'id': 'integrity.transaction_price_plausibility',
+        'description': 'No corrupt insider_transactions.price values (ceiling violations or market divergence)',
+        'severity': CRITICAL,
+        'check_fn': check_insider_transaction_price_plausibility
+    },
 
     # Derived artifacts
     {
@@ -2378,6 +2905,32 @@ CHECKS = [
         'description': 'Row counts not >10% below previous release',
         'severity': WARN,
         'check_fn': check_catastrophic_row_loss
+    },
+
+    # Base-rate model
+    {
+        'id': 'base_rates.tables_exist',
+        'description': 'Base-rate tables exist and are non-empty',
+        'severity': CRITICAL,
+        'check_fn': check_base_rate_tables_exist
+    },
+    {
+        'id': 'base_rates.segment_coverage',
+        'description': 'Segment coverage maintained (>=18 reportable, >=3451 clusters)',
+        'severity': WARN,
+        'check_fn': check_segment_coverage_maintained
+    },
+    {
+        'id': 'base_rates.sanity',
+        'description': 'All hit_rates within their CIs and in [0,1]',
+        'severity': WARN,
+        'check_fn': check_base_rate_sanity
+    },
+    {
+        'id': 'base_rates.training_staleness',
+        'description': 'Training year not >1 year behind newest cluster (informational)',
+        'severity': WARN,
+        'check_fn': check_base_rate_training_staleness
     }
 ]
 

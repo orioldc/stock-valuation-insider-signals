@@ -119,6 +119,94 @@ def find_corrupt_rows(conn):
 
     logger.info(f"  Found {len(qoq_violations)} QoQ outliers ({len([r for r in qoq_violations if r[0] not in absolute_row_ids])} new)")
 
+    # Check 3: Basis switches (large share changes without inverse price moves)
+    # These pass the 3x-50x filter but are data errors (ADR/ordinary switches, etc.)
+    # SKIP legitimate splits that are documented in split_events table
+    logger.info("Checking for basis switches (share changes without price compensation)...")
+    already_flagged = {r[0] for r in corrupt}
+
+    # Load known splits to exclude them from basis-switch detection
+    known_splits = {}  # {ticker: {date}}
+    cur.execute("SELECT ticker, date FROM split_events")
+    for ticker, split_date in cur.fetchall():
+        if ticker not in known_splits:
+            known_splits[ticker] = set()
+        known_splits[ticker].add(split_date)
+
+    cur.execute("""
+        WITH share_price_changes AS (
+            SELECT
+                so.id,
+                so.company_id,
+                c.ticker,
+                so.date,
+                so.shares,
+                LAG(so.shares, 1) OVER (PARTITION BY so.company_id ORDER BY so.date) as prev_shares,
+                LAG(so.date, 1) OVER (PARTITION BY so.company_id ORDER BY so.date) as prev_date,
+                p.close as price,
+                LAG(p.close, 1) OVER (PARTITION BY c.ticker ORDER BY so.date) as prev_price
+            FROM shares_outstanding so
+            JOIN companies c ON so.company_id = c.id
+            LEFT JOIN prices p ON c.ticker = p.ticker AND so.date = p.date
+        )
+        SELECT id, company_id, ticker, date, shares, prev_shares, prev_date, price, prev_price
+        FROM share_price_changes
+        WHERE prev_shares IS NOT NULL
+          AND prev_shares > 0
+          AND price IS NOT NULL
+          AND prev_price IS NOT NULL
+          AND prev_price > 0
+          -- Large share change (3x to 50x range)
+          AND (
+              (CAST(shares AS REAL) / CAST(prev_shares AS REAL) >= 3.0
+               AND CAST(shares AS REAL) / CAST(prev_shares AS REAL) <= ?)
+              OR (CAST(shares AS REAL) / CAST(prev_shares AS REAL) <= 0.33
+                  AND CAST(shares AS REAL) / CAST(prev_shares AS REAL) >= ?)
+          )
+    """, (MAX_QOQ_RATIO, MIN_QOQ_RATIO))
+
+    basis_switch_candidates = cur.fetchall()
+    basis_switches = []
+
+    for row_id, company_id, ticker, date, shares, prev_shares, prev_date, price, prev_price in basis_switch_candidates:
+        if row_id in already_flagged:
+            continue
+
+        # Check if this change is explained by a known split
+        # Splits can occur between prev_date and date, so check both
+        ticker_splits = known_splits.get(ticker, set())
+        if date in ticker_splits or prev_date in ticker_splits:
+            # This is a legitimate split, skip it
+            continue
+
+        # Also check dates in between (since shares_outstanding might be quarterly but splits are daily)
+        # If any split occurred in the window [prev_date, date], skip
+        split_in_window = False
+        for split_date in ticker_splits:
+            if prev_date <= split_date <= date:
+                split_in_window = True
+                break
+
+        if split_in_window:
+            continue
+
+        share_ratio = shares / prev_shares
+        price_ratio = price / prev_price
+        combined_ratio = share_ratio * price_ratio
+
+        # For a legitimate split, combined_ratio should be near 1.0 (mcap preserved)
+        # For a basis switch, combined_ratio will be way off
+        # Use ±30% tolerance to be conservative (allows for market moves)
+        if combined_ratio < 0.7 or combined_ratio > 1.3:
+            # Price did NOT compensate for share change — likely basis switch
+            reason = (f"basis_switch ({prev_shares:,.0f} -> {shares:,.0f} = {share_ratio:.2f}x, "
+                     f"price ${prev_price:.2f} -> ${price:.2f} = {price_ratio:.2f}x, "
+                     f"combined={combined_ratio:.3f})")
+            corrupt.append((row_id, company_id, ticker, date, shares, reason))
+            basis_switches.append((ticker, date, share_ratio, price_ratio, combined_ratio))
+
+    logger.info(f"  Found {len(basis_switches)} basis switches (large share changes without price compensation)")
+
     return corrupt
 
 

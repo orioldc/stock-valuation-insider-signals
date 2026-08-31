@@ -60,6 +60,11 @@ END_DATE = datetime.now().strftime("%Y-%m-%d")  # Today
 BATCH_SIZE = 50
 RATE_LIMIT_DELAY = 2.0  # seconds between batches (increased from 1.0 to avoid rate limits)
 
+# Staleness threshold: refresh prices older than this many calendar days
+# For monthly jobs, 7 days ensures we catch all actively-traded companies while
+# avoiding unnecessary re-downloads. Accounts for weekends (Friday→Monday = 3 days).
+STALE_PRICE_DAYS = 7
+
 # SEC ticker map cache (global, fetched once per run)
 _SEC_TICKER_MAP = None
 
@@ -324,8 +329,13 @@ def get_target_tickers(conn, retest_failures=True):
     """
     Get list of (ticker, fetch_symbol, cik, name) tuples to backfill.
 
-    Returns ALL companies lacking price coverage, plus companies from failures
-    table for re-testing with resolved symbols. Resolves stale tickers via SEC map.
+    Returns companies with stale or absent price coverage, plus companies from
+    failures table for re-testing with resolved symbols. Resolves stale tickers
+    via SEC map.
+
+    Staleness threshold: STALE_PRICE_DAYS (currently 7 calendar days). This ensures
+    monthly jobs refresh actively-traded companies while avoiding unnecessary
+    re-downloads of recent data.
 
     Args:
         conn: Database connection
@@ -355,10 +365,14 @@ def get_target_tickers(conn, retest_failures=True):
 
     logger.info(f"Total companies in DB: {len(all_companies):,}")
 
-    # Get tickers with ANY existing price coverage
-    cur.execute("SELECT DISTINCT ticker FROM prices")
-    tickers_with_coverage = {row[0] for row in cur.fetchall()}
-    logger.info(f"Companies with prices: {len(tickers_with_coverage):,}")
+    # Get tickers with their latest price date (not just ANY coverage)
+    cur.execute("""
+        SELECT ticker, MAX(date) as latest_date
+        FROM prices
+        GROUP BY ticker
+    """)
+    latest_price_dates = {row[0]: row[1] for row in cur.fetchall()}
+    logger.info(f"Companies with prices: {len(latest_price_dates):,}")
 
     # Get known failures
     cur.execute("SELECT ticker FROM price_backfill_failures")
@@ -368,6 +382,10 @@ def get_target_tickers(conn, retest_failures=True):
     # Build work list with ticker resolution
     work_list = []
     ticker_mismatches = []
+    stale_coverage_count = 0
+    no_coverage_count = 0
+
+    run_date = datetime.now()
 
     for stored_ticker, cik, name in all_companies:
         # Resolve ticker symbol
@@ -377,9 +395,30 @@ def get_target_tickers(conn, retest_failures=True):
         if is_resolved:
             ticker_mismatches.append((stored_ticker, fetch_symbol, cik, name or ""))
 
+        # Check if ticker has CURRENT coverage (not just ANY coverage)
+        has_current_coverage = False
+        if stored_ticker in latest_price_dates:
+            latest_date_str = latest_price_dates[stored_ticker]
+            try:
+                latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d")
+                days_old = (run_date - latest_date).days
+
+                if days_old <= STALE_PRICE_DAYS:
+                    # Current coverage - skip
+                    has_current_coverage = True
+                else:
+                    # Stale coverage - include in work list
+                    stale_coverage_count += 1
+            except (ValueError, TypeError):
+                # Invalid date - treat as stale, include to retry
+                stale_coverage_count += 1
+        else:
+            # No coverage - include in work list
+            no_coverage_count += 1
+
         # Decide whether to include in work list
-        if stored_ticker in tickers_with_coverage:
-            # Already have prices for this ticker - skip (additive only)
+        if has_current_coverage:
+            # Already have current prices for this ticker - skip (additive only)
             continue
 
         if stored_ticker in failed_tickers and not retest_failures:
@@ -389,17 +428,34 @@ def get_target_tickers(conn, retest_failures=True):
         # Include in work list
         work_list.append((stored_ticker, fetch_symbol, cik, name or ""))
 
-    # Add benchmark ETFs unconditionally (required for backtesting)
+    # Add benchmark ETFs if they lack current coverage (required for backtesting)
     BENCHMARK_ETFS = [
         ('SPY', None, 'SPDR S&P 500 ETF Trust'),
         ('IWM', None, 'iShares Russell 2000 ETF'),
         ('MDY', None, 'SPDR S&P MidCap 400 ETF Trust')
     ]
     for ticker, cik, name in BENCHMARK_ETFS:
-        if ticker not in tickers_with_coverage:
+        # Check if ETF has current coverage
+        has_current = False
+        if ticker in latest_price_dates:
+            latest_date_str = latest_price_dates[ticker]
+            try:
+                latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d")
+                days_old = (run_date - latest_date).days
+                if days_old <= STALE_PRICE_DAYS:
+                    has_current = True
+            except (ValueError, TypeError):
+                pass
+
+        if not has_current:
             # ETFs don't have CIKs in our DB, fetch with stored ticker
             if not any(w[0] == ticker for w in work_list):
                 work_list.append((ticker, ticker, cik, name))
+
+    # Report coverage stats
+    logger.info(f"Coverage analysis:")
+    logger.info(f"  Stale coverage (>{STALE_PRICE_DAYS}d old): {stale_coverage_count:,}")
+    logger.info(f"  No coverage:                 {no_coverage_count:,}")
 
     # Report ticker resolution stats
     if retest_failures and failed_tickers:
@@ -633,6 +689,7 @@ def run_backfill(dry_run=False, max_tickers=None, size_check=False):
 
     # Purge stale failure records for tickers that now have prices
     # This prevents the bug where a ticker is in both prices and failures tables
+    # (e.g., from interrupted runs where INSERT committed but DELETE didn't)
     cur = conn.cursor()
     cur.execute("""
         DELETE FROM price_backfill_failures
@@ -644,6 +701,8 @@ def run_backfill(dry_run=False, max_tickers=None, size_check=False):
     if purged > 0:
         logger.info(f"Purged {purged} stale failure records for tickers with current prices")
         conn.commit()
+    else:
+        logger.info("Purge check: no contradictions found (failures table clean)")
 
     # Get DB size before
     db_size_before = os.path.getsize(DB_PATH) / (1024 * 1024)  # MB
@@ -777,24 +836,25 @@ def run_backfill(dry_run=False, max_tickers=None, size_check=False):
                 prices_df = prices_by_ticker[fetch_symbol]
 
                 try:
+                    # Write-through: delete failure record BEFORE inserting prices
+                    # so that both operations are in the same transaction. If process
+                    # is killed mid-transaction, we avoid the contradiction where
+                    # a ticker has current prices but is also marked permanently failed.
+                    if not dry_run:
+                        conn.execute("DELETE FROM price_backfill_failures WHERE ticker = ?",
+                                   (stored_ticker,))
+
                     # CRITICAL: Store under stored_ticker, not fetch_symbol
                     # stored_ticker is the join key used throughout the system
                     rows_inserted = insert_prices(conn, stored_ticker, prices_df, dry_run=dry_run)
 
                     if not dry_run:
-                        # Commit after each ticker for incremental consistency
+                        # Commit both DELETE and INSERT atomically
                         conn.commit()
 
                     total_rows_inserted += rows_inserted
                     successful.append(stored_ticker)
                     resolved[stored_ticker] = "success"
-
-                    # Write-through: success invalidates any existing failure record
-                    # Always delete from failures table on success, not just if previously_failed
-                    if not dry_run:
-                        conn.execute("DELETE FROM price_backfill_failures WHERE ticker = ?",
-                                   (stored_ticker,))
-                        conn.commit()
 
                     # Track if this was a rescue from failures table
                     if stored_ticker in previously_failed:

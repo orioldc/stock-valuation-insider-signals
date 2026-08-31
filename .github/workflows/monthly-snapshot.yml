@@ -269,6 +269,10 @@ jobs:
         run: |
           cd packages/tracker
           mkdir -p validation_reports
+          # Pipefail ensures tee does not mask the validator's exit code.
+          # Without this, a CRITICAL failure would exit 1 but the step would
+          # succeed (tee always returns 0), and publication would proceed.
+          set -o pipefail
           python -m tracker.pipeline.validate \
             --json-report validation_reports/validation.json \
             --verbose | tee validation_reports/validation.txt
@@ -352,10 +356,13 @@ jobs:
           if [ -f data/insider_frozen.json.gz ]; then
             ASSETS="$ASSETS data/insider_frozen.json.gz"
           fi
-          if [ -f data/validation.json ]; then
+          # Skip validation reports if missing or zero-byte (GitHub rejects empty uploads).
+          # This makes publication resilient to buffering/output issues, but validation
+          # failure still blocks this step from running at all (no continue-on-error).
+          if [ -f data/validation.json ] && [ -s data/validation.json ]; then
             ASSETS="$ASSETS data/validation.json"
           fi
-          if [ -f data/validation.txt ]; then
+          if [ -f data/validation.txt ] && [ -s data/validation.txt ]; then
             ASSETS="$ASSETS data/validation.txt"
           fi
 

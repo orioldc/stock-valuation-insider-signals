@@ -29,6 +29,7 @@ import sqlite3
 import logging
 import argparse
 from datetime import datetime, timedelta
+import yfinance as yf
 
 # Add tracker to path for provenance
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +57,14 @@ MAX_DATE_MISALIGNMENT_DAYS = 400  # Price and shares dates must be within 400 da
 # cross a 6x tier boundary. 400d covers quarterly reporting + filing lag + one missed quarter.
 MAX_PLAUSIBLE_MARKET_CAP = 5e12   # $5T ceiling - accommodates largest companies (MSFT, AAPL, NVDA)
 
+# ADR cross-check threshold: only validate companies above this size
+# (avoids network calls for small-cap universe; ADR errors only affect mega/large caps)
+CROSS_CHECK_THRESHOLD = 500e9    # $500B
+
+# ADR cross-check tolerance: reject if derived/yfinance ratio exceeds this
+# (3x accommodates methodology differences; ADR unit errors typically 5-10x)
+MAX_DISCREPANCY_RATIO = 3.0
+
 
 def get_db(db_path=None):
     """Get database connection with busy timeout for concurrent access."""
@@ -65,32 +74,97 @@ def get_db(db_path=None):
     return conn
 
 
-def _ensure_market_cap_asof_column(conn):
+def _ensure_market_cap_columns(conn):
     """
-    Add market_cap_asof column if missing.
+    Add market_cap_asof and market_cap_source columns if missing.
 
     CI seeds from the previous release and only runs init_db.py on a full rebuild,
-    so a column added there never reaches the artifact. We guard every script that
-    uses this column.
+    so columns added there never reach the artifact. We guard every script that
+    uses these columns.
     """
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(companies)")
     columns = [col[1] for col in cur.fetchall()]
 
+    added = []
+
     if "market_cap_asof" not in columns:
         try:
             cur.execute("ALTER TABLE companies ADD COLUMN market_cap_asof TEXT")
-            conn.commit()
-            logger.info("Schema migration: added market_cap_asof column")
-            return True
+            added.append("market_cap_asof")
         except Exception as e:
-            if "duplicate column" in str(e).lower():
-                logger.info("Schema migration: market_cap_asof column already exists")
-                return True
-            else:
+            if "duplicate column" not in str(e).lower():
                 logger.warning(f"Failed to add market_cap_asof column: {e}")
-                return False
+
+    if "market_cap_source" not in columns:
+        try:
+            cur.execute("ALTER TABLE companies ADD COLUMN market_cap_source TEXT")
+            added.append("market_cap_source")
+        except Exception as e:
+            if "duplicate column" not in str(e).lower():
+                logger.warning(f"Failed to add market_cap_source column: {e}")
+
+    if added:
+        conn.commit()
+        logger.info(f"Schema migration: added {', '.join(added)} column(s)")
+        return True
+
     return True
+
+
+def _cross_check_with_yfinance(ticker, derived_mcap):
+    """
+    Cross-check derived market cap against yfinance's reported marketCap.
+
+    Returns (use_yfinance, mcap_to_use, source_label, reason).
+
+    ADR errors produce values in the legitimate range (TM $2.5T, HSBC $1.8T sit
+    between AMZN $2.9T and AVGO $1.8T), so no absolute threshold separates them.
+    Instead, compare against yfinance's ground-truth marketCap: a relative check
+    catches any units error (ADR or otherwise) without needing share-class metadata.
+
+    When they disagree significantly, use yfinance's value if it's usable (>0).
+
+    Args:
+        ticker: Stock ticker symbol
+        derived_mcap: Our computed market cap (price × shares)
+
+    Returns:
+        (use_yfinance, mcap_to_use, source_label, reason)
+        - use_yfinance: True if we should use yfinance's value instead of derived
+        - mcap_to_use: The market cap to write (yfinance or derived)
+        - source_label: 'derived' or 'yfinance_crosscheck' or None (for NULL)
+        - reason: Human-readable explanation
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        if not info or 'marketCap' not in info or info['marketCap'] is None:
+            # yfinance fetch failed or no market cap available
+            # Use our derived value (already validated locally)
+            return (False, derived_mcap, "derived", "yfinance_unavailable")
+
+        yf_mcap = float(info['marketCap'])
+
+        if yf_mcap <= 0:
+            # Invalid yfinance data - use our derived value
+            return (False, derived_mcap, "derived", "yfinance_invalid")
+
+        # Compare ratio (use max/min to handle both directions)
+        ratio = max(derived_mcap, yf_mcap) / min(derived_mcap, yf_mcap)
+
+        if ratio > MAX_DISCREPANCY_RATIO:
+            # Significant disagreement - use yfinance's value (it's an independent source)
+            return (True, yf_mcap, "yfinance_crosscheck", f"discrepancy_{ratio:.1f}x")
+
+        # Within tolerance - use our derived value
+        return (False, derived_mcap, "derived", f"validated_{ratio:.2f}x")
+
+    except Exception as e:
+        # Network error or other exception - use our derived value
+        logger.debug(f"{ticker}: yfinance cross-check failed: {e}")
+        return (False, derived_mcap, "derived", f"yfinance_error")
 
 
 def compute_market_caps(dry_run=True, db_path=None):
@@ -127,8 +201,8 @@ def compute_market_caps(dry_run=True, db_path=None):
     conn = get_db(db_path)
     cur = conn.cursor()
 
-    # Ensure market_cap_asof column exists
-    has_asof = _ensure_market_cap_asof_column(conn)
+    # Ensure market_cap_asof and market_cap_source columns exist
+    _ensure_market_cap_columns(conn)
 
     # Get all companies
     cur.execute("SELECT id, ticker, market_cap FROM companies ORDER BY ticker")
@@ -149,6 +223,8 @@ def compute_market_caps(dry_run=True, db_path=None):
     changed_tier_count = 0
     mcap_changes = []  # (ticker, old_mcap, new_mcap, old_tier, new_tier)
     rejections = []  # (ticker, reason, details) for data quality logging
+    yfinance_checks_performed = 0
+    yfinance_values_used = 0  # Count of times we used yfinance's value instead of derived
 
     for i, (company_id, ticker, old_mcap) in enumerate(all_companies):
         # Get latest price with date
@@ -213,13 +289,41 @@ def compute_market_caps(dry_run=True, db_path=None):
             continue
 
         # Compute market cap
-        new_mcap = close_price * shares
+        derived_mcap = close_price * shares
+        mcap_source = "derived"
 
-        # Guard 5: Output plausibility check
+        # Guard 5: ADR cross-check for large companies
+        # ADR unit errors (5:1 ratios) produce values in the legitimate range (TM $2.5T,
+        # HSBC $1.8T sit between AMZN $2.9T and AVGO $1.8T), so absolute thresholds fail.
+        # Instead, cross-check against yfinance's ground-truth marketCap for companies
+        # above $500B where the stakes justify a network call.
+        #
+        # Run this BEFORE the $5T ceiling so TSM can benefit from yfinance's correct value.
+        if derived_mcap >= CROSS_CHECK_THRESHOLD:
+            yfinance_checks_performed += 1
+            use_yfinance, mcap_to_use, source_label, reason = _cross_check_with_yfinance(ticker, derived_mcap)
+
+            if use_yfinance:
+                # Significant disagreement - use yfinance's value
+                yfinance_values_used += 1
+                new_mcap = mcap_to_use
+                mcap_source = source_label
+                rejections.append((ticker, "adr_corrected",
+                                 f"derived=${derived_mcap/1e9:.1f}B, yfinance=${new_mcap/1e9:.1f}B ({reason}), "
+                                 f"using yfinance value"))
+                logger.debug(f"{ticker}: Using yfinance value ${new_mcap/1e9:.1f}B instead of derived ${derived_mcap/1e9:.1f}B")
+            else:
+                new_mcap = derived_mcap
+                mcap_source = source_label
+        else:
+            new_mcap = derived_mcap
+
+        # Guard 6: Output plausibility check (on the FINAL value we're going to use)
         if new_mcap > MAX_PLAUSIBLE_MARKET_CAP:
             skipped_implausible += 1
             rejections.append((ticker, "implausible_mcap",
-                             f"${new_mcap/1e12:.1f}T (price={close_price:,.0f}, shares={shares:,.0f}, "
+                             f"${new_mcap/1e12:.1f}T (source={mcap_source}, "
+                             f"price={close_price:,.0f}, shares={shares:,.0f}, "
                              f"price_date={price_date_str}, shares_date={shares_date_str})"))
             continue
 
@@ -240,18 +344,13 @@ def compute_market_caps(dry_run=True, db_path=None):
             changed_tier_count += 1
 
         if not dry_run:
-            if has_asof:
-                cur.execute("""
-                    UPDATE companies
-                    SET market_cap = ?, market_cap_asof = ?
-                    WHERE id = ?
-                """, (new_mcap, price_date_str, company_id))
-            else:
-                cur.execute("""
-                    UPDATE companies
-                    SET market_cap = ?
-                    WHERE id = ?
-                """, (new_mcap, company_id))
+            # Always write market_cap and market_cap_source
+            # market_cap_asof only if column exists (schema migration succeeded)
+            cur.execute("""
+                UPDATE companies
+                SET market_cap = ?, market_cap_asof = ?, market_cap_source = ?
+                WHERE id = ?
+            """, (new_mcap, price_date_str, mcap_source, company_id))
 
         updated += 1
 
@@ -280,6 +379,8 @@ def compute_market_caps(dry_run=True, db_path=None):
     logger.info(f"Skipped (misaligned dates):     {skipped_misaligned:,}")
     logger.info(f"Skipped (invalid input):        {skipped_invalid_input:,}")
     logger.info(f"Skipped (implausible result):   {skipped_implausible:,}")
+    logger.info(f"yfinance cross-checks:          {yfinance_checks_performed:,}")
+    logger.info(f"yfinance values used:           {yfinance_values_used:,}")
     logger.info(f"Changed market cap:             {changed_mcap_count:,}")
     logger.info(f"Changed size tier:              {changed_tier_count:,}")
 
@@ -332,6 +433,8 @@ def compute_market_caps(dry_run=True, db_path=None):
         'skipped_misaligned': skipped_misaligned,
         'skipped_invalid_input': skipped_invalid_input,
         'skipped_implausible': skipped_implausible,
+        'yfinance_checks_performed': yfinance_checks_performed,
+        'yfinance_values_used': yfinance_values_used,
         'changed_mcap_count': changed_mcap_count,
         'changed_tier_count': changed_tier_count,
     }
@@ -372,6 +475,8 @@ def main():
                 'skipped_misaligned': stats['skipped_misaligned'],
                 'skipped_invalid_input': stats['skipped_invalid_input'],
                 'skipped_implausible': stats['skipped_implausible'],
+                'yfinance_checks_performed': stats['yfinance_checks_performed'],
+                'yfinance_values_used': stats['yfinance_values_used'],
             }
 
         logger.info("")

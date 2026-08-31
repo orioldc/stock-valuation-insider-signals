@@ -294,6 +294,8 @@ def ingest_incremental(ticker, ticker_map=None):
     filings = [f for f in filings if f["filing_date"] > latest_date]
 
     inserted = 0
+    rejected_prices = []
+    cur = conn.cursor()
     for filing in filings:
         transactions = parse_form4_xml(
             filing["cik"],
@@ -306,6 +308,18 @@ def ingest_incremental(ticker, ticker_map=None):
                     txn["transaction_date"],
                     filing["filing_date"]
                 )
+
+                # Validate price before insertion
+                price_valid, price_reason, normalized_price = _validate_price_value(
+                    txn["price"], ticker, normalized_date, cur, shares=txn["shares"]
+                )
+
+                if not price_valid:
+                    rejected_prices.append((normalized_date, txn["price"], price_reason))
+                    logger.info(f"{ticker}: REJECTED price on {normalized_date}: {txn['price']} - {price_reason}")
+                    continue
+
+                # Use normalized_price (which may be None if price was <= 0)
                 conn.execute("""
                     INSERT OR IGNORE INTO insider_transactions
                     (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
@@ -319,7 +333,7 @@ def ingest_incremental(ticker, ticker_map=None):
                     txn["insider_cik"],
                     txn["transaction_code"],
                     txn["shares"],
-                    txn["price"],
+                    normalized_price,
                     txn["shares_owned_after"],
                     json.dumps(txn),
                 ))
@@ -371,11 +385,13 @@ def ingest_insider_trades(ticker, ticker_map=None):
     
     filings = fetch_form4_filings(cik)
     inserted = 0
-    
+    rejected_prices = []
+    cur = conn.cursor()
+
     for fi, filing in enumerate(filings):
         if fi % 50 == 0 and fi > 0:
             logger.info(f"  {ticker}: parsed {fi}/{len(filings)} filings, {inserted} inserted so far")
-        
+
         transactions = parse_form4_xml(
             filing["cik"],
             filing["accession_number"],
@@ -387,6 +403,18 @@ def ingest_insider_trades(ticker, ticker_map=None):
                     txn["transaction_date"],
                     filing["filing_date"]
                 )
+
+                # Validate price before insertion
+                price_valid, price_reason, normalized_price = _validate_price_value(
+                    txn["price"], ticker, normalized_date, cur, shares=txn["shares"]
+                )
+
+                if not price_valid:
+                    rejected_prices.append((normalized_date, txn["price"], price_reason))
+                    logger.info(f"{ticker}: REJECTED price on {normalized_date}: {txn['price']} - {price_reason}")
+                    continue
+
+                # Use normalized_price (which may be None if price was <= 0)
                 conn.execute("""
                     INSERT OR IGNORE INTO insider_transactions
                     (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
@@ -400,17 +428,20 @@ def ingest_insider_trades(ticker, ticker_map=None):
                     txn["insider_cik"],
                     txn["transaction_code"],
                     txn["shares"],
-                    txn["price"],
+                    normalized_price,
                     txn["shares_owned_after"],
                     json.dumps(txn),
                 ))
                 inserted += 1
             except Exception as e:
                 logger.warning(f"Error inserting transaction for {ticker}: {e}")
-    
+
     conn.commit()
     conn.close()
-    logger.info(f"{ticker}: Inserted {inserted} insider transactions")
+    if rejected_prices:
+        logger.info(f"{ticker}: Inserted {inserted} insider transactions, rejected {len(rejected_prices)} corrupt prices")
+    else:
+        logger.info(f"{ticker}: Inserted {inserted} insider transactions")
     return inserted
 
 
@@ -468,6 +499,80 @@ def _validate_shares_value(shares, company_id, date, ticker, cur):
                 return False, f"qoq_outlier ({prior_shares:,.0f} -> {shares:,.0f} = {ratio:.2f}x on {prior_date})"
 
     return True, None
+
+
+def _validate_price_value(price, ticker, transaction_date, cur, shares=None):
+    """
+    Validate insider transaction price for plausibility.
+
+    Returns (valid: bool, reason: str or None, normalized_price: float or None)
+
+    Treats price <= 0 as unknown (not zero) — returns (True, None, None) so the
+    transaction is accepted but price is stored as NULL.
+
+    Checks:
+    1. Price <= 0: Accept transaction but store price as NULL (unknown, not zero)
+    2. Hard bound: price > $1,000,000/share is corrupt under any interpretation
+       (BRK-A legitimately trades ~$700K; threshold must accommodate real extremes)
+    3. Market cap sanity: Transaction value (price × shares) > company market cap
+       is impossible for a single transaction. Catches cases where aggregate value
+       was written into the price field (e.g., NUTX: 31,746 shares × $0.63 = "price" $20,000).
+
+    Note: Market-divergence check is NOT performed at ingestion time. It requires:
+    - Split-corrected market prices (prices table is back-adjusted, transactions are as-transacted)
+    - Complete split_events table for the ticker
+    - Historical price coverage overlapping the transaction date
+
+    These dependencies are not guaranteed during incremental ingestion, and attempting
+    to enforce them here would either reject valid data or require complex on-demand
+    fetching. The market divergence check is instead performed by the cleanup script
+    (scripts/cleanup_corrupt_prices.py), which runs after all data is loaded and has
+    full access to the split_events table.
+
+    Args:
+        price: Price value to validate
+        ticker: Ticker symbol (for market cap lookup)
+        transaction_date: Transaction date (unused currently)
+        cur: Database cursor (for market cap lookup)
+        shares: Shares transacted (for market cap sanity check)
+    """
+    # Guard 1: Non-positive prices are unknown, not zero
+    # On Form 4, an absent price usually means undisclosed, not free.
+    # Store as NULL so downstream code must handle absence; conflating unknown
+    # and zero is the recurring defect in this codebase.
+    if price is not None and price <= 0:
+        return True, "price_unknown", None
+
+    # Guard 2: Absolute ceiling
+    # BRK-A legitimately trades near $700,000/share, NVR near $8,000.
+    # A price above $1M/share is corrupt under any interpretation.
+    # P99 of valid distribution is $1,576; $1M is 630x that.
+    MAX_PLAUSIBLE_PRICE = 1_000_000.0
+
+    if price is not None and price > MAX_PLAUSIBLE_PRICE:
+        return False, f"above_ceiling ({price:,.2f} > {MAX_PLAUSIBLE_PRICE:,.0f})", None
+
+    # Guard 3: Market cap sanity check (if shares provided)
+    if price is not None and shares is not None and shares > 0:
+        # Get company market cap
+        cur.execute("SELECT market_cap FROM companies WHERE ticker = ?", (ticker,))
+        mcap_row = cur.fetchone()
+
+        if mcap_row and mcap_row[0] is not None:
+            market_cap = mcap_row[0]
+            MIN_PLAUSIBLE_MCAP = 1_000_000.0      # $1M
+            MAX_PLAUSIBLE_MCAP = 5_000_000_000_000.0  # $5T
+
+            # Only apply check if market cap is plausible
+            if MIN_PLAUSIBLE_MCAP <= market_cap <= MAX_PLAUSIBLE_MCAP:
+                tx_value = price * shares
+                ratio = tx_value / market_cap
+
+                if ratio > 1.0:  # Transaction value > 100% of market cap
+                    return False, f"exceeds_market_cap (tx_value=${tx_value/1e9:.2f}B > market_cap=${market_cap/1e9:.2f}B)", None
+
+    # All checks passed
+    return True, None, price
 
 
 def ingest_shares_outstanding(ticker, ticker_map=None):

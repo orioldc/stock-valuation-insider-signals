@@ -28,6 +28,7 @@ import os
 import sqlite3
 import logging
 import argparse
+import time
 from datetime import datetime, timedelta
 import yfinance as yf
 
@@ -57,12 +58,9 @@ MAX_DATE_MISALIGNMENT_DAYS = 400  # Price and shares dates must be within 400 da
 # cross a 6x tier boundary. 400d covers quarterly reporting + filing lag + one missed quarter.
 MAX_PLAUSIBLE_MARKET_CAP = 5e12   # $5T ceiling - accommodates largest companies (MSFT, AAPL, NVDA)
 
-# ADR cross-check threshold: only validate companies above this size
-# (avoids network calls for small-cap universe; ADR errors only affect mega/large caps)
-CROSS_CHECK_THRESHOLD = 500e9    # $500B
-
-# ADR cross-check tolerance: reject if derived/yfinance ratio exceeds this
-# (3x accommodates methodology differences; ADR unit errors typically 5-10x)
+# Discrepancy threshold for logging basis mismatches
+# When yfinance and derived disagree by more than this ratio, log it as a data quality signal
+# (basis mismatches in share data typically show 5-10x disagreements)
 MAX_DISCREPANCY_RATIO = 3.0
 
 
@@ -114,16 +112,14 @@ def _ensure_market_cap_columns(conn):
 
 def _cross_check_with_yfinance(ticker, derived_mcap):
     """
-    Cross-check derived market cap against yfinance's reported marketCap.
+    Get market cap with yfinance as primary authority, derived as fallback.
 
-    Returns (use_yfinance, mcap_to_use, source_label, reason).
+    Inverted authority model: yfinance's marketCap is internally consistent
+    (vendor computes it from matching price and share basis), so we trust it
+    when available. Fall back to price × shares only when yfinance has no value.
 
-    ADR errors produce values in the legitimate range (TM $2.5T, HSBC $1.8T sit
-    between AMZN $2.9T and AVGO $1.8T), so no absolute threshold separates them.
-    Instead, compare against yfinance's ground-truth marketCap: a relative check
-    catches any units error (ADR or otherwise) without needing share-class metadata.
-
-    When they disagree significantly, use yfinance's value if it's usable (>0).
+    The derived value serves as a reverse cross-check: when the two disagree by
+    more than ~3x, log it (signals bad share data worth surfacing).
 
     Args:
         ticker: Stock ticker symbol
@@ -131,9 +127,9 @@ def _cross_check_with_yfinance(ticker, derived_mcap):
 
     Returns:
         (use_yfinance, mcap_to_use, source_label, reason)
-        - use_yfinance: True if we should use yfinance's value instead of derived
+        - use_yfinance: True if we used yfinance's value
         - mcap_to_use: The market cap to write (yfinance or derived)
-        - source_label: 'derived' or 'yfinance_crosscheck' or None (for NULL)
+        - source_label: 'yfinance' or 'derived'
         - reason: Human-readable explanation
     """
     try:
@@ -142,28 +138,29 @@ def _cross_check_with_yfinance(ticker, derived_mcap):
 
         if not info or 'marketCap' not in info or info['marketCap'] is None:
             # yfinance fetch failed or no market cap available
-            # Use our derived value (already validated locally)
+            # Fall back to our derived value
             return (False, derived_mcap, "derived", "yfinance_unavailable")
 
         yf_mcap = float(info['marketCap'])
 
         if yf_mcap <= 0:
-            # Invalid yfinance data - use our derived value
+            # Invalid yfinance data - fall back to our derived value
             return (False, derived_mcap, "derived", "yfinance_invalid")
 
-        # Compare ratio (use max/min to handle both directions)
-        ratio = max(derived_mcap, yf_mcap) / min(derived_mcap, yf_mcap)
+        # yfinance has a usable value - use it as primary source
+        # Compare against derived as a sanity check
+        ratio = max(derived_mcap, yf_mcap) / min(derived_mcap, yf_mcap) if min(derived_mcap, yf_mcap) > 0 else float('inf')
 
         if ratio > MAX_DISCREPANCY_RATIO:
-            # Significant disagreement - use yfinance's value (it's an independent source)
-            return (True, yf_mcap, "yfinance_crosscheck", f"discrepancy_{ratio:.1f}x")
+            # Significant disagreement - log it (signals basis mismatch in share data)
+            return (True, yf_mcap, "yfinance", f"basis_mismatch_{ratio:.1f}x")
 
-        # Within tolerance - use our derived value
-        return (False, derived_mcap, "derived", f"validated_{ratio:.2f}x")
+        # Agreement within tolerance
+        return (True, yf_mcap, "yfinance", f"validated_{ratio:.2f}x")
 
     except Exception as e:
-        # Network error or other exception - use our derived value
-        logger.debug(f"{ticker}: yfinance cross-check failed: {e}")
+        # Network error or other exception - fall back to our derived value
+        logger.debug(f"{ticker}: yfinance fetch failed: {e}")
         return (False, derived_mcap, "derived", f"yfinance_error")
 
 
@@ -288,35 +285,34 @@ def compute_market_caps(dry_run=True, db_path=None):
                              f"close={close_price}, shares={shares}"))
             continue
 
-        # Compute market cap
+        # Compute market cap from price × shares (used as fallback)
         derived_mcap = close_price * shares
-        mcap_source = "derived"
 
-        # Guard 5: ADR cross-check for large companies
-        # ADR unit errors (5:1 ratios) produce values in the legitimate range (TM $2.5T,
-        # HSBC $1.8T sit between AMZN $2.9T and AVGO $1.8T), so absolute thresholds fail.
-        # Instead, cross-check against yfinance's ground-truth marketCap for companies
-        # above $500B where the stakes justify a network call.
-        #
-        # Run this BEFORE the $5T ceiling so TSM can benefit from yfinance's correct value.
-        if derived_mcap >= CROSS_CHECK_THRESHOLD:
-            yfinance_checks_performed += 1
-            use_yfinance, mcap_to_use, source_label, reason = _cross_check_with_yfinance(ticker, derived_mcap)
+        # Guard 5: Fetch market cap from yfinance (primary source, internally consistent)
+        # Fall back to derived value only when yfinance is unavailable.
+        # This runs BEFORE the $5T ceiling so companies with basis mismatches (BABA, TSM)
+        # can benefit from yfinance's correct value.
+        yfinance_checks_performed += 1
+        use_yfinance, mcap_to_use, source_label, reason = _cross_check_with_yfinance(ticker, derived_mcap)
 
-            if use_yfinance:
-                # Significant disagreement - use yfinance's value
-                yfinance_values_used += 1
-                new_mcap = mcap_to_use
-                mcap_source = source_label
-                rejections.append((ticker, "adr_corrected",
-                                 f"derived=${derived_mcap/1e9:.1f}B, yfinance=${new_mcap/1e9:.1f}B ({reason}), "
-                                 f"using yfinance value"))
-                logger.debug(f"{ticker}: Using yfinance value ${new_mcap/1e9:.1f}B instead of derived ${derived_mcap/1e9:.1f}B")
-            else:
-                new_mcap = derived_mcap
-                mcap_source = source_label
+        if use_yfinance:
+            yfinance_values_used += 1
+            new_mcap = mcap_to_use
+            mcap_source = source_label
+
+            # Log basis mismatches (yfinance vs derived disagreement > 3x)
+            if "basis_mismatch" in reason:
+                rejections.append((ticker, "basis_mismatch",
+                                 f"derived=${derived_mcap/1e9:.1f}B, yfinance=${new_mcap/1e9:.1f}B ({reason})"))
+                logger.debug(f"{ticker}: Basis mismatch detected, using yfinance ${new_mcap/1e9:.1f}B")
         else:
+            # yfinance unavailable/invalid - use derived value
             new_mcap = derived_mcap
+            mcap_source = source_label
+
+        # Rate limit: polite delay between yfinance calls (20ms)
+        # This adds ~2.5 minutes to a full run of 7630 companies but prevents API throttling
+        time.sleep(0.02)
 
         # Guard 6: Output plausibility check (on the FINAL value we're going to use)
         if new_mcap > MAX_PLAUSIBLE_MARKET_CAP:

@@ -593,12 +593,13 @@ def check_inactive_price_growth(conn):
 
 def check_benchmark_etf_coverage(conn):
     """
-    SPY, IWM, and MDY are present and continuous from the earliest signal_date
+    All benchmark ETFs are present and continuous from the earliest signal_date
     to present, with no interior gaps in consecutive trading days.
 
     A benchmark with an interior gap corrupts every excess-return calculation. We scope
     this to the backtest window (earliest signal onward) rather than the full price history
-    because SPY wasn't listed until 1993, MDY 1995, IWM 2000.
+    because different benchmarks launched at different times (SPY 1993, MDY 1995, IWM 2000,
+    QQQ 1999, ^IXIC 1971, ACWI 2008, URTH 2012).
 
     Trailing-edge tolerance: ETFs are fetched by different code paths at different moments,
     so their last-trading-day may differ by a few days (fetch timing, not data loss). We
@@ -640,7 +641,7 @@ def check_benchmark_etf_coverage(conn):
     # Trailing edge tolerance: 7 calendar days (~5 trading days)
     trailing_tolerance_days = 7
 
-    benchmarks = ['SPY', 'IWM', 'MDY']
+    benchmarks = ['SPY', 'IWM', 'MDY', 'QQQ', '^IXIC', 'URTH', 'ACWI']
     results = {}
     all_passed = True
     failure_reasons = []
@@ -900,6 +901,77 @@ def check_price_values(conn):
             'non_positive_prices': 0,
             'note': 'Price must be strictly positive; zero tolerance',
             'threshold_type': 'target'
+        }
+    }
+
+
+def check_extreme_price_values(conn):
+    """
+    Prices.close values above $100k (informational, flags for review).
+
+    Most extreme prices are legitimate split-adjusted history for reverse-split
+    microcaps. A stock at $3 today after cumulative 1:100,000 reverse splits
+    genuinely shows $300k adjusted prices in the past. However, values above
+    $100k are worth flagging for review to catch potential data corruption.
+
+    This check is informational (WARN) because these values are legitimate
+    back-adjusted artifacts, not corruption. They only become wrong when
+    treated as current prices, which market_cap_plausibility catches.
+
+    Threshold: $100,000 per share
+    Threshold type: Informational (flags for review, not corruption)
+    """
+    cur = conn.cursor()
+
+    # Threshold for extreme prices
+    extreme_threshold = 100000.0
+
+    # Count prices above threshold
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM prices
+        WHERE close > ?
+    """, (extreme_threshold,))
+    extreme_count = cur.fetchone()[0]
+
+    if extreme_count > 0:
+        # Get examples (highest values, with context)
+        cur.execute("""
+            SELECT ticker, date, close,
+                   (SELECT COUNT(*) FROM prices p2 WHERE p2.ticker = prices.ticker) as total_rows
+            FROM prices
+            WHERE close > ?
+            ORDER BY close DESC
+            LIMIT 20
+        """, (extreme_threshold,))
+        examples = [
+            f"{row[0]} on {row[1]}: ${row[2]:,.0f} ({row[3]} total rows)"
+            for row in cur.fetchall()
+        ]
+
+        # Get ticker count
+        cur.execute("""
+            SELECT COUNT(DISTINCT ticker)
+            FROM prices
+            WHERE close > ?
+        """, (extreme_threshold,))
+        ticker_count = cur.fetchone()[0]
+    else:
+        examples = []
+        ticker_count = 0
+
+    return {
+        'passed': True,  # Informational only, always passes
+        'measured': {
+            'extreme_price_count': extreme_count,
+            'tickers_affected': ticker_count,
+            'threshold': extreme_threshold,
+            'examples': examples
+        },
+        'expected': {
+            'threshold_type': 'informational',
+            'threshold_display': f'${extreme_threshold:,.0f}',
+            'note': 'Legitimate split-adjusted values; review for potential corruption'
         }
     }
 
@@ -1286,6 +1358,115 @@ def check_market_cap_input_staleness(conn):
         'expected': {
             'threshold_type': 'informational',
             'note': 'Market cap from stale inputs (>1yr behind latest price) — monitors for growth'
+        }
+    }
+
+
+def check_shares_basis_switches(conn):
+    """
+    Consecutive-quarter share count changes that look like reporting-basis switches.
+
+    A large consecutive-quarter multiplier (roughly 5x or 1/5x) that is NOT explained
+    by an entry in split_events signals either:
+      - Reporting basis switch (ADR shares vs ordinary shares)
+      - Bad data (incorrect XBRL parse or vendor error)
+
+    Example: BABA 2025-03-31 → 2026-03-31
+      18,474M → 1,858M  (9.94x drop, no split recorded)
+      This is an ADR/ordinary switch, not a real corporate action.
+
+    Catches the root cause of market cap basis mismatches.
+
+    Threshold type: Informational (WARN, surfaces data quality issues)
+    """
+    cur = conn.cursor()
+
+    # Basis switch threshold: 5x or 1/5x consecutive quarter change
+    basis_switch_threshold = 5.0
+
+    # Get all companies with at least 2 quarters of share data
+    cur.execute("""
+        SELECT c.ticker, c.id
+        FROM companies c
+        WHERE EXISTS (
+            SELECT 1 FROM shares_outstanding
+            WHERE company_id = c.id
+            GROUP BY company_id
+            HAVING COUNT(*) >= 2
+        )
+        ORDER BY c.ticker
+    """)
+    companies = cur.fetchall()
+
+    basis_switches = []
+
+    for ticker, company_id in companies:
+        # Get shares in chronological order
+        cur.execute("""
+            SELECT date, shares
+            FROM shares_outstanding
+            WHERE company_id = ?
+            ORDER BY date
+        """, (company_id,))
+        share_history = cur.fetchall()
+
+        if len(share_history) < 2:
+            continue
+
+        # Check consecutive quarters for large multipliers
+        for i in range(1, len(share_history)):
+            prev_date, prev_shares = share_history[i-1]
+            curr_date, curr_shares = share_history[i]
+
+            if prev_shares <= 0 or curr_shares <= 0:
+                continue
+
+            # Calculate multiplier (both directions)
+            multiplier = max(curr_shares / prev_shares, prev_shares / curr_shares)
+
+            if multiplier >= basis_switch_threshold:
+                # Check if there's a split event that explains this
+                # Look for splits within +/- 90 days of the current date
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM split_events
+                    WHERE ticker = ?
+                      AND date >= date(?, '-90 days')
+                      AND date <= date(?, '+90 days')
+                """, (ticker, curr_date, curr_date))
+                has_split = cur.fetchone()[0] > 0
+
+                if not has_split:
+                    # Unexplained large change - likely a basis switch
+                    basis_switches.append({
+                        'ticker': ticker,
+                        'from_date': prev_date,
+                        'to_date': curr_date,
+                        'from_shares': prev_shares,
+                        'to_shares': curr_shares,
+                        'multiplier': round(multiplier, 2)
+                    })
+
+    # Get unique ticker count
+    affected_tickers = set(s['ticker'] for s in basis_switches)
+
+    # Sort by multiplier (descending) to show most extreme cases first
+    basis_switches_sorted = sorted(basis_switches, key=lambda s: s['multiplier'], reverse=True)
+
+    return {
+        'passed': True,  # Informational only, always passes
+        'measured': {
+            'basis_switch_count': len(basis_switches),
+            'affected_tickers': len(affected_tickers),
+            'threshold_multiplier': basis_switch_threshold,
+            'examples': [
+                f"{s['ticker']}: {s['from_shares']/1e6:.1f}M → {s['to_shares']/1e6:.1f}M ({s['multiplier']}x, {s['from_date']} → {s['to_date']})"
+                for s in basis_switches_sorted[:20]
+            ]
+        },
+        'expected': {
+            'threshold_type': 'informational',
+            'note': 'Large consecutive-quarter share changes (≥5x) without split events signal basis switches or bad data'
         }
     }
 
@@ -1801,8 +1982,9 @@ def check_no_prices_for_unknown_tickers(conn):
     """
     No prices for tickers absent from companies table (except benchmark ETFs).
 
-    Benchmark ETFs (SPY, IWM, MDY) are legitimately in prices without companies entries.
-    All other tickers in prices must exist in companies, or they represent orphaned data.
+    Benchmark ETFs (SPY, IWM, MDY, QQQ, ^IXIC, URTH, ACWI) are legitimately in prices
+    without companies entries. All other tickers in prices must exist in companies,
+    or they represent orphaned data.
 
     Threshold type: Target (zero tolerance for non-benchmark orphans)
     """
@@ -1813,7 +1995,7 @@ def check_no_prices_for_unknown_tickers(conn):
         SELECT DISTINCT p.ticker
         FROM prices p
         WHERE p.ticker NOT IN (SELECT ticker FROM companies WHERE ticker != 'NONE')
-          AND p.ticker NOT IN ('SPY', 'IWM', 'MDY')
+          AND p.ticker NOT IN ('SPY', 'IWM', 'MDY', 'QQQ', '^IXIC', 'URTH', 'ACWI')
         ORDER BY p.ticker
     """)
     orphans = [row[0] for row in cur.fetchall()]
@@ -1826,7 +2008,7 @@ def check_no_prices_for_unknown_tickers(conn):
         },
         'expected': {
             'orphan_tickers': 0,
-            'note': 'Prices for unknown tickers (benchmarks SPY/IWM/MDY exempted)',
+            'note': 'Prices for unknown tickers (benchmarks SPY/IWM/MDY/QQQ/^IXIC/URTH/ACWI exempted)',
             'threshold_type': 'target'
         }
     }
@@ -2065,7 +2247,7 @@ CHECKS = [
     },
     {
         'id': 'coverage.benchmark_etfs',
-        'description': 'SPY, IWM, MDY continuous across backtest window (earliest signal to present)',
+        'description': 'All benchmarks (SPY/IWM/MDY/QQQ/^IXIC/URTH/ACWI) continuous across backtest window',
         'severity': CRITICAL,
         'check_fn': check_benchmark_etf_coverage
     },
@@ -2082,6 +2264,12 @@ CHECKS = [
         'description': 'Zero non-positive prices (close <= 0 is invalid)',
         'severity': CRITICAL,
         'check_fn': check_price_values
+    },
+    {
+        'id': 'integrity.extreme_price_values',
+        'description': 'Prices >$100k (informational: flags split-adjusted extremes for review)',
+        'severity': WARN,
+        'check_fn': check_extreme_price_values
     },
     {
         'id': 'integrity.market_cap_plausibility',
@@ -2112,6 +2300,12 @@ CHECKS = [
         'description': 'Market cap inputs >1yr stale (monitors for growth)',
         'severity': WARN,
         'check_fn': check_market_cap_input_staleness
+    },
+    {
+        'id': 'integrity.shares_basis_switches',
+        'description': 'Consecutive-quarter share changes ≥5x without split events (basis switches)',
+        'severity': WARN,
+        'check_fn': check_shares_basis_switches
     },
     {
         'id': 'integrity.ticker_cik_coverage',

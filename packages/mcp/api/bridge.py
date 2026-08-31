@@ -853,9 +853,18 @@ def _build_summary_text(p):
     lines.append(f"Sector: {sector} ({cap_lbl}, market cap {cap_str})")
     lines.append("")
     lines.append("## Verdict")
+
+    # Build current price line with date
+    price_str = _money(p.get('current_price'))
+    price_date = p.get('price_date')
+    if price_date:
+        price_display = f"{price_str} (close {price_date})"
+    else:
+        price_display = price_str
+
     lines.append(
         f"{p.get('verdict','n/a')} — Intrinsic {_money(p.get('intrinsic_value'))} vs "
-        f"Current {_money(p.get('current_price'))} ({_pct((p.get('upside_pct') or 0)/100)} upside)"
+        f"Current {price_display} ({_pct((p.get('upside_pct') or 0)/100)} upside)"
     )
     lines.append("")
     lines.append("## Method Outputs")
@@ -990,6 +999,7 @@ def run_valuation(ticker):
         "market_cap": _to_native(profile.get("market_cap")),
         "market_cap_label": profile.get("market_cap_label"),
         "current_price": _to_native(profile.get("current_price")),
+        "price_date": profile.get("price_date"),
         "intrinsic_value": _to_native(syn.get("weighted_value")),
         "synthesized_value": _to_native(syn.get("weighted_value")),
         "upside_pct": _to_native(syn.get("upside_pct")),

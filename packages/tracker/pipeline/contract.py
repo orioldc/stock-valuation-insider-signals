@@ -1599,81 +1599,201 @@ def check_derived_artifacts_consistency(conn):
     }
 
 
-def check_no_contradictory_price_failures(conn):
-    """
-    No entity may be simultaneously in price_backfill_failures and have price data.
-
-    This catches stale failure records that prevent future refreshes. Found live bug:
-    743 tickers including SPY were marked 'no_data' but held current prices, causing
-    backfill to skip them forever and silently corrupt backtests.
-
-    Threshold type: Target (zero tolerance — logical contradiction)
-    """
-    cur = conn.cursor()
-
-    # Find tickers in both failures and prices
-    cur.execute("""
+# Shared mapping used by both contradiction and coverage checks
+# Mapping: failure_table -> (data_table, description, query)
+# Query returns (entity_id, reason, data_row_count, latest_data_item)
+FAILURE_MAPPINGS = {
+    'benchmark_backfill_failures': (
+        'prices',
+        'benchmarks',
+        """
+        SELECT f.ticker, f.reason, COUNT(p.date) as price_rows, MAX(p.date) as latest_price
+        FROM benchmark_backfill_failures f
+        INNER JOIN prices p ON f.ticker = p.ticker
+        WHERE f.ticker IN ('SPY', 'IWM', 'MDY')
+        GROUP BY f.ticker, f.reason
+        ORDER BY price_rows DESC
+        """
+    ),
+    'price_backfill_failures': (
+        'prices',
+        'company prices',
+        """
         SELECT f.ticker, f.reason, COUNT(p.date) as price_rows, MAX(p.date) as latest_price
         FROM price_backfill_failures f
         INNER JOIN prices p ON f.ticker = p.ticker
         GROUP BY f.ticker, f.reason
         ORDER BY price_rows DESC
-    """)
-    contradictions = cur.fetchall()
+        """
+    ),
+    'quarter_index_failures': (
+        'insider_transactions',
+        'current-quarter Form 4 ingestion',
+        """
+        SELECT f.cik, f.ticker, f.reason, COUNT(it.id) as txn_count,
+               f.year || 'Q' || f.quarter as quarter_id
+        FROM quarter_index_failures f
+        INNER JOIN companies c ON f.cik = c.cik
+        INNER JOIN insider_transactions it ON c.id = it.company_id
+        WHERE it.filing_date >= date(printf('%04d-%02d-01', f.year, (f.quarter - 1) * 3 + 1))
+          AND it.filing_date < date(printf('%04d-%02d-01', f.year, (f.quarter - 1) * 3 + 1), '+3 months')
+        GROUP BY f.cik, f.ticker, f.reason, f.year, f.quarter
+        ORDER BY txn_count DESC
+        """
+    ),
+    'shares_backfill_failures': (
+        'shares_outstanding',
+        'share buyback data',
+        """
+        SELECT c.ticker, f.reason, COUNT(s.date) as shares_rows, f.cik
+        FROM shares_backfill_failures f
+        INNER JOIN companies c ON f.cik = c.cik
+        INNER JOIN shares_outstanding s ON c.id = s.company_id
+        GROUP BY c.ticker, f.reason, f.cik
+        ORDER BY shares_rows DESC
+        """
+    ),
+    'ticker_fix_failures': (
+        'companies',
+        'ticker symbols',
+        """
+        SELECT f.ticker, f.reason, 1 as present, c.id
+        FROM ticker_fix_failures f
+        INNER JOIN companies c ON f.company_id = c.id
+        """
+    )
+}
 
-    return {
-        'passed': len(contradictions) == 0,
-        'measured': {
-            'contradiction_count': len(contradictions),
-            'examples': [
-                f"{row[0]} (reason={row[1]}, {row[2]} price rows, latest={row[3]})"
-                for row in contradictions[:10]
-            ] if contradictions else []
-        },
-        'expected': {
-            'contradictions': 0,
-            'note': 'Ticker cannot be both failed and covered',
-            'threshold_type': 'target'
-        }
-    }
 
-
-def check_no_contradictory_shares_failures(conn):
+def check_failure_table_contradictions(conn):
     """
-    No entity may be simultaneously in shares_backfill_failures and have shares_outstanding data.
+    No entity may be simultaneously in a *_failures table and have its corresponding data.
 
-    Same class of bug as price failures: stale bookkeeping prevents future refreshes.
+    CRITICAL severity — this is a logic error in the pipeline's own bookkeeping.
+    An entity marked permanently failed while its data is present means the reconciliation
+    contract (DB-derived work list, clear-failure-on-success) was violated.
+
+    Found live bug: 743 tickers including SPY were marked 'no_data' in price_backfill_failures
+    but held current prices, causing backfill to skip them forever and silently corrupt backtests.
+
+    Principle: THE DATA BEING WRONG BLOCKS A RELEASE.
+    This check guards data integrity, not contract completeness (see check_failure_table_coverage).
+
+    Mapping from failure table to (data_table, key_column, join_predicate):
+    - benchmark_backfill_failures → prices (ticker, benchmarks only)
+    - price_backfill_failures → prices (ticker, all companies)
+    - quarter_index_failures → insider_transactions (cik, scoped to quarter range)
+    - shares_backfill_failures → shares_outstanding (cik, via companies join)
+    - ticker_fix_failures → companies (company_id)
 
     Threshold type: Target (zero tolerance — logical contradiction)
     """
     cur = conn.cursor()
 
-    # Find CIKs in both failures and shares_outstanding
-    # Join through companies to get ticker for reporting
+    # Discover all *_failures tables
     cur.execute("""
-        SELECT c.ticker, f.cik, f.reason, COUNT(s.date) as shares_rows
-        FROM shares_backfill_failures f
-        INNER JOIN companies c ON f.cik = c.cik
-        INNER JOIN shares_outstanding s ON c.id = s.company_id
-        GROUP BY c.ticker, f.cik, f.reason
-        ORDER BY shares_rows DESC
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name LIKE '%_failures'
+        ORDER BY name
     """)
-    contradictions = cur.fetchall()
+    failure_tables = [row[0] for row in cur.fetchall()]
+
+    all_contradictions = []
+
+    for failure_table in failure_tables:
+        if failure_table not in FAILURE_MAPPINGS:
+            # Unmapped tables are handled by check_failure_table_coverage (WARN)
+            continue
+
+        data_table, description, query = FAILURE_MAPPINGS[failure_table]
+
+        # Execute the contradiction query
+        try:
+            cur.execute(query)
+            contradictions = cur.fetchall()
+
+            if contradictions:
+                for row in contradictions[:5]:  # Top 5 per table
+                    all_contradictions.append({
+                        'failure_table': failure_table,
+                        'data_table': data_table,
+                        'description': description,
+                        'entity': row[0],
+                        'reason': row[1],
+                        'data_count': row[2]
+                    })
+        except Exception as e:
+            # Table might be empty or query might fail - log but don't crash
+            logger.warning(f"Failed to check {failure_table}: {e}")
+            continue
+
+    # Format examples for reporting
+    examples = [
+        f"{c['entity']} in {c['failure_table']} (reason={c['reason']}, {c['data_count']} {c['description']} rows)"
+        for c in all_contradictions[:20]
+    ]
 
     return {
-        'passed': len(contradictions) == 0,
+        'passed': len(all_contradictions) == 0,
         'measured': {
-            'contradiction_count': len(contradictions),
-            'examples': [
-                f"{row[0]} (CIK {row[1]}, reason={row[2]}, {row[3]} shares rows)"
-                for row in contradictions[:10]
-            ] if contradictions else []
+            'contradiction_count': len(all_contradictions),
+            'examples': examples
         },
         'expected': {
             'contradictions': 0,
-            'note': 'CIK cannot be both failed and covered',
+            'note': 'Entity cannot be both failed and covered (logic error in pipeline bookkeeping)',
             'threshold_type': 'target'
         }
+    }
+
+
+def check_failure_table_coverage(conn):
+    """
+    All *_failures tables must be mapped to a contradiction check.
+
+    WARN severity — an unmapped table is a coverage gap in the contract, not a defect in the data.
+    Someone added a capability faster than the contract caught up. This deserves visibility,
+    not a blocked release.
+
+    Principle: THE CONTRACT BEING INCOMPLETE DOES NOT BLOCK A RELEASE.
+    A gate that blocks on its own incompleteness will eventually be switched off, and then it
+    blocks on nothing at all.
+
+    Unmapped tables discovered during development:
+    - benchmark_backfill_failures, shares_backfill_failures, ticker_fix_failures appeared
+      during reconciliation work (3 tables in one PR)
+    - quarter_index_failures created by backfill_quarter_index.py on first monthly run
+
+    Discovering the coupling during a release, at whatever hour a scheduled job fires, is the
+    worst possible moment. A loud WARN surfaces the gap without blocking valid work.
+
+    Threshold type: Informational (visibility, not enforcement)
+    """
+    cur = conn.cursor()
+
+    # Discover all *_failures tables
+    cur.execute("""
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name LIKE '%_failures'
+        ORDER BY name
+    """)
+    failure_tables = [row[0] for row in cur.fetchall()]
+
+    unmapped_tables = [t for t in failure_tables if t not in FAILURE_MAPPINGS]
+
+    return {
+        'passed': len(unmapped_tables) == 0,
+        'measured': {
+            'total_failure_tables': len(failure_tables),
+            'mapped_tables': len([t for t in failure_tables if t in FAILURE_MAPPINGS]),
+            'unmapped_tables': unmapped_tables
+        },
+        'expected': {
+            'unmapped_tables': 0,
+            'note': 'All *_failures tables should be mapped; unmapped tables represent coverage gaps',
+            'threshold_type': 'informational'
+        },
+        'details': f"Unmapped tables: {', '.join(unmapped_tables)}" if unmapped_tables else None
     }
 
 
@@ -2034,16 +2154,16 @@ CHECKS = [
 
     # Internal consistency (bookkeeping vs data)
     {
-        'id': 'consistency.price_failures',
-        'description': 'No ticker in both price_backfill_failures and prices',
+        'id': 'consistency.failure_table_contradictions',
+        'description': 'No entity in both *_failures tables and their corresponding data',
         'severity': CRITICAL,
-        'check_fn': check_no_contradictory_price_failures
+        'check_fn': check_failure_table_contradictions
     },
     {
-        'id': 'consistency.shares_failures',
-        'description': 'No CIK in both shares_backfill_failures and shares_outstanding',
-        'severity': CRITICAL,
-        'check_fn': check_no_contradictory_shares_failures
+        'id': 'consistency.failure_table_coverage',
+        'description': 'All *_failures tables must be mapped to a contradiction check',
+        'severity': WARN,
+        'check_fn': check_failure_table_coverage
     },
     {
         'id': 'consistency.orphan_prices',

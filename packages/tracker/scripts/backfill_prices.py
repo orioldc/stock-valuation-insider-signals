@@ -42,6 +42,10 @@ import urllib.request
 import pandas as pd
 import yfinance as yf
 
+# Add tracker to path for provenance
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from pipeline.provenance import record_run
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -956,4 +960,22 @@ if __name__ == "__main__":
             os.remove(path)
             logger.info("Checkpoint cleared")
 
-    run_backfill(dry_run=args.dry_run, max_tickers=args.max_tickers, size_check=args.size_check)
+    if args.dry_run or args.size_check:
+        # Dry-run or size-check: no provenance
+        run_backfill(dry_run=args.dry_run, max_tickers=args.max_tickers, size_check=args.size_check)
+    else:
+        # Write mode: use provenance tracking
+        with record_run(DB_PATH, 'prices') as run:
+            stats = run_backfill(dry_run=False, max_tickers=args.max_tickers, size_check=False)
+            run.rows_written = stats['total_rows']
+            # Coverage: successful fetches vs total companies needing prices
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM companies WHERE ticker != 'NONE'")
+            total_companies = cur.fetchone()[0]
+            conn.close()
+            run.coverage(stats['successful'], total_companies)
+            run.permanent_failures = stats['failed_permanent']
+
+        logger.info("")
+        logger.info(f"Provenance recorded: source='prices'")

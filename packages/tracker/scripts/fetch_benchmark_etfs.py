@@ -12,6 +12,7 @@ import os
 import sqlite3
 import logging
 import pandas as pd
+from datetime import datetime
 
 # Add parent to path for shared functions
 sys.path.insert(0, os.path.dirname(__file__))
@@ -22,15 +23,67 @@ from backfill_prices import (
     get_coverage_stats,
 )
 
+# Add tracker to path for provenance
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRACKER_DIR = os.path.join(SCRIPT_DIR, "..")
+sys.path.insert(0, TRACKER_DIR)
+from pipeline.provenance import record_run
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 BENCHMARK_ETFS = ["IWM", "MDY"]  # SPY already exists
 
 
+def _ensure_failures_table(conn):
+    """
+    Create benchmark_backfill_failures table if it doesn't exist.
+
+    Persists permanent failures (ticker doesn't exist, no data) so we don't
+    retry them every run.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS benchmark_backfill_failures (
+            ticker TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            last_attempt TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def _record_permanent_failure(conn, ticker, reason, dry_run=False):
+    """Record a permanent failure in the DB so it won't be retried next run."""
+    if dry_run:
+        return
+
+    timestamp = datetime.now().isoformat()
+    conn.execute("""
+        INSERT OR REPLACE INTO benchmark_backfill_failures (ticker, reason, last_attempt)
+        VALUES (?, ?, ?)
+    """, (ticker, reason, timestamp))
+    conn.commit()
+
+
 def fetch_benchmarks(dry_run=False):
     """Fetch benchmark ETF prices over full coverage window."""
     conn = get_db()
+
+    # Ensure failures table exists
+    _ensure_failures_table(conn)
+
+    # Purge stale failure records for benchmarks that now have prices
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM benchmark_backfill_failures
+        WHERE ticker IN (
+            SELECT DISTINCT ticker FROM prices
+        )
+    """)
+    purged = cur.rowcount
+    if purged > 0:
+        logger.info(f"Purged {purged} stale failure records for benchmarks with current prices")
+        conn.commit()
 
     # Get date range from existing prices
     cur = conn.cursor()
@@ -70,19 +123,32 @@ def fetch_benchmarks(dry_run=False):
 
     # Insert
     total_inserted = 0
+    successful = []
+    failed = []
+
     for ticker in missing:
         if ticker not in prices_by_ticker:
             logger.warning(f"{ticker}: no data returned")
+            # Record permanent failure
+            _record_permanent_failure(conn, ticker, "no_data", dry_run=dry_run)
+            failed.append(ticker)
             continue
 
         prices_df = prices_by_ticker[ticker]
         rows_inserted = insert_prices(conn, ticker, prices_df, dry_run=dry_run)
 
-        if not dry_run:
-            conn.commit()
+        if rows_inserted > 0:
+            # Write-through: success clears any existing failure record
+            if not dry_run:
+                conn.execute("DELETE FROM benchmark_backfill_failures WHERE ticker = ?", (ticker,))
+                conn.commit()
 
-        total_inserted += rows_inserted
-        logger.info(f"{ticker}: {rows_inserted} rows inserted")
+            successful.append(ticker)
+            total_inserted += rows_inserted
+            logger.info(f"{ticker}: {rows_inserted} rows inserted")
+        else:
+            logger.warning(f"{ticker}: no rows inserted")
+            failed.append(ticker)
 
     # Report coverage
     logger.info("=" * 60)
@@ -111,7 +177,11 @@ def fetch_benchmarks(dry_run=False):
     conn.close()
 
     logger.info(f"\nTotal rows inserted: {total_inserted:,}")
-    return total_inserted
+    return {
+        'total_rows': total_inserted,
+        'successful': len(successful),
+        'failed': len(failed),
+    }
 
 
 if __name__ == "__main__":
@@ -125,4 +195,22 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    fetch_benchmarks(dry_run=args.dry_run)
+
+    if args.dry_run:
+        # Dry-run: no provenance
+        fetch_benchmarks(dry_run=True)
+    else:
+        # Write mode: use provenance tracking
+        # Get DB path from get_db function
+        conn = get_db()
+        db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+        conn.close()
+
+        with record_run(db_path, 'benchmark_etfs') as run:
+            stats = fetch_benchmarks(dry_run=False)
+            run.rows_written = stats['total_rows']
+            run.coverage(stats['successful'], len(BENCHMARK_ETFS))
+            run.permanent_failures = stats['failed']
+
+        logger.info("")
+        logger.info(f"Provenance recorded: source='benchmark_etfs'")

@@ -26,8 +26,15 @@ import sqlite3
 import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from datetime import datetime
 
 import requests
+
+# Add tracker to path for provenance
+SCRIPT_DIR = Path(__file__).resolve().parent
+TRACKER_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(TRACKER_DIR))
+from pipeline.provenance import record_run
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -37,11 +44,37 @@ logger = logging.getLogger(__name__)
 USER_AGENT = "InsiderSignalTracker oriol.diaz@ozoneproject.com"
 
 # Paths
-SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH = SCRIPT_DIR.parent / "db" / "insider_signals.db"
 
 # Valid ticker pattern: 1-7 uppercase alphanumeric plus dot/hyphen
 VALID_TICKER = re.compile(r"^[A-Z][A-Z0-9.\-]{0,6}$")
+
+
+def _ensure_failures_table(conn: sqlite3.Connection):
+    """
+    Create ticker_fix_failures table if it doesn't exist.
+
+    Persists unresolvable tickers so we don't retry them every run.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ticker_fix_failures (
+            company_id INTEGER PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            last_attempt TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def _record_permanent_failure(conn: sqlite3.Connection, company_id: int, ticker: str, reason: str):
+    """Record a permanent failure in the DB so it won't be retried next run."""
+    timestamp = datetime.now().isoformat()
+    conn.execute("""
+        INSERT OR REPLACE INTO ticker_fix_failures (company_id, ticker, reason, last_attempt)
+        VALUES (?, ?, ?, ?)
+    """, (company_id, ticker, reason, timestamp))
+    conn.commit()
 
 
 def fetch_sec_ticker_map() -> Dict[int, str]:
@@ -258,23 +291,37 @@ def resolve_tickers(
     return resolved, collisions, unresolved
 
 
-def apply_fixes(conn: sqlite3.Connection, resolved: list):
-    """Apply ticker fixes to database.
+def apply_fixes(conn: sqlite3.Connection, resolved: list, unresolved: list, collisions: list):
+    """Apply ticker fixes to database and record permanent failures.
 
     Args:
         conn: Database connection
         resolved: List of (id, old_ticker, new_ticker, source, cik, name, txn_count)
+        unresolved: List of (id, ticker, cik, name, reason)
+        collisions: List of (id, old_ticker, new_ticker, existing_id, existing_name, txn_count, existing_txn_count)
     """
     cursor = conn.cursor()
+
+    # Apply successful resolutions
     for company_id, old_ticker, new_ticker, source, cik, name, txn_count in resolved:
         cursor.execute(
             "UPDATE companies SET ticker = ? WHERE id = ?",
             (new_ticker, company_id)
         )
+        # Write-through: success clears any existing failure record
+        cursor.execute("DELETE FROM ticker_fix_failures WHERE company_id = ?", (company_id,))
         logger.info(f"Updated: {old_ticker} -> {new_ticker} (CIK {cik}, {source})")
 
+    # Record permanent failures for unresolved tickers
+    for company_id, ticker, cik, name, reason in unresolved:
+        _record_permanent_failure(conn, company_id, ticker, reason)
+
+    # Record permanent failures for collisions
+    for company_id, old_ticker, new_ticker, existing_id, existing_name, txn_count, existing_txn_count in collisions:
+        _record_permanent_failure(conn, company_id, old_ticker, f"collision_on_{new_ticker}")
+
     conn.commit()
-    logger.info(f"Applied {len(resolved)} ticker fixes")
+    logger.info(f"Applied {len(resolved)} ticker fixes, recorded {len(unresolved) + len(collisions)} permanent failures")
 
 
 def verify_database(conn: sqlite3.Connection):
@@ -328,7 +375,15 @@ def main():
         default=DB_PATH,
         help=f"Database path (default: {DB_PATH})"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Dry-run mode (alias for not using --write)"
+    )
     args = parser.parse_args()
+
+    # Normalize dry_run flag
+    dry_run = not args.write or args.dry_run
 
     if not args.db.exists():
         logger.error(f"Database not found: {args.db}")
@@ -339,6 +394,31 @@ def main():
 
     # Connect to DB
     conn = sqlite3.connect(args.db)
+
+    # Ensure failures table exists
+    _ensure_failures_table(conn)
+
+    # Purge stale failure records for companies that now have valid tickers
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM ticker_fix_failures
+        WHERE company_id IN (
+            SELECT id FROM companies
+            WHERE ticker GLOB '[A-Z]*'
+              AND LENGTH(ticker) <= 7
+              AND ticker NOT GLOB '*:*'
+              AND ticker NOT GLOB '*;*'
+              AND ticker NOT GLOB '*/*'
+              AND ticker NOT GLOB '*, *'
+              AND ticker NOT GLOB '*(*'
+              AND ticker != '-'
+              AND ticker != '--'
+        )
+    """)
+    purged = cur.rowcount
+    if purged > 0:
+        logger.info(f"Purged {purged} stale failure records for companies with now-valid tickers")
+        conn.commit()
 
     # Identify malformed tickers
     malformed = identify_malformed_tickers(conn)
@@ -388,41 +468,51 @@ def main():
 
     # Apply if --write
     if args.write:
-        if not resolved:
-            logger.info("\nNothing to apply (no resolved tickers)")
+        if not resolved and not unresolved and not collisions:
+            logger.info("\nNothing to apply (no changes)")
         else:
-            logger.info(f"\nApplying {len(resolved)} fixes...")
-            apply_fixes(conn, resolved)
+            # Use provenance tracking
+            with record_run(str(args.db), 'ticker_fixes') as run:
+                logger.info(f"\nApplying {len(resolved)} fixes and recording {len(unresolved) + len(collisions)} failures...")
+                apply_fixes(conn, resolved, unresolved, collisions)
 
-            # Verify
-            logger.info("\n" + "=" * 80)
-            logger.info("VERIFICATION")
-            logger.info("=" * 80)
-            metrics = verify_database(conn)
-            logger.info(f"Total companies: {metrics['total_companies']}")
-            logger.info(f"Malformed remaining: {metrics['malformed_remaining']}")
-            logger.info(f"Duplicate tickers: {metrics['duplicate_tickers']}")
-            logger.info(f"Companies with price data: {metrics['companies_with_prices']}")
+                # Verify
+                logger.info("\n" + "=" * 80)
+                logger.info("VERIFICATION")
+                logger.info("=" * 80)
+                metrics = verify_database(conn)
+                logger.info(f"Total companies: {metrics['total_companies']}")
+                logger.info(f"Malformed remaining: {metrics['malformed_remaining']}")
+                logger.info(f"Duplicate tickers: {metrics['duplicate_tickers']}")
+                logger.info(f"Companies with price data: {metrics['companies_with_prices']}")
 
-            if metrics['duplicate_tickers'] > 0:
-                logger.warning("WARNING: Duplicate tickers detected:")
-                for ticker, count in metrics['duplicates']:
-                    logger.warning(f"  {ticker}: {count} occurrences")
+                if metrics['duplicate_tickers'] > 0:
+                    logger.warning("WARNING: Duplicate tickers detected:")
+                    for ticker, count in metrics['duplicates']:
+                        logger.warning(f"  {ticker}: {count} occurrences")
 
-            # Check how many resolved tickers now have prices
-            resolved_ids = [x[0] for x in resolved]
-            with_prices = conn.execute(f"""
-                SELECT COUNT(DISTINCT c.id)
-                FROM companies c
-                JOIN prices p ON c.ticker = p.ticker
-                WHERE c.id IN ({','.join('?' * len(resolved_ids))})
-            """, resolved_ids).fetchone()[0]
+                # Check how many resolved tickers now have prices
+                resolved_ids = [x[0] for x in resolved]
+                with_prices = conn.execute(f"""
+                    SELECT COUNT(DISTINCT c.id)
+                    FROM companies c
+                    JOIN prices p ON c.ticker = p.ticker
+                    WHERE c.id IN ({','.join('?' * len(resolved_ids))})
+                """, resolved_ids).fetchone()[0]
 
-            logger.info(f"\nOf {len(resolved)} fixed tickers, {with_prices} now have price data available")
+                logger.info(f"\nOf {len(resolved)} fixed tickers, {with_prices} now have price data available")
 
-            # Check how many with insider purchases were fixed
-            with_purchases = sum(1 for x in resolved if x[6] > 0)
-            logger.info(f"Fixed {with_purchases} tickers with insider purchase transactions")
+                # Check how many with insider purchases were fixed
+                with_purchases = sum(1 for x in resolved if x[6] > 0)
+                logger.info(f"Fixed {with_purchases} tickers with insider purchase transactions")
+
+                # Record provenance
+                run.rows_written = len(resolved)
+                run.coverage(len(resolved), len(malformed))
+                run.permanent_failures = len(unresolved) + len(collisions)
+
+                logger.info("")
+                logger.info(f"Provenance recorded: source='ticker_fixes'")
     else:
         logger.info("\n" + "=" * 80)
         logger.info("DRY RUN - No changes applied")

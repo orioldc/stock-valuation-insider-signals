@@ -29,6 +29,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "dat
 from data_ingestion.data_loader import get_db
 from data_ingestion.edgar_client import parse_form4_xml, get_rate_stats, fetch_form4_filings
 
+# Add pipeline to path for provenance
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+from pipeline.provenance import record_run
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,37 @@ CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check
 
 # SEC's User-Agent requirement
 USER_AGENT = "InsiderSignalTracker oriol.diaz@ozoneproject.com"
+
+
+def _ensure_failures_table(conn):
+    """
+    Create quarter_index_failures table if it doesn't exist.
+
+    Persists permanent failures (CIK not found, parse errors) so we don't
+    retry them every quarter.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS quarter_index_failures (
+            cik TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            quarter INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            last_attempt TEXT NOT NULL,
+            PRIMARY KEY (cik, year, quarter)
+        )
+    """)
+    conn.commit()
+
+
+def _record_permanent_failure(conn, cik, ticker, year, quarter, reason):
+    """Record a permanent failure in the DB so it won't be retried next run."""
+    timestamp = datetime.now().isoformat()
+    conn.execute("""
+        INSERT OR REPLACE INTO quarter_index_failures (cik, ticker, year, quarter, reason, last_attempt)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (cik, ticker, year, quarter, reason, timestamp))
+    conn.commit()
 
 
 def _checkpoint_path(year, quarter):
@@ -179,6 +215,32 @@ def get_tracked_ciks(conn) -> Dict[str, Tuple[int, str]]:
 def run_backfill(year: int, quarter: int):
     """Backfill Form 4 filings for the given quarter using SEC's index."""
 
+    # Get DB connection early for failures table
+    conn = get_db()
+
+    # Ensure failures table exists
+    _ensure_failures_table(conn)
+
+    # Purge stale failure records for this quarter where we now have data
+    # (Success in one run should clear the failure from a previous run)
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM quarter_index_failures
+        WHERE year = ? AND quarter = ?
+          AND cik IN (
+              SELECT DISTINCT CAST(c.cik AS TEXT)
+              FROM companies c
+              JOIN insider_transactions it ON c.id = it.company_id
+              WHERE it.filing_date >= ?
+          )
+    """, (year, quarter, f"{year}-{((quarter - 1) * 3 + 1):02d}-01"))
+    purged = cur.rowcount
+    if purged > 0:
+        logger.info(f"Purged {purged} stale failure records for this quarter with new transactions")
+        conn.commit()
+
+    conn.close()
+
     # Load checkpoint
     completed = _load_checkpoint(year, quarter)
     logger.info(f"Checkpoint: {len(completed)} companies already completed")
@@ -296,6 +358,13 @@ def run_backfill(year: int, quarter: int):
                 if company_inserted > 0 or parse_failures < len(filings):
                     completed.add(cik)
                     processed += 1
+
+                    # Write-through: success clears any existing failure record for this quarter
+                    conn.execute("""
+                        DELETE FROM quarter_index_failures
+                        WHERE cik = ? AND year = ? AND quarter = ?
+                    """, (cik, year, quarter))
+                    conn.commit()
                 else:
                     logger.warning(f"{ticker} ({cik}): all {len(filings)} filings failed to parse")
 
@@ -315,6 +384,8 @@ def run_backfill(year: int, quarter: int):
                 logger.warning(f"{ticker} ({cik}): error - {e}")
                 # Treat 503/429 as transient
                 if "503" not in err_str and "429" not in err_str and "Failed after" not in err_str:
+                    # Permanent error - record failure
+                    _record_permanent_failure(conn, cik, ticker, year, quarter, str(e)[:200])
                     errors += 1
                     completed.add(cik)
                     processed += 1
@@ -388,4 +459,15 @@ if __name__ == "__main__":
         quarter = quarter or default_quarter
 
     logger.info(f"Starting backfill for {year} Q{quarter}")
-    run_backfill(year, quarter)
+
+    # Use provenance tracking
+    with record_run(DB_PATH, 'insider_transactions') as run:
+        stats = run_backfill(year, quarter)
+        run.rows_written = stats['inserted']
+        run.coverage(stats['processed'], stats['tracked_companies'])
+        run.permanent_failures = stats['errors']
+        # Also record quarter metadata for tracking which quarters are complete
+        run.detail = {'year': year, 'quarter': quarter}
+
+    logger.info("")
+    logger.info(f"Provenance recorded: source='insider_transactions' (quarter={year}Q{quarter})")

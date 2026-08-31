@@ -1,0 +1,251 @@
+name: Rebuild Audit
+
+# Quarterly audit to verify the full rebuild path and detect incremental drift.
+#
+# This workflow:
+#   1. Performs a full rebuild from source (exercises the otherwise-rotting cold path)
+#   2. Downloads the current published release (product of incremental updates)
+#   3. Compares the two artifacts to detect material divergence
+#   4. Validates the rebuilt DB against the data contract
+#   5. Publishes comparison and validation reports as workflow artifacts
+#
+# CRITICAL: This workflow DOES NOT publish a release. It is an audit only.
+# If suspicious differences are found, the workflow fails loudly for human review.
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of Jan, Apr, Jul, Oct (quarterly)
+    - cron: "0 6 1 1,4,7,10 *"
+  workflow_dispatch:
+    inputs:
+      skip_backfills:
+        description: "Skip the slow backfill steps (for testing the workflow)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours: 45-60min pipeline + 1-2h backfills + buffer
+    env:
+      FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      # ── Full rebuild from source ──
+      - name: Initialize empty DB schema
+        run: |
+          mkdir -p audit packages/tracker/db
+          python packages/tracker/db/init_db.py
+          cp packages/tracker/db/insider_signals.db audit/rebuilt.db
+          echo "Initialized empty schema:"
+          ls -lh audit/rebuilt.db
+
+      - name: Run full pipeline (~45-60 min)
+        timeout-minutes: 90
+        run: |
+          cd packages/tracker
+          python run_expanded_pipeline.py
+          # Move result to audit directory
+          cp db/insider_signals.db ../../audit/rebuilt.db
+          echo "Full rebuild complete:"
+          ls -lh ../../audit/rebuilt.db
+
+      # ── Optional backfills (matching monthly-snapshot.yml pattern) ──
+      - name: Fix ticker symbols
+        if: ${{ github.event.inputs.skip_backfills != 'true' }}
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/fix_ticker_symbols.py --write
+
+      - name: Backfill pre-2021 prices
+        if: ${{ github.event.inputs.skip_backfills != 'true' }}
+        timeout-minutes: 60
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/backfill_prices.py
+
+      - name: Fetch benchmark ETF prices
+        if: ${{ github.event.inputs.skip_backfills != 'true' }}
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/fetch_benchmark_etfs.py
+
+      - name: Backfill shares outstanding
+        if: ${{ github.event.inputs.skip_backfills != 'true' }}
+        timeout-minutes: 90
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/backfill_shares_outstanding.py --write
+
+      - name: Recompute market caps
+        if: ${{ github.event.inputs.skip_backfills != 'true' }}
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/recompute_market_caps.py --write
+
+      - name: Run historical backtest
+        if: ${{ github.event.inputs.skip_backfills != 'true' }}
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python backtest/historical_backtest.py
+
+      - name: Export frozen insider snapshot
+        if: ${{ github.event.inputs.skip_backfills != 'true' }}
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/export_frozen_insider.py
+
+      # Sync rebuilt DB back to audit/
+      - name: Sync rebuilt DB to audit directory
+        run: |
+          cp packages/tracker/db/insider_signals.db audit/rebuilt.db
+          echo "Rebuilt DB after backfills:"
+          ls -lh audit/
+
+      # ── Download current published release ──
+      - name: Download current published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find the latest data-* release
+          LATEST_TAG=$(gh release list --repo ${{ github.repository }} --json tagName --jq '[.[] | .tagName | select(startswith("data-"))][0]')
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::error::No published data-* release found. Cannot perform comparison."
+            echo "This workflow requires at least one published release to compare against."
+            exit 1
+          fi
+
+          echo "Downloading published release: $LATEST_TAG"
+          gh release download "$LATEST_TAG" --repo ${{ github.repository }} --pattern "insider_signals.db.xz" --dir audit/
+          xz -d audit/insider_signals.db.xz
+          mv audit/insider_signals.db audit/published.db
+
+          echo "Published DB:"
+          ls -lh audit/published.db
+          echo "PUBLISHED_TAG=$LATEST_TAG" >> $GITHUB_ENV
+
+      # ── Compare artifacts ──
+      - name: Compare rebuilt vs published
+        id: compare
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          mkdir -p audit/reports
+          cd packages/tracker
+
+          python pipeline/compare_artifacts.py \
+            ../../audit/published.db \
+            ../../audit/rebuilt.db \
+            --output ../../audit/reports/comparison.txt \
+            --json ../../audit/reports/comparison.json
+
+          COMPARE_EXIT=$?
+          echo "comparison_exit_code=$COMPARE_EXIT" >> $GITHUB_OUTPUT
+
+          echo "Comparison complete (exit code: $COMPARE_EXIT)"
+          echo ""
+          echo "=== COMPARISON SUMMARY ==="
+          cat ../../audit/reports/comparison.txt | tail -20
+
+      # ── Validate rebuilt DB ──
+      - name: Validate rebuilt DB against contract
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          mkdir -p ../../audit/reports
+
+          python -m tracker.pipeline.validate \
+            --db ../../audit/rebuilt.db \
+            --json-report ../../audit/reports/validation.json \
+            --verbose | tee ../../audit/reports/validation.txt
+
+          VALIDATE_EXIT=$?
+          echo "VALIDATION_EXIT_CODE=$VALIDATE_EXIT" >> $GITHUB_ENV
+
+          echo ""
+          echo "=== VALIDATION SUMMARY ==="
+          cat ../../audit/reports/validation.txt | tail -20
+
+      # ── Upload reports ──
+      - name: Upload audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebuild-audit-reports
+          path: audit/reports/
+          retention-days: 180
+
+      # ── Check results and fail if needed ──
+      - name: Evaluate audit results
+        if: always()
+        run: |
+          echo "=== AUDIT RESULTS ==="
+          echo "Published release: $PUBLISHED_TAG"
+          echo "Comparison exit code: ${{ steps.compare.outputs.comparison_exit_code }}"
+          echo "Validation exit code: $VALIDATION_EXIT_CODE"
+          echo ""
+
+          FAILURES=""
+
+          # Check comparison
+          if [ "${{ steps.compare.outputs.comparison_exit_code }}" = "1" ]; then
+            FAILURES="${FAILURES}- SUSPICIOUS DIFFERENCES detected between rebuilt and published artifacts\n"
+          elif [ "${{ steps.compare.outputs.comparison_exit_code }}" = "2" ]; then
+            FAILURES="${FAILURES}- COMPARISON FAILED (error during comparison)\n"
+          fi
+
+          # Check validation
+          if [ "$VALIDATION_EXIT_CODE" = "1" ]; then
+            FAILURES="${FAILURES}- VALIDATION FAILED (rebuilt DB violates data contract)\n"
+          elif [ "$VALIDATION_EXIT_CODE" = "2" ]; then
+            FAILURES="${FAILURES}- VALIDATION ERROR (error during validation)\n"
+          fi
+
+          if [ -n "$FAILURES" ]; then
+            echo "::error::Rebuild audit FAILED:"
+            echo -e "$FAILURES"
+            echo ""
+            echo "Review the audit reports artifact for details."
+            echo "This indicates either:"
+            echo "  - The incremental path has drifted from the full rebuild"
+            echo "  - The full rebuild path is broken and cannot produce a valid artifact"
+            echo ""
+            echo "DO NOT merge changes that break this audit without investigation."
+            exit 1
+          else
+            echo "✅ Rebuild audit PASSED"
+            echo "The full rebuild path works and produces an artifact consistent with"
+            echo "the incremental updates. No suspicious drift detected."
+          fi

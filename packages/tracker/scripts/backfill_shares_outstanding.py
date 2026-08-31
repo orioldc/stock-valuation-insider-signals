@@ -38,6 +38,11 @@ sys.path.insert(0, VALUATION_DIR)
 
 from data.edgar_client import _get
 
+# Add tracker to path for provenance
+TRACKER_DIR = os.path.join(SCRIPT_DIR, "..")
+sys.path.insert(0, TRACKER_DIR)
+from pipeline.provenance import record_run
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -414,6 +419,23 @@ def run_backfill(dry_run=True, max_companies=None):
     # Ensure failures table exists
     _ensure_failures_table(conn)
 
+    # Purge stale failure records for companies that now have shares data
+    # This prevents the bug where a company is in both failures and shares_outstanding tables
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM shares_backfill_failures
+        WHERE cik IN (
+            SELECT DISTINCT c.cik
+            FROM companies c
+            JOIN shares_outstanding so ON c.id = so.company_id
+            WHERE c.cik IS NOT NULL
+        )
+    """)
+    purged = cur.rowcount
+    if purged > 0:
+        logger.info(f"Purged {purged} stale failure records for companies with current shares data")
+        conn.commit()
+
     # Report coverage before
     logger.info("=" * 60)
     logger.info("SHARES OUTSTANDING BACKFILL — Coverage Before")
@@ -497,6 +519,10 @@ def run_backfill(dry_run=True, max_companies=None):
                     if rejected:
                         accept_str += f" ({len(rejected)} rejected)"
                     logger.debug(f"  {ticker} (CIK {cik}): {accept_str} from {len(shares_data)} datapoints")
+
+                    # Write-through: success invalidates any existing failure record
+                    if not dry_run:
+                        conn.execute("DELETE FROM shares_backfill_failures WHERE cik = ?", (cik,))
 
                     # Commit in batches
                     if not dry_run and batch_count >= BATCH_COMMIT_SIZE:
@@ -622,4 +648,16 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    run_backfill(dry_run=not args.write, max_companies=args.max_companies)
+    if not args.write:
+        # Dry-run: no provenance
+        run_backfill(dry_run=True, max_companies=args.max_companies)
+    else:
+        # Write mode: use provenance tracking
+        with record_run(DB_PATH, 'shares_outstanding') as run:
+            stats = run_backfill(dry_run=False, max_companies=args.max_companies)
+            run.rows_written = stats['total_rows']
+            run.coverage(stats['successful'], stats['successful'] + stats['failed_permanent'] + stats['failed_transient'])
+            run.permanent_failures = stats['failed_permanent']
+
+        logger.info("")
+        logger.info(f"Provenance recorded: source='shares_outstanding'")

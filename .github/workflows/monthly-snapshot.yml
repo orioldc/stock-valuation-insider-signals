@@ -215,6 +215,13 @@ jobs:
           cd packages/tracker
           python backfill_quarter_index.py
 
+      - name: Cleanup transaction dates
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/cleanup_transaction_dates.py --write
+
       - name: Fix ticker symbols
         timeout-minutes: 10
         continue-on-error: true
@@ -236,6 +243,13 @@ jobs:
           cd packages/tracker
           python scripts/fetch_benchmark_etfs.py
 
+      - name: Backfill splits
+        timeout-minutes: 45
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/backfill_splits.py --write
+
       - name: Backfill shares outstanding
         timeout-minutes: 90
         continue-on-error: true
@@ -243,15 +257,29 @@ jobs:
           cd packages/tracker
           python scripts/backfill_shares_outstanding.py --write
 
-      - name: Recompute market caps
-        timeout-minutes: 5
+      - name: Clean shares outstanding
+        timeout-minutes: 10
         continue-on-error: true
         run: |
           cd packages/tracker
-          python scripts/recompute_market_caps.py --write
+          python scripts/clean_shares_outstanding.py --write
+
+      - name: Recompute market caps
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/recompute_market_caps.py --unverified-only --write
+
+      - name: Cleanup corrupt prices
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/cleanup_corrupt_prices.py --write
 
       - name: Run historical backtest
-        timeout-minutes: 30
+        timeout-minutes: 20
         continue-on-error: true
         run: |
           cd packages/tracker
@@ -359,37 +387,78 @@ jobs:
           TITLE="Monthly DB snapshot — $TAG"
           NOTES="Pre-built insider-transactions + shares-outstanding SQLite DB plus the latest signal scanner CSV, historical hit rate clusters, frozen insider snapshot, and validation report. Generated automatically by the monthly-snapshot workflow ($MODE mode). SHA256SUMS provided for integrity verification."
 
-          ASSETS="data/insider_signals.db.xz data/latest_signals.csv data/SHA256SUMS"
-          if [ -f data/historical_clusters.csv ]; then
-            ASSETS="$ASSETS data/historical_clusters.csv"
-          fi
-          if [ -f data/insider_frozen.json.gz ]; then
-            ASSETS="$ASSETS data/insider_frozen.json.gz"
-          fi
-          # Skip validation reports if missing or zero-byte (GitHub rejects empty uploads).
-          # This makes publication resilient to buffering/output issues, but validation
-          # failure still blocks this step from running at all (no continue-on-error).
-          if [ -f data/validation.json ] && [ -s data/validation.json ]; then
-            ASSETS="$ASSETS data/validation.json"
-          fi
-          if [ -f data/validation.txt ] && [ -s data/validation.txt ]; then
-            ASSETS="$ASSETS data/validation.txt"
-          fi
-
-          # Check if release already exists
+          # Step 1: ensure the release exists with no assets
           if gh release view "$TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
-            echo "Release $TAG already exists; uploading assets with --clobber"
-            gh release upload "$TAG" $ASSETS \
-              --repo ${{ github.repository }} \
-              --clobber
-            gh release edit "$TAG" \
-              --repo ${{ github.repository }} \
-              --notes "$NOTES"
+            echo "Release $TAG already exists"
           else
-            echo "Creating new release $TAG"
+            echo "Creating release $TAG (no assets yet)"
             gh release create "$TAG" \
-              $ASSETS \
               --repo ${{ github.repository }} \
               --title "$TITLE" \
               --notes "$NOTES"
           fi
+
+          # Step 2: upload assets individually with retries
+          # Helper function: retry up to N times with a short sleep
+          upload_with_retry() {
+            local FILE="$1"
+            local MAX_ATTEMPTS="$2"
+            local ATTEMPT=1
+
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              if [ ! -f "$FILE" ]; then
+                echo "⚠️  $FILE does not exist, skipping"
+                return 1
+              fi
+              if [ ! -s "$FILE" ]; then
+                echo "⚠️  $FILE is zero bytes (GitHub rejects), skipping"
+                return 1
+              fi
+
+              echo "Uploading $FILE (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+              if gh release upload "$TAG" "$FILE" \
+                --repo ${{ github.repository }} \
+                --clobber; then
+                echo "✓ $FILE uploaded"
+                return 0
+              else
+                echo "✗ Upload failed for $FILE"
+                if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                  sleep 3
+                fi
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+            done
+
+            return 1
+          }
+
+          # Critical assets: must succeed or fail the step
+          CRITICAL_OK=true
+          echo "=== Uploading critical assets ==="
+          if ! upload_with_retry "data/insider_signals.db.xz" 3; then
+            echo "❌ CRITICAL: insider_signals.db.xz upload failed"
+            CRITICAL_OK=false
+          fi
+          if ! upload_with_retry "data/SHA256SUMS" 3; then
+            echo "❌ CRITICAL: SHA256SUMS upload failed"
+            CRITICAL_OK=false
+          fi
+
+          # Best-effort assets: retry once, log and continue on failure
+          echo "=== Uploading best-effort assets ==="
+          upload_with_retry "data/latest_signals.csv" 2 || echo "⚠️  latest_signals.csv skipped"
+          upload_with_retry "data/historical_clusters.csv" 2 || echo "⚠️  historical_clusters.csv skipped"
+          upload_with_retry "data/insider_frozen.json.gz" 2 || echo "⚠️  insider_frozen.json.gz skipped"
+          upload_with_retry "data/validation.json" 2 || echo "⚠️  validation.json skipped"
+          upload_with_retry "data/validation.txt" 2 || echo "⚠️  validation.txt skipped"
+
+          # Step 3: verify critical assets and fail if missing
+          if [ "$CRITICAL_OK" = false ]; then
+            echo ""
+            echo "❌ Publication failed: one or more critical assets could not be uploaded"
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ Publication complete for $TAG"

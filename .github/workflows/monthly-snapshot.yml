@@ -193,7 +193,7 @@ jobs:
           # (pre-backfill was 25%) while avoiding false positives on normal variance.
           if [ "$BASELINE" -eq 0 ]; then
             echo "No baseline data available, running backfill as a precaution"
-            python backfill_quarter_live.py
+            python backfill_quarter_index.py
           else
             THRESHOLD=70
             PERCENTAGE=$(python3 -c "print(int(100 * $CURRENT_COUNT / $BASELINE))")

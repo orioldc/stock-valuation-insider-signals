@@ -514,20 +514,35 @@ def insert_prices(conn, ticker, prices_df, dry_run=False):
     """
     Insert prices for a ticker using INSERT OR IGNORE (additive only).
 
+    Validates that close > 0 before insertion. Non-positive prices are rejected.
+
     Returns number of rows inserted (0 in dry-run mode).
     """
+    rejected_count = 0
+
+    # Filter out invalid prices (non-positive)
+    valid_rows = []
+    for _, row in prices_df.iterrows():
+        close = float(row['close'])
+        if close > 0:
+            valid_rows.append((ticker, str(row['date'].date()), close))
+        else:
+            rejected_count += 1
+            logger.debug(f"{ticker}: rejected non-positive price {close} on {row['date'].date()}")
+
+    if rejected_count > 0:
+        logger.info(f"{ticker}: rejected {rejected_count} non-positive prices")
+
     if dry_run:
-        return len(prices_df)
+        return len(valid_rows)
+
+    if not valid_rows:
+        return 0
 
     cur = conn.cursor()
-    rows = [
-        (ticker, str(row['date'].date()), float(row['close']))
-        for _, row in prices_df.iterrows()
-    ]
-
     cur.executemany(
         "INSERT OR IGNORE INTO prices (ticker, date, close) VALUES (?, ?, ?)",
-        rows
+        valid_rows
     )
 
     return cur.rowcount

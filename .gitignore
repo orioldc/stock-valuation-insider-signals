@@ -52,3 +52,6 @@ Thumbs.db
 *.mcpb
 *.dxt
 build/
+data/SHA256SUMS
+data/validation.txt
+data/validation.json

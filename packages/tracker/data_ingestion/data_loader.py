@@ -414,49 +414,122 @@ def ingest_insider_trades(ticker, ticker_map=None):
     return inserted
 
 
+def _validate_shares_value(shares, company_id, date, ticker, cur):
+    """
+    Validate shares outstanding value for plausibility.
+
+    Returns (valid: bool, reason: str or None)
+
+    Checks:
+    1. Absolute bounds: 100K - 100B shares (based on P1=1.4M, P99.9=29B)
+    2. Relative QoQ check: reject if >50x or <1/50x vs prior quarter (avoids sentinel/unit errors)
+
+    Args:
+        shares: Value to validate
+        company_id: Company ID for historical comparison
+        date: Date of this value
+        ticker: Ticker for logging
+        cur: Database cursor for querying historical data
+    """
+    # Guard 1: Absolute plausibility bounds
+    # Listed companies have share counts in millions to low billions
+    # Values below 100K are sentinels (1, 10, 100) or data errors
+    # Values above 100B are unit errors (52 quadrillion, etc.)
+    MIN_PLAUSIBLE_SHARES = 100_000          # P1 is 1.4M
+    MAX_PLAUSIBLE_SHARES = 100_000_000_000  # 100B (P99.9 is 29B)
+
+    if shares < MIN_PLAUSIBLE_SHARES:
+        return False, f"below_minimum ({shares:,.0f} < {MIN_PLAUSIBLE_SHARES:,})"
+
+    if shares > MAX_PLAUSIBLE_SHARES:
+        return False, f"above_maximum ({shares:,.0f} > {MAX_PLAUSIBLE_SHARES:,})"
+
+    # Guard 2: Relative QoQ plausibility
+    # A legitimate reverse split (1:100) produces a 0.01x ratio
+    # A legitimate stock split (100:1) produces a 100x ratio
+    # But sentinel values (1) and unit errors produce extreme ratios that revert next quarter
+    # Use 50x threshold to allow legitimate corporate actions while catching errors
+    MAX_QOQ_RATIO = 50.0
+    MIN_QOQ_RATIO = 0.02  # 1/50
+
+    # Get most recent prior value for this company
+    prior = cur.execute("""
+        SELECT shares, date FROM shares_outstanding
+        WHERE company_id = ? AND date < ?
+        ORDER BY date DESC
+        LIMIT 1
+    """, (company_id, date)).fetchone()
+
+    if prior:
+        prior_shares, prior_date = prior
+        if prior_shares > 0:
+            ratio = shares / prior_shares
+            if ratio > MAX_QOQ_RATIO or ratio < MIN_QOQ_RATIO:
+                return False, f"qoq_outlier ({prior_shares:,.0f} -> {shares:,.0f} = {ratio:.2f}x on {prior_date})"
+
+    return True, None
+
+
 def ingest_shares_outstanding(ticker, ticker_map=None):
-    """Fetch shares outstanding from EDGAR XBRL and store."""
+    """Fetch shares outstanding from EDGAR XBRL and store with validation."""
     if ticker_map is None:
         ticker_map = fetch_company_tickers()
-    
+
     cik = ticker_map.get(ticker)
     if not cik:
         logger.warning(f"No CIK found for {ticker}")
         return 0
-    
+
     cik_padded = str(cik).zfill(10)
     url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik_padded}/dei/EntityCommonStockSharesOutstanding.json"
-    
+
     try:
         resp = _get(url)
         data = resp.json()
     except Exception as e:
         logger.warning(f"Failed to fetch shares outstanding for {ticker}: {e}")
         return 0
-    
+
     conn = get_db()
     company_id = ensure_company(conn, ticker, cik)
-    
+    cur = conn.cursor()
+
     inserted = 0
+    rejected = []
     units = data.get("units", {})
     for unit_key, entries in units.items():
         for entry in entries:
             date = entry.get("end") or entry.get("filed")
             val = entry.get("val")
             if date and val:
+                shares = float(val)
+
+                # Validate before insert
+                valid, reason = _validate_shares_value(shares, company_id, date, ticker, cur)
+
+                if not valid:
+                    rejected.append((date, shares, reason))
+                    logger.info(f"{ticker}: REJECTED {date}: {shares:,.0f} shares - {reason}")
+                    continue
+
                 try:
-                    conn.execute("""
+                    cur.execute("""
                         INSERT OR IGNORE INTO shares_outstanding
                         (company_id, date, shares, source)
                         VALUES (?, ?, ?, 'EDGAR_XBRL')
-                    """, (company_id, date, float(val)))
-                    inserted += 1
+                    """, (company_id, date, shares))
+                    inserted += cur.rowcount
                 except Exception:
                     pass
-    
+
     conn.commit()
     conn.close()
-    logger.info(f"{ticker}: Inserted {inserted} shares outstanding records")
+
+    if rejected:
+        logger.info(f"{ticker}: Inserted {inserted} shares outstanding records, rejected {len(rejected)}")
+    else:
+        logger.info(f"{ticker}: Inserted {inserted} shares outstanding records")
+
     return inserted
 
 

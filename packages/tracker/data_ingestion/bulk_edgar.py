@@ -79,17 +79,18 @@ def _parse_sec_date(d):
 def normalize_transaction_date(transaction_date, filing_date):
     """Normalize malformed transaction_date values.
 
-    Handles two known malformations:
+    Handles three known malformations:
     1. Trailing timezone offset (e.g., '2024-06-27-05:00') → truncate to date part
     2. Two-digit year (e.g., '24-02-12') → expand century using filing_date
+    3. Zero-padded century (e.g., '0022-10-12') → derive century from filing_date
 
     Future dates beyond today are rejected as corrupt with no recoverable signal.
     Already-valid ISO dates pass through unchanged, even if transaction_date > filing_date
     (the relationship between two fields is unreliable - we cannot determine which is wrong).
 
-    DELIBERATE ASYMMETRY: Case 2 (two-digit years) enforces txn_date <= filing_date
-    and rejects candidates that violate it, because without an anchor we cannot choose
-    a century at all. Case 3 (complete unambiguous dates) does NOT enforce this
+    DELIBERATE ASYMMETRY: Cases 2 and 3 (ambiguous years) enforce txn_date <= filing_date
+    and reject candidates that violate it, because without an anchor we cannot choose
+    a century at all. Case 4 (complete unambiguous dates) does NOT enforce this
     relationship — we have a valid date and choose not to null it on an unverified
     assumption about which field is wrong. This is intentional: losing data on a guess
     is worse than keeping a possibly-inconsistent but well-formed date.
@@ -142,7 +143,36 @@ def normalize_transaction_date(transaction_date, filing_date):
         logger.warning(f"Cannot normalize two-digit year date: {raw} (filing: {filing_date})")
         return None
 
-    # Case 3: Already YYYY-MM-DD - validate and accept if <= today
+    # Case 3: Zero-padded century like '0022-10-12' (two-digit year padded with zeros)
+    if len(raw) == 10 and raw[4] == '-' and raw[7] == '-':
+        year_str = raw[:4]
+        if year_str.startswith('00') and year_str[2:].isdigit():
+            # Zero-padded century detected: '00YY-MM-DD' → derive century from filing_date
+            yy = int(year_str[2:])
+            mm_dd = raw[4:]
+            if filing_date:
+                try:
+                    filing_year = int(filing_date[:4])
+                    # Try both 20xx and 19xx
+                    for century in [2000, 1900]:
+                        year = century + yy
+                        candidate = f"{year:04d}{mm_dd}"
+                        # Validate date is parseable
+                        try:
+                            txn_dt = datetime.strptime(candidate, "%Y-%m-%d")
+                            filing_dt = datetime.strptime(filing_date, "%Y-%m-%d")
+                            # Transaction must precede filing and be within ~5 years of it
+                            if txn_dt <= filing_dt and abs((txn_dt - filing_dt).days) <= 1825:
+                                logger.debug(f"Normalized zero-padded century: {raw} → {candidate} (filing: {filing_date})")
+                                return candidate
+                        except ValueError:
+                            continue
+                except (ValueError, IndexError):
+                    pass
+            logger.warning(f"Cannot normalize zero-padded century date: {raw} (filing: {filing_date})")
+            return None
+
+    # Case 4: Already YYYY-MM-DD - validate and accept if <= today
     if len(raw) == 10 and raw[4] == '-' and raw[7] == '-':
         try:
             txn_dt = datetime.strptime(raw, "%Y-%m-%d")

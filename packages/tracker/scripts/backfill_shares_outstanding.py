@@ -262,34 +262,102 @@ def _record_permanent_failure(conn, cik, ticker, reason, dry_run=False):
     conn.commit()
 
 
-def insert_shares_data(conn, company_id, shares_data, dry_run=False):
+def _validate_shares_value(shares, company_id, date, ticker, cur):
+    """
+    Validate shares outstanding value for plausibility.
+
+    Returns (valid: bool, reason: str or None)
+
+    Checks:
+    1. Absolute bounds: 100K - 100B shares (based on P1=1.4M, P99.9=29B)
+    2. Relative QoQ check: reject if >50x or <1/50x vs prior quarter (avoids sentinel/unit errors)
+
+    Args:
+        shares: Value to validate
+        company_id: Company ID for historical comparison
+        date: Date of this value
+        ticker: Ticker for logging
+        cur: Database cursor for querying historical data
+    """
+    # Guard 1: Absolute plausibility bounds
+    # Listed companies have share counts in millions to low billions
+    # Values below 100K are sentinels (1, 10, 100) or data errors
+    # Values above 100B are unit errors (52 quadrillion, etc.)
+    MIN_PLAUSIBLE_SHARES = 100_000          # P1 is 1.4M
+    MAX_PLAUSIBLE_SHARES = 100_000_000_000  # 100B (P99.9 is 29B)
+
+    if shares < MIN_PLAUSIBLE_SHARES:
+        return False, f"below_minimum ({shares:,.0f} < {MIN_PLAUSIBLE_SHARES:,})"
+
+    if shares > MAX_PLAUSIBLE_SHARES:
+        return False, f"above_maximum ({shares:,.0f} > {MAX_PLAUSIBLE_SHARES:,})"
+
+    # Guard 2: Relative QoQ plausibility
+    # A legitimate reverse split (1:100) produces a 0.01x ratio
+    # A legitimate stock split (100:1) produces a 100x ratio
+    # But sentinel values (1) and unit errors produce extreme ratios that revert next quarter
+    # Use 50x threshold to allow legitimate corporate actions while catching errors
+    MAX_QOQ_RATIO = 50.0
+    MIN_QOQ_RATIO = 0.02  # 1/50
+
+    # Get most recent prior value for this company
+    prior = cur.execute("""
+        SELECT shares, date FROM shares_outstanding
+        WHERE company_id = ? AND date < ?
+        ORDER BY date DESC
+        LIMIT 1
+    """, (company_id, date)).fetchone()
+
+    if prior:
+        prior_shares, prior_date = prior
+        if prior_shares > 0:
+            ratio = shares / prior_shares
+            if ratio > MAX_QOQ_RATIO or ratio < MIN_QOQ_RATIO:
+                return False, f"qoq_outlier ({prior_shares:,.0f} -> {shares:,.0f} = {ratio:.2f}x on {prior_date})"
+
+    return True, None
+
+
+def insert_shares_data(conn, company_id, shares_data, dry_run=False, ticker=None):
     """
     Insert shares outstanding data using INSERT OR IGNORE (additive only).
 
-    Returns number of rows inserted (estimate in dry-run mode).
-    """
-    if dry_run:
-        return len(shares_data)
+    Validates each value before insert. Rejects impossible values (sentinels,
+    unit errors) based on absolute bounds and relative QoQ checks.
 
+    Returns (inserted: int, rejected: list[(date, shares, reason)])
+    """
     cur = conn.cursor()
-    rows = [
-        (company_id, record['date'], record['shares'], 'sec_xbrl')
-        for record in shares_data
-    ]
 
     inserted = 0
-    for row in rows:
+    rejected = []
+
+    for record in shares_data:
+        date = record['date']
+        shares = record['shares']
+
+        # Validate before insert
+        valid, reason = _validate_shares_value(shares, company_id, date, ticker or "unknown", cur)
+
+        if not valid:
+            rejected.append((date, shares, reason))
+            continue
+
+        if dry_run:
+            inserted += 1
+            continue
+
         try:
             cur.execute(
                 "INSERT OR IGNORE INTO shares_outstanding (company_id, date, shares, source) VALUES (?, ?, ?, ?)",
-                row
+                (company_id, date, shares, 'sec_xbrl')
             )
             inserted += cur.rowcount
         except sqlite3.IntegrityError:
             # Already exists, skip
             continue
 
-    return inserted
+    return inserted, rejected
 
 
 def clean_corrupt_dates(conn, dry_run=False):
@@ -408,24 +476,38 @@ def run_backfill(dry_run=True, max_companies=None):
         success, shares_data, error_type = _fetch_shares_outstanding(cik)
 
         if success:
-            # Insert data
+            # Insert data with validation
             try:
-                rows_inserted = insert_shares_data(conn, company_id, shares_data, dry_run=dry_run)
+                rows_inserted, rejected = insert_shares_data(conn, company_id, shares_data, dry_run=dry_run, ticker=ticker)
+
+                # Log rejections
+                if rejected:
+                    logger.info(f"  {ticker} (CIK {cik}): REJECTED {len(rejected)} values:")
+                    for date, shares, reason in rejected[:5]:  # Show first 5
+                        logger.info(f"    {date}: {shares:,.0f} shares - {reason}")
+                    if len(rejected) > 5:
+                        logger.info(f"    ... and {len(rejected) - 5} more rejections")
 
                 if rows_inserted > 0:
                     total_rows_inserted += rows_inserted
                     successful.append((ticker, cik, len(shares_data)))
                     batch_count += 1
 
-                    logger.debug(f"  {ticker} (CIK {cik}): {rows_inserted} rows inserted from {len(shares_data)} datapoints")
+                    accept_str = f"{rows_inserted} rows inserted"
+                    if rejected:
+                        accept_str += f" ({len(rejected)} rejected)"
+                    logger.debug(f"  {ticker} (CIK {cik}): {accept_str} from {len(shares_data)} datapoints")
 
                     # Commit in batches
                     if not dry_run and batch_count >= BATCH_COMMIT_SIZE:
                         conn.commit()
                         batch_count = 0
                 else:
-                    # No new rows (already had data)
-                    logger.debug(f"  {ticker} (CIK {cik}): no new rows (data already present)")
+                    # No new rows (already had data or all rejected)
+                    if rejected:
+                        logger.debug(f"  {ticker} (CIK {cik}): all {len(rejected)} values rejected")
+                    else:
+                        logger.debug(f"  {ticker} (CIK {cik}): no new rows (data already present)")
 
             except Exception as e:
                 logger.warning(f"  {ticker} (CIK {cik}): insert failed - {e}")

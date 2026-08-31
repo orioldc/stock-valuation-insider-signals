@@ -56,7 +56,7 @@ def _load_old_signals():
     try:
         path = os.path.join(OUTPUT_DIR, "latest_signals.csv")
         if os.path.exists(path):
-            return pd.read_csv(path)
+            return pd.read_csv(path, keep_default_na=False, na_values=[''])
     except Exception:
         pass
     return None

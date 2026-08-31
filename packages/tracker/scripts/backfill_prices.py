@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-Price Backfill Script — Extend price coverage back to 2019-01-01.
+Price Backfill Script — Extend price coverage to all companies.
 
-Fetches daily closes for the gap window (2019-01-01 → 2021-02-16) for tickers
-with insider purchases in that period, plus SPY for benchmark continuity.
+Fetches maximum available daily price history for all companies in the database,
+resolving stale ticker symbols via SEC's authoritative company_tickers.json map.
 
 Features:
+  - Complete coverage: fetches prices for ALL companies, not just gap-window subset
+  - Ticker resolution: maps stale tickers to current symbols via SEC CIK registry
+  - Maximum history: fetches full available history, not just gap window
   - Self-healing: derives work list from DB state, not checkpoint files
   - Resumable: checkpoint tracking saves progress within a run
   - Persistent failure tracking: permanent failures (delisted/malformed) stored
     in DB to avoid retrying them across runs
+  - Re-tests failures: gives failed tickers one more attempt with resolved symbols
   - Batched: downloads multiple tickers at once for efficiency
   - Tolerant: individual ticker failures don't stop the run
   - Dry-run mode: reports what would be fetched without writing
   - Coverage reporting: before/after row counts, date ranges, success/failure stats
 
-On a DB with coverage already present, this is a no-op. On a DB missing coverage
+Design:
+  - Fetch symbol: Use stored ticker if valid for CIK, else SEC's current ticker
+  - Storage: Always write under existing companies.ticker (join key unchanged)
+  - Where stored != fetch, log the mismatch for separate rename decision
+
+On a DB with coverage already present, this extends it. On a DB missing coverage
 (e.g., first CI run seeded from old release), it backfills once; coverage then
 travels forward in the published DB artifact.
 """
@@ -28,6 +37,8 @@ import json
 import logging
 import argparse
 from datetime import datetime
+from collections import defaultdict
+import urllib.request
 import pandas as pd
 import yfinance as yf
 
@@ -39,16 +50,154 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "..", "db", "insider_signals.db")
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "..", "checkpoints")
 
-# Backfill window
-START_DATE = "2019-01-01"
-END_DATE = "2021-02-16"  # Exclusive end - existing coverage starts here
+# Backfill window — now fetches maximum history, not just gap
+START_DATE = "1970-01-01"  # yfinance maximum lookback
+END_DATE = datetime.now().strftime("%Y-%m-%d")  # Today
 BATCH_SIZE = 50
 RATE_LIMIT_DELAY = 2.0  # seconds between batches (increased from 1.0 to avoid rate limits)
 
+# SEC ticker map cache (global, fetched once per run)
+_SEC_TICKER_MAP = None
+
 
 def get_db():
-    """Get database connection."""
-    return sqlite3.connect(DB_PATH)
+    """Get database connection with busy timeout."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout = 60000")  # 60s timeout for concurrent writes
+    return conn
+
+
+def _fetch_sec_ticker_map():
+    """
+    Fetch SEC's authoritative company_tickers.json map.
+
+    Returns dict mapping CIK (int) -> set of ticker strings.
+
+    The SEC file is keyed by index, with each entry having cik_str, ticker, title.
+    One CIK can have multiple listings (preferred shares, share classes), so we
+    collect ALL tickers per CIK into a set. Treating it as a simple CIK->ticker
+    dict by overwriting produces nonsense like BAC -> MER-PK (last entry wins).
+    """
+    global _SEC_TICKER_MAP
+    if _SEC_TICKER_MAP is not None:
+        return _SEC_TICKER_MAP
+
+    url = "https://www.sec.gov/files/company_tickers.json"
+
+    # SEC requires User-Agent format: "Company/App Contact@email.com"
+    # See: https://www.sec.gov/os/accessing-edgar-data
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "InsiderSignalTracker oriol.diaz@ozoneproject.com",
+        "Accept": "application/json"
+    })
+
+    # Retry with exponential backoff
+    for attempt in range(3):
+        try:
+            logger.info(f"Fetching SEC company_tickers.json (attempt {attempt + 1}/3)...")
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode('utf-8'))
+
+            # Build CIK -> set of tickers
+            cik_to_tickers = defaultdict(set)
+            for entry in data.values():
+                cik = int(entry['cik_str'])
+                ticker = entry['ticker'].upper()  # Normalize to uppercase
+                cik_to_tickers[cik].add(ticker)
+
+            _SEC_TICKER_MAP = dict(cik_to_tickers)
+            logger.info(f"  Loaded {len(_SEC_TICKER_MAP):,} CIKs with ticker mappings")
+
+            return _SEC_TICKER_MAP
+
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < 2:  # Don't sleep on last attempt
+                sleep_time = 2 ** attempt  # 1s, 2s
+                logger.info(f"  Retrying in {sleep_time}s...")
+                time.sleep(sleep_time)
+
+    logger.warning("Failed to fetch SEC ticker map after 3 attempts")
+    logger.warning("Will fall back to stored tickers for all companies")
+    logger.warning("(This means stale ticker symbols won't be resolved)")
+    return {}
+
+
+def resolve_ticker_symbol(stored_ticker, cik, sec_map):
+    """
+    Resolve the ticker symbol to use for fetching prices.
+
+    Args:
+        stored_ticker: Ticker from companies table (join key, never modified)
+        cik: CIK from companies table
+        sec_map: Dict mapping CIK -> set of valid tickers from SEC
+
+    Returns:
+        (fetch_symbol, is_resolved, reason)
+
+        fetch_symbol: Symbol to use for yfinance download
+        is_resolved: True if stored ticker is invalid and we resolved to a different one
+        reason: Human-readable explanation
+
+    Logic:
+        1. If CIK is None or not in SEC map: use stored ticker (no better option)
+        2. If stored ticker is in SEC's set for this CIK: use it (valid)
+        3. Otherwise: pick SEC's "primary" ticker (first alphabetically) and flag it
+    """
+    if not cik or cik not in sec_map:
+        return (stored_ticker, False, "no_sec_data")
+
+    valid_tickers = sec_map[cik]
+
+    if stored_ticker.upper() in valid_tickers:
+        return (stored_ticker, False, "valid")
+
+    # Stored ticker is stale/invalid - resolve to SEC's current ticker
+    # Pick first alphabetically as "primary" (arbitrary but deterministic)
+    resolved = sorted(valid_tickers)[0]
+
+    return (resolved, True, f"resolved_{stored_ticker}_to_{resolved}")
+
+
+def _log_ticker_mismatches(mismatches, output_file=None):
+    """
+    Log ticker mismatches (stored vs. fetch symbol).
+
+    Args:
+        mismatches: List of (stored_ticker, fetch_symbol, cik, name) tuples
+        output_file: Optional path to write CSV
+    """
+    if not mismatches:
+        logger.info("No ticker mismatches (all stored tickers are valid)")
+        return
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"TICKER SYMBOL MISMATCHES: {len(mismatches)} companies")
+    logger.info(f"{'='*60}")
+    logger.info("Stored ticker is not current for CIK - fetching with resolved symbol")
+    logger.info("(Storage still uses stored ticker as join key - no renames)")
+    logger.info("")
+
+    # Show top mismatches by transaction count if we have that data
+    # For now, just show first 20 and save full list to file
+    for i, (stored, fetched, cik, name) in enumerate(mismatches[:20]):
+        logger.info(f"  {stored:6s} -> {fetched:6s}  CIK {cik:8d}  {name}")
+
+    if len(mismatches) > 20:
+        logger.info(f"  ... and {len(mismatches) - 20} more")
+
+    # Write full list to file if requested
+    if output_file:
+        try:
+            with open(output_file, 'w') as f:
+                f.write("stored_ticker,fetch_symbol,cik,company_name\n")
+                for stored, fetched, cik, name in mismatches:
+                    # Escape commas in company name
+                    name_escaped = name.replace('"', '""')
+                    f.write(f'{stored},{fetched},{cik},"{name_escaped}"\n')
+            logger.info(f"\nFull mismatch list saved to: {output_file}")
+        except Exception as e:
+            logger.warning(f"Failed to write mismatch file: {e}")
 
 
 def _ensure_failures_table(conn):
@@ -167,74 +316,101 @@ def get_coverage_stats(conn):
     return stats
 
 
-def get_target_tickers(conn):
+def get_target_tickers(conn, retest_failures=True):
     """
-    Get list of tickers to backfill.
+    Get list of (ticker, fetch_symbol, cik, name) tuples to backfill.
 
-    Returns tickers with insider purchases in the gap window that lack price
-    coverage for it, plus SPY if it lacks coverage. Excludes tickers listed in
-    the failures table (permanent failures).
+    Returns ALL companies lacking price coverage, plus companies from failures
+    table for re-testing with resolved symbols. Resolves stale tickers via SEC map.
 
-    On a DB with coverage already, this returns near-empty list (no-op).
-    On a DB missing coverage (first CI run), it does the work once.
-    Coverage then travels forward in the published DB artifact.
+    Args:
+        conn: Database connection
+        retest_failures: If True, include companies from price_backfill_failures
+                        for one more attempt with resolved ticker symbols
+
+    Returns:
+        List of (stored_ticker, fetch_symbol, cik, company_name) tuples
+        where stored_ticker is the join key, fetch_symbol is what to download
     """
     cur = conn.cursor()
 
     # Ensure failures table exists
     _ensure_failures_table(conn)
 
-    # Get tickers with known permanent failures
+    # Fetch SEC ticker map once per run
+    sec_map = _fetch_sec_ticker_map()
+
+    # Get all companies
+    cur.execute("""
+        SELECT ticker, cik, name
+        FROM companies
+        WHERE ticker != 'NONE'
+        ORDER BY ticker
+    """)
+    all_companies = cur.fetchall()
+
+    logger.info(f"Total companies in DB: {len(all_companies):,}")
+
+    # Get tickers with ANY existing price coverage
+    cur.execute("SELECT DISTINCT ticker FROM prices")
+    tickers_with_coverage = {row[0] for row in cur.fetchall()}
+    logger.info(f"Companies with prices: {len(tickers_with_coverage):,}")
+
+    # Get known failures
     cur.execute("SELECT ticker FROM price_backfill_failures")
     failed_tickers = {row[0] for row in cur.fetchall()}
-    if failed_tickers:
-        logger.info(f"Skipping {len(failed_tickers)} tickers with known permanent failures")
+    logger.info(f"Previously failed: {len(failed_tickers):,}")
 
-    # Get all tickers with purchases in gap window
-    query = """
-        SELECT DISTINCT c.ticker
-        FROM insider_transactions it
-        JOIN companies c ON it.company_id = c.id
-        WHERE it.transaction_type = 'P'
-          AND it.shares_transacted > 0
-          AND it.price > 0
-          AND it.transaction_date >= ?
-          AND it.transaction_date < ?
-          AND c.ticker != 'NONE'
-        ORDER BY c.ticker
-    """
-    cur.execute(query, (START_DATE, END_DATE))
-    candidates = [row[0] for row in cur.fetchall()]
+    # Build work list with ticker resolution
+    work_list = []
+    ticker_mismatches = []
 
-    # Get all tickers with existing coverage in gap window (bulk query)
-    cur.execute("""
-        SELECT DISTINCT ticker
-        FROM prices
-        WHERE date >= ?
-          AND date < ?
-    """, (START_DATE, END_DATE))
-    tickers_with_coverage = {row[0] for row in cur.fetchall()}
+    for stored_ticker, cik, name in all_companies:
+        # Resolve ticker symbol
+        fetch_symbol, is_resolved, reason = resolve_ticker_symbol(stored_ticker, cik, sec_map)
 
-    # Filter to tickers that need backfilling
-    tickers_needing_backfill = [
-        t for t in candidates
-        if t not in failed_tickers and t not in tickers_with_coverage
+        # Track mismatches for reporting
+        if is_resolved:
+            ticker_mismatches.append((stored_ticker, fetch_symbol, cik, name or ""))
+
+        # Decide whether to include in work list
+        if stored_ticker in tickers_with_coverage:
+            # Already have prices for this ticker - skip (additive only)
+            continue
+
+        if stored_ticker in failed_tickers and not retest_failures:
+            # Skip known failures unless retesting
+            continue
+
+        # Include in work list
+        work_list.append((stored_ticker, fetch_symbol, cik, name or ""))
+
+    # Add benchmark ETFs unconditionally (required for backtesting)
+    BENCHMARK_ETFS = [
+        ('SPY', None, 'SPDR S&P 500 ETF Trust'),
+        ('IWM', None, 'iShares Russell 2000 ETF'),
+        ('MDY', None, 'SPDR S&P MidCap 400 ETF Trust')
     ]
+    for ticker, cik, name in BENCHMARK_ETFS:
+        if ticker not in tickers_with_coverage:
+            # ETFs don't have CIKs in our DB, fetch with stored ticker
+            if not any(w[0] == ticker for w in work_list):
+                work_list.append((ticker, ticker, cik, name))
 
-    # Add benchmark ETFs unconditionally if they need backfilling
-    # Benchmarks have no insider purchases, so they're skipped by the above query,
-    # but they're required for size-matched backtesting - missing benchmarks
-    # silently corrupt excess return calculations, so make them unconditional
-    BENCHMARK_ETFS = ['SPY', 'IWM', 'MDY']
-    for benchmark in BENCHMARK_ETFS:
-        if benchmark not in failed_tickers and benchmark not in tickers_with_coverage:
-            if benchmark not in tickers_needing_backfill:
-                tickers_needing_backfill.append(benchmark)
+    # Report ticker resolution stats
+    if retest_failures and failed_tickers:
+        retest_count = sum(1 for t, _, _, _ in work_list if t in failed_tickers)
+        logger.info(f"Re-testing {retest_count} previously failed tickers with resolved symbols")
 
-    logger.info(f"Candidates with purchases in gap: {len(candidates)}")
-    logger.info(f"Tickers needing backfill: {len(tickers_needing_backfill)}")
+    logger.info(f"Companies needing prices: {len(work_list):,}")
+    logger.info(f"  With ticker mismatches: {len(ticker_mismatches):,}")
 
-    return tickers_needing_backfill
+    # Log ticker mismatches
+    if ticker_mismatches:
+        mismatch_file = os.path.join(CHECKPOINT_DIR, "ticker_mismatches.csv")
+        _log_ticker_mismatches(ticker_mismatches, output_file=mismatch_file)
+
+    return work_list
 
 
 def classify_failure(error_msg):
@@ -414,11 +590,17 @@ def _migrate_checkpoint_to_db(conn):
         logger.info(f"Checkpoint migration: all {len(failures_to_migrate)} failures already in DB")
 
 
-def run_backfill(dry_run=False, max_tickers=None):
+def run_backfill(dry_run=False, max_tickers=None, size_check=False):
     """
     Main backfill entry point.
 
-    Fetches prices for gap window, inserts into DB with checkpointing.
+    Fetches maximum available price history for all companies, inserts into DB
+    with checkpointing. Resolves stale ticker symbols via SEC map.
+
+    Args:
+        dry_run: If True, report what would be done without writing
+        max_tickers: Limit to N tickers for testing
+        size_check: If True, estimate row count and DB growth, then exit
     """
     start_time = time.time()
 
@@ -430,6 +612,23 @@ def run_backfill(dry_run=False, max_tickers=None):
     # Migrate checkpoint to DB (one-time transition)
     _migrate_checkpoint_to_db(conn)
 
+    # Purge stale failure records for tickers that now have prices
+    # This prevents the bug where a ticker is in both prices and failures tables
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM price_backfill_failures
+        WHERE ticker IN (
+            SELECT DISTINCT ticker FROM prices
+        )
+    """)
+    purged = cur.rowcount
+    if purged > 0:
+        logger.info(f"Purged {purged} stale failure records for tickers with current prices")
+        conn.commit()
+
+    # Get DB size before
+    db_size_before = os.path.getsize(DB_PATH) / (1024 * 1024)  # MB
+
     # Report coverage before
     logger.info("=" * 60)
     logger.info("PRICE BACKFILL — Coverage Before")
@@ -439,13 +638,59 @@ def run_backfill(dry_run=False, max_tickers=None):
     logger.info(f"  Distinct tickers: {before['distinct_tickers']:,}")
     logger.info(f"  Date range:       {before['min_date']} → {before['max_date']}")
     logger.info(f"  SPY coverage:     {before['spy_min']} → {before['spy_max']} ({before['spy_rows']} rows)")
+    logger.info(f"  DB size:          {db_size_before:.2f} MB")
 
-    # Get target tickers (now derives work list from DB state)
-    tickers = get_target_tickers(conn)
+    # Get companies in DB
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM companies WHERE ticker != 'NONE'")
+    total_companies = cur.fetchone()[0]
+
+    coverage_pct = (before['distinct_tickers'] / total_companies * 100) if total_companies > 0 else 0
+    logger.info(f"  Coverage:         {before['distinct_tickers']:,} / {total_companies:,} ({coverage_pct:.1f}%)")
+
+    # Get target tickers with resolution
+    work_list = get_target_tickers(conn, retest_failures=True)
 
     if max_tickers:
-        tickers = tickers[:max_tickers]
+        work_list = work_list[:max_tickers]
         logger.info(f"Limited to {max_tickers} tickers for testing")
+
+    # Size estimation mode
+    if size_check:
+        logger.info("=" * 60)
+        logger.info("SIZE ESTIMATION MODE")
+        logger.info("=" * 60)
+
+        # Estimate: ~252 trading days/year * years since 1970
+        years_of_data = datetime.now().year - 1970
+        estimated_rows_per_ticker = years_of_data * 252
+
+        total_estimated_rows = len(work_list) * estimated_rows_per_ticker
+
+        # Estimate DB growth: ~24 bytes per row (ticker, date, close, indexes)
+        estimated_growth_mb = (total_estimated_rows * 24) / (1024 * 1024)
+        estimated_final_size_mb = db_size_before + estimated_growth_mb
+
+        logger.info(f"  Companies needing prices: {len(work_list):,}")
+        logger.info(f"  Estimated rows/ticker:    ~{estimated_rows_per_ticker:,}")
+        logger.info(f"  Total estimated rows:     ~{total_estimated_rows:,}")
+        logger.info(f"  Current DB size:          {db_size_before:.2f} MB")
+        logger.info(f"  Estimated growth:         ~{estimated_growth_mb:.2f} MB")
+        logger.info(f"  Estimated final size:     ~{estimated_final_size_mb:.2f} MB")
+
+        if estimated_final_size_mb > 4000:
+            logger.warning(f"\n⚠️  WARNING: Estimated final size ({estimated_final_size_mb:.0f} MB) exceeds 4 GB")
+            logger.warning("   This may cause issues with the release artifact")
+
+        logger.info("\nPausing for review. Run without --size-check to proceed.")
+        return {
+            'total_rows': 0,
+            'successful': 0,
+            'failed_permanent': 0,
+            'failed_transient': 0,
+            'size_check': True,
+            'estimated_final_size_mb': estimated_final_size_mb
+        }
 
     # Load checkpoint
     resolved = _load_checkpoint()
@@ -458,9 +703,9 @@ def run_backfill(dry_run=False, max_tickers=None):
         logger.info(f"  Successes: {successes}")
         logger.info(f"  Known-delisted/malformed: {permanent_failures}")
 
-    # Filter to pending tickers
-    pending = [t for t in tickers if t not in resolved]
-    logger.info(f"Pending: {len(pending)} tickers")
+    # Filter to pending work items (check stored_ticker against checkpoint)
+    pending = [item for item in work_list if item[0] not in resolved]
+    logger.info(f"Pending: {len(pending)} companies")
 
     if dry_run:
         logger.info("=" * 60)
@@ -472,17 +717,26 @@ def run_backfill(dry_run=False, max_tickers=None):
     successful = []
     failed_permanent = []
     failed_transient = []
+    rescued_from_failures = []
+
+    # Track tickers that were in failures table before this run
+    cur = conn.cursor()
+    cur.execute("SELECT ticker FROM price_backfill_failures")
+    previously_failed = {row[0] for row in cur.fetchall()}
 
     for i in range(0, len(pending), BATCH_SIZE):
-        batch = pending[i:i+BATCH_SIZE]
+        batch_items = pending[i:i+BATCH_SIZE]
         batch_num = (i // BATCH_SIZE) + 1
         total_batches = (len(pending) + BATCH_SIZE - 1) // BATCH_SIZE
 
-        logger.info(f"Batch {batch_num}/{total_batches}: fetching {len(batch)} tickers...")
+        logger.info(f"Batch {batch_num}/{total_batches}: fetching {len(batch_items)} companies...")
+
+        # Extract fetch symbols for yfinance (dedupe in case of collisions)
+        fetch_symbols = list(set(item[1] for item in batch_items))
 
         # Fetch prices with error capture
         try:
-            prices_by_ticker = fetch_prices_batch(batch, START_DATE, END_DATE)
+            prices_by_ticker = fetch_prices_batch(fetch_symbols, START_DATE, END_DATE)
         except Exception as e:
             # Entire batch failed (likely rate limit or network issue)
             is_permanent, reason = classify_failure(str(e))
@@ -490,63 +744,80 @@ def run_backfill(dry_run=False, max_tickers=None):
 
             if not is_permanent:
                 # Transient: do NOT checkpoint, will retry entire batch next run
-                for ticker in batch:
-                    failed_transient.append((ticker, reason))
+                for stored_ticker, fetch_symbol, cik, name in batch_items:
+                    failed_transient.append((stored_ticker, reason))
                 logger.info(f"  Batch marked for retry ({reason})")
                 continue
             else:
                 # Permanent batch failure (unlikely but handle it)
                 prices_by_ticker = {}
 
-        # Insert per ticker
-        for ticker in batch:
-            if ticker in prices_by_ticker:
-                prices_df = prices_by_ticker[ticker]
+        # Insert per company (stored_ticker is storage key, fetch_symbol is download key)
+        for stored_ticker, fetch_symbol, cik, name in batch_items:
+            if fetch_symbol in prices_by_ticker:
+                prices_df = prices_by_ticker[fetch_symbol]
 
                 try:
-                    rows_inserted = insert_prices(conn, ticker, prices_df, dry_run=dry_run)
+                    # CRITICAL: Store under stored_ticker, not fetch_symbol
+                    # stored_ticker is the join key used throughout the system
+                    rows_inserted = insert_prices(conn, stored_ticker, prices_df, dry_run=dry_run)
 
                     if not dry_run:
                         # Commit after each ticker for incremental consistency
                         conn.commit()
 
                     total_rows_inserted += rows_inserted
-                    successful.append(ticker)
-                    resolved[ticker] = "success"
+                    successful.append(stored_ticker)
+                    resolved[stored_ticker] = "success"
 
-                    logger.debug(f"  {ticker}: {rows_inserted} rows")
+                    # Write-through: success invalidates any existing failure record
+                    # Always delete from failures table on success, not just if previously_failed
+                    if not dry_run:
+                        conn.execute("DELETE FROM price_backfill_failures WHERE ticker = ?",
+                                   (stored_ticker,))
+                        conn.commit()
+
+                    # Track if this was a rescue from failures table
+                    if stored_ticker in previously_failed:
+                        rescued_from_failures.append((stored_ticker, fetch_symbol))
+
+                    log_msg = f"  {stored_ticker}: {rows_inserted} rows"
+                    if fetch_symbol != stored_ticker:
+                        log_msg += f" (fetched as {fetch_symbol})"
+                    logger.debug(log_msg)
 
                 except Exception as e:
-                    logger.warning(f"  {ticker}: insert failed - {e}")
+                    logger.warning(f"  {stored_ticker}: insert failed - {e}")
                     is_permanent, reason = classify_failure(str(e))
 
                     if is_permanent:
-                        failed_permanent.append((ticker, reason))
-                        resolved[ticker] = reason
-                        _record_permanent_failure(conn, ticker, reason, dry_run=dry_run)
+                        failed_permanent.append((stored_ticker, reason))
+                        resolved[stored_ticker] = reason
+                        _record_permanent_failure(conn, stored_ticker, reason, dry_run=dry_run)
                     else:
-                        failed_transient.append((ticker, reason))
+                        failed_transient.append((stored_ticker, reason))
                         # Do NOT checkpoint transient failures
             else:
-                # No data returned - check yfinance stderr to classify
-                # yfinance logs errors to stderr, which we can't easily capture,
-                # so we conservatively treat "no data" as permanent only if
-                # it looks like a known-bad ticker
-                if ticker.startswith('*') or ticker.startswith('(') or ticker in ['[NONE]', '[N/A]', '-']:
+                # No data returned for fetch_symbol
+                # Classify based on ticker format
+                if stored_ticker.startswith('*') or stored_ticker.startswith('(') or stored_ticker in ['[NONE]', '[N/A]', '-']:
                     # Malformed ticker symbol
                     reason = "malformed"
-                    failed_permanent.append((ticker, reason))
-                    resolved[ticker] = reason
-                    _record_permanent_failure(conn, ticker, reason, dry_run=dry_run)
+                    failed_permanent.append((stored_ticker, reason))
+                    resolved[stored_ticker] = reason
+                    _record_permanent_failure(conn, stored_ticker, reason, dry_run=dry_run)
                 else:
-                    # Could be delisted or rate-limited; treat as permanent
+                    # Could be delisted or no data available; treat as permanent
                     # (rate limits usually error, not return empty)
                     reason = "no_data"
-                    failed_permanent.append((ticker, reason))
-                    resolved[ticker] = reason
-                    _record_permanent_failure(conn, ticker, reason, dry_run=dry_run)
+                    failed_permanent.append((stored_ticker, reason))
+                    resolved[stored_ticker] = reason
+                    _record_permanent_failure(conn, stored_ticker, reason, dry_run=dry_run)
 
-                logger.debug(f"  {ticker}: {reason}")
+                log_msg = f"  {stored_ticker}: {reason}"
+                if fetch_symbol != stored_ticker:
+                    log_msg += f" (tried {fetch_symbol})"
+                logger.debug(log_msg)
 
         # Save checkpoint after each batch
         if not dry_run:
@@ -555,7 +826,9 @@ def run_backfill(dry_run=False, max_tickers=None):
         # Progress report
         if (i + BATCH_SIZE) < len(pending):
             elapsed = time.time() - start_time
-            logger.info(f"  Progress: {len(resolved)}/{len(tickers)} tickers, "
+            completed = len(resolved)
+            total = len(work_list)
+            logger.info(f"  Progress: {completed}/{total} companies, "
                        f"{total_rows_inserted:,} rows, {elapsed:.0f}s elapsed")
 
         # Rate limiting
@@ -569,32 +842,46 @@ def run_backfill(dry_run=False, max_tickers=None):
 
     if not dry_run:
         after = get_coverage_stats(conn)
+        db_size_after = os.path.getsize(DB_PATH) / (1024 * 1024)  # MB
+
         logger.info(f"  Total rows:       {after['total_rows']:,} (+{after['total_rows'] - before['total_rows']:,})")
         logger.info(f"  Distinct tickers: {after['distinct_tickers']:,} (+{after['distinct_tickers'] - before['distinct_tickers']:,})")
         logger.info(f"  Date range:       {after['min_date']} → {after['max_date']}")
         logger.info(f"  SPY coverage:     {after['spy_min']} → {after['spy_max']} ({after['spy_rows']} rows, +{after['spy_rows'] - before['spy_rows']})")
+        logger.info(f"  DB size:          {db_size_after:.2f} MB (+{db_size_after - db_size_before:.2f} MB)")
 
-        # Verify SPY has full coverage
-        spy_expected_days = (pd.to_datetime(after['max_date']) - pd.to_datetime(after['spy_min'])).days
-        spy_coverage_pct = (after['spy_rows'] / spy_expected_days) * 100 if spy_expected_days > 0 else 0
-        logger.info(f"  SPY coverage:     {spy_coverage_pct:.1f}% of calendar days")
+        coverage_pct = (after['distinct_tickers'] / total_companies * 100) if total_companies > 0 else 0
+        logger.info(f"  Coverage:         {after['distinct_tickers']:,} / {total_companies:,} ({coverage_pct:.1f}%)")
 
-        if after['spy_min'] <= START_DATE:
-            logger.info(f"  ✓ SPY coverage extends to {START_DATE} (backtest-ready)")
-        else:
-            logger.warning(f"  ✗ SPY coverage only starts at {after['spy_min']} (expected {START_DATE})")
+        # Check for compressed release artifact size
+        logger.info(f"\n  Estimated gzipped: ~{db_size_after * 0.07:.0f} MB (for release artifact)")
+
     else:
         logger.info(f"  Would insert:     ~{total_rows_inserted:,} rows")
 
     logger.info("=" * 60)
     logger.info("SUMMARY")
     logger.info("=" * 60)
-    logger.info(f"  Tickers requested:      {len(tickers)}")
+    logger.info(f"  Companies requested:    {len(work_list)}")
     logger.info(f"  Successful:             {len(successful)}")
+    logger.info(f"  Rescued from failures:  {len(rescued_from_failures)}")
     logger.info(f"  Failed (permanent):     {len(failed_permanent)}")
     logger.info(f"  Failed (transient):     {len(failed_transient)}")
     logger.info(f"  Rows inserted:          {total_rows_inserted:,}")
     logger.info(f"  Runtime:                {time.time() - start_time:.0f}s")
+
+    if rescued_from_failures:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"RESCUED FROM FAILURES: {len(rescued_from_failures)} companies")
+        logger.info(f"{'='*60}")
+        logger.info("Previously failed, now succeeded with resolved ticker symbols:")
+        for stored, fetched in rescued_from_failures[:20]:
+            if stored != fetched:
+                logger.info(f"  {stored:6s} (resolved to {fetched})")
+            else:
+                logger.info(f"  {stored:6s}")
+        if len(rescued_from_failures) > 20:
+            logger.info(f"  ... and {len(rescued_from_failures) - 20} more")
 
     if failed_permanent:
         logger.info(f"\nPermanent failures: {len(failed_permanent)} (checkpointed, won't retry)")
@@ -621,41 +908,34 @@ def run_backfill(dry_run=False, max_tickers=None):
             for reason, count in reason_counts.most_common():
                 logger.info(f"    {reason}: {count}")
 
-    # Report actual pre-2021 coverage
-    if not dry_run:
-        logger.info("=" * 60)
-        logger.info("PRE-2021 COVERAGE VERIFICATION")
-        logger.info("=" * 60)
-
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT COUNT(DISTINCT ticker)
-            FROM prices
-            WHERE date < '2021-02-16'
-        """)
-        tickers_with_pre2021 = cur.fetchone()[0]
-        logger.info(f"  Tickers with pre-2021 data: {tickers_with_pre2021:,}")
-        logger.info(f"  Checkpoint resolved:        {len(resolved):,}")
-        logger.info(f"  Checkpointed but no data:   {len(resolved) - tickers_with_pre2021:,}")
-
     conn.close()
+
+    # Get final DB size (even in dry run, for comparison)
+    db_size_final = os.path.getsize(DB_PATH) / (1024 * 1024) if not dry_run else db_size_before
 
     return {
         'total_rows': total_rows_inserted,
         'successful': len(successful),
+        'rescued': len(rescued_from_failures),
         'failed_permanent': len(failed_permanent),
-        'failed_transient': len(failed_transient)
+        'failed_transient': len(failed_transient),
+        'db_size_mb': db_size_final
     }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Backfill price data from 2019-01-01 to 2021-02-16"
+        description="Backfill price data for all companies with ticker resolution"
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Report what would be fetched without writing to DB"
+    )
+    parser.add_argument(
+        "--size-check",
+        action="store_true",
+        help="Estimate row count and DB growth, then exit"
     )
     parser.add_argument(
         "--max-tickers",
@@ -676,4 +956,4 @@ if __name__ == "__main__":
             os.remove(path)
             logger.info("Checkpoint cleared")
 
-    run_backfill(dry_run=args.dry_run, max_tickers=args.max_tickers)
+    run_backfill(dry_run=args.dry_run, max_tickers=args.max_tickers, size_check=args.size_check)

@@ -2,9 +2,10 @@
 """Clean up malformed transaction_date values in existing insider_transactions.
 
 Applies the same normalization logic used in the ingestion pipeline to rows
-already in the database. Handles two known malformations:
+already in the database. Handles three known malformations:
 1. Trailing timezone offset (e.g., '2024-06-27-05:00')
 2. Two-digit year (e.g., '24-02-12')
+3. Zero-padded century (e.g., '0022-10-12')
 
 Future dates beyond today are rejected. Already-valid ISO dates pass through
 unchanged, even if transaction_date > filing_date.
@@ -45,6 +46,7 @@ def main():
         sys.exit(1)
 
     conn = sqlite3.connect(args.db)
+    conn.execute("PRAGMA busy_timeout = 60000")  # 60s timeout for concurrent access
     cur = conn.cursor()
 
     # Fetch all rows with transaction_date and filing_date
@@ -62,6 +64,7 @@ def main():
         "unchanged": 0,
         "timezone_offset": 0,
         "two_digit_year": 0,
+        "zero_padded_century": 0,
         "nulled": 0,
     }
     updates = []
@@ -123,16 +126,19 @@ def main():
                     stats["timezone_offset"] += 1
                 elif len(txn_date) == 8 and txn_date[2] == '-' and txn_date[5] == '-':
                     stats["two_digit_year"] += 1
+                elif len(txn_date) == 10 and txn_date[4] == '-' and txn_date[7] == '-' and txn_date[:2] == '00':
+                    stats["zero_padded_century"] += 1
                 updates.append((row_id, normalized, txn_date, filing_date))
 
     # Report
     print("Results:")
-    print(f"  Unchanged (already valid):  {stats['unchanged']}")
-    print(f"  Fixed (timezone offset):    {stats['timezone_offset']}")
-    print(f"  Fixed (two-digit year):     {stats['two_digit_year']}")
-    print(f"  Nulled (future dates):      {stats['nulled']}")
-    print(f"  Genuine duplicates:         {len(duplicates)}")
-    print(f"  Total updates:              {len(updates)}")
+    print(f"  Unchanged (already valid):     {stats['unchanged']}")
+    print(f"  Fixed (timezone offset):       {stats['timezone_offset']}")
+    print(f"  Fixed (two-digit year):        {stats['two_digit_year']}")
+    print(f"  Fixed (zero-padded century):   {stats['zero_padded_century']}")
+    print(f"  Nulled (future dates):         {stats['nulled']}")
+    print(f"  Genuine duplicates:            {len(duplicates)}")
+    print(f"  Total updates:                 {len(updates)}")
 
     # Data quality findings (not fixed, just reported)
     if txn_after_filing:
@@ -235,8 +241,33 @@ def main():
         else:
             print(f"  ✓ No malformed rows remain")
 
+        # Check plausibility floor: no dates before 1990
+        # (Form 4 electronic filing didn't exist before then, dataset is overwhelmingly 2020+)
+        cur.execute("""
+            SELECT COUNT(*) FROM insider_transactions
+            WHERE transaction_date IS NOT NULL
+              AND transaction_date < '1990-01-01'
+        """)
+        implausible_count = cur.fetchone()[0]
+        print(f"  Dates before 1990 (implausible): {implausible_count}")
+
+        if implausible_count > 0:
+            # Show sample
+            cur.execute("""
+                SELECT id, transaction_date, filing_date
+                FROM insider_transactions
+                WHERE transaction_date IS NOT NULL
+                  AND transaction_date < '1990-01-01'
+                LIMIT 5
+            """)
+            sample = cur.fetchall()
+            print(f"    Sample: {sample}")
+            print(f"  ❌ FAILED: {implausible_count} implausible dates remain")
+        else:
+            print(f"  ✓ All dates are plausible (>= 1990)")
+
         # Overall status
-        if max_is_valid and malformed_count == 0:
+        if max_is_valid and malformed_count == 0 and implausible_count == 0:
             print("\n✓ SUCCESS: All goals met")
         else:
             print("\n❌ INCOMPLETE: Some issues remain")

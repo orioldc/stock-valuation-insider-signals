@@ -133,6 +133,109 @@ if [[ $DB_ONLY -eq 0 ]]; then
   cd "$REPO_ROOT"
 fi
 
+# ── checksum verification helper ──
+# Verifies a file against SHA256SUMS. Returns 0 if verified, 1 if mismatch, 2 if checksums absent.
+verify_checksum() {
+  local file="$1"
+  local checksums_file="$2"
+  local basename
+  basename="$(basename "$file")"
+
+  if [[ ! -f "$checksums_file" ]]; then
+    return 2  # checksums file absent
+  fi
+
+  # Extract expected hash for this file
+  local expected_hash
+  expected_hash="$(grep -E "\\s+${basename}\$" "$checksums_file" | awk '{print $1}')"
+  if [[ -z "$expected_hash" ]]; then
+    echo "[install] WARNING: $basename not found in SHA256SUMS"
+    return 2
+  fi
+
+  # Compute actual hash (prefer shasum -a 256 on macOS, fallback to sha256sum on Linux)
+  local actual_hash
+  if command -v shasum >/dev/null 2>&1; then
+    actual_hash="$(shasum -a 256 "$file" | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    actual_hash="$(sha256sum "$file" | awk '{print $1}')"
+  else
+    echo "[install] ERROR: neither shasum nor sha256sum found; cannot verify integrity"
+    return 1
+  fi
+
+  if [[ "$actual_hash" == "$expected_hash" ]]; then
+    echo "[install] ✓ checksum verified: $basename"
+    return 0
+  else
+    echo "[install] ERROR: checksum mismatch for $basename"
+    echo "[install]   expected: $expected_hash"
+    echo "[install]   actual:   $actual_hash"
+    return 1
+  fi
+}
+
+# ── database sanity check ──
+# Verifies that a SQLite database is structurally sound and has expected tables/data.
+sanity_check_db() {
+  local db_file="$1"
+
+  echo "[install] running sanity checks on database …"
+
+  # Check that file opens as SQLite
+  if ! sqlite3 "$db_file" "PRAGMA quick_check;" >/dev/null 2>&1; then
+    echo "[install] ERROR: database failed SQLite integrity check"
+    return 1
+  fi
+
+  # Check core tables exist
+  local tables
+  tables="$(sqlite3 "$db_file" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;" 2>/dev/null || echo "")"
+  local required_tables=("companies" "insider_transactions" "prices" "shares_outstanding")
+  for tbl in "${required_tables[@]}"; do
+    if ! echo "$tables" | grep -qx "$tbl"; then
+      echo "[install] ERROR: missing required table: $tbl"
+      return 1
+    fi
+  done
+
+  # Check that core tables have rows
+  local row_counts
+  row_counts="$(sqlite3 "$db_file" "
+    SELECT
+      (SELECT COUNT(*) FROM companies) as companies,
+      (SELECT COUNT(*) FROM insider_transactions) as txns,
+      (SELECT COUNT(*) FROM prices) as prices,
+      (SELECT COUNT(*) FROM shares_outstanding) as shares
+  " 2>/dev/null || echo "0|0|0|0")"
+
+  local companies_count txns_count prices_count shares_count
+  companies_count="$(echo "$row_counts" | cut -d'|' -f1)"
+  txns_count="$(echo "$row_counts" | cut -d'|' -f2)"
+  prices_count="$(echo "$row_counts" | cut -d'|' -f3)"
+  shares_count="$(echo "$row_counts" | cut -d'|' -f4)"
+
+  if [[ "$companies_count" -eq 0 ]]; then
+    echo "[install] ERROR: companies table is empty"
+    return 1
+  fi
+  if [[ "$txns_count" -eq 0 ]]; then
+    echo "[install] ERROR: insider_transactions table is empty"
+    return 1
+  fi
+  if [[ "$prices_count" -eq 0 ]]; then
+    echo "[install] ERROR: prices table is empty"
+    return 1
+  fi
+  if [[ "$shares_count" -eq 0 ]]; then
+    echo "[install] ERROR: shares_outstanding table is empty"
+    return 1
+  fi
+
+  echo "[install] ✓ database sanity check passed ($companies_count companies, $txns_count transactions, $prices_count prices, $shares_count shares)"
+  return 0
+}
+
 # ── 4. DB snapshot download ──
 if [[ $SKIP_DB -eq 0 ]]; then
   DB_PATH="$REPO_ROOT/data/insider_signals.db"
@@ -158,13 +261,15 @@ for r in json.load(sys.stdin):
     csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
     hist_csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='historical_clusters.csv'), '')
     frozen_json = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider_frozen.json.gz'), '')
-    print(r['tag_name']); print(db); print(csv); print(hist_csv); print(frozen_json); break
+    checksums = next((a['browser_download_url'] for a in r['assets'] if a['name']=='SHA256SUMS'), '')
+    print(r['tag_name']); print(db); print(csv); print(hist_csv); print(frozen_json); print(checksums); break
 ")"
       RESOLVED_TAG="$(echo "$RELEASE_INFO" | sed -n 1p)"
       DB_URL="$(echo "$RELEASE_INFO" | sed -n 2p)"
       CSV_URL="$(echo "$RELEASE_INFO" | sed -n 3p)"
       HIST_CSV_URL="$(echo "$RELEASE_INFO" | sed -n 4p)"
       FROZEN_JSON_URL="$(echo "$RELEASE_INFO" | sed -n 5p)"
+      CHECKSUMS_URL="$(echo "$RELEASE_INFO" | sed -n 6p)"
     else
       RESOLVED_TAG="$RELEASE_TAG"
       URLS="$(curl -sSL "https://api.github.com/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG" \
@@ -175,24 +280,96 @@ db = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider
 csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='latest_signals.csv'), '')
 hist_csv = next((a['browser_download_url'] for a in r['assets'] if a['name']=='historical_clusters.csv'), '')
 frozen_json = next((a['browser_download_url'] for a in r['assets'] if a['name']=='insider_frozen.json.gz'), '')
-print(db); print(csv); print(hist_csv); print(frozen_json)
+checksums = next((a['browser_download_url'] for a in r['assets'] if a['name']=='SHA256SUMS'), '')
+print(db); print(csv); print(hist_csv); print(frozen_json); print(checksums)
 ")"
       DB_URL="$(echo "$URLS" | sed -n 1p)"
       CSV_URL="$(echo "$URLS" | sed -n 2p)"
       HIST_CSV_URL="$(echo "$URLS" | sed -n 3p)"
       FROZEN_JSON_URL="$(echo "$URLS" | sed -n 4p)"
+      CHECKSUMS_URL="$(echo "$URLS" | sed -n 5p)"
     fi
     if [[ -z "$DB_URL" ]]; then
       echo "[install] WARNING: no DB snapshot found in release $RELEASE_TAG. Skipping download."
       echo "[install]          You can rebuild from scratch with: python packages/tracker/run_expanded_pipeline.py"
     else
       mkdir -p "$REPO_ROOT/data"
+
+      # Clean up any stale staging directories from previous crashed runs
+      find "$REPO_ROOT/data" -maxdepth 1 -type d -name '.staging.*' -exec rm -rf {} + 2>/dev/null || true
+
+      # Check available disk space (need ~2.5 GB for decompression)
+      REQUIRED_SPACE_MB=2560
+      if command -v df >/dev/null 2>&1; then
+        # macOS df uses 512-byte blocks, Linux may vary; use -k for consistent KB output
+        AVAIL_KB=$(df -k "$REPO_ROOT/data" | tail -1 | awk '{print $4}')
+        AVAIL_MB=$((AVAIL_KB / 1024))
+        if [[ $AVAIL_MB -lt $REQUIRED_SPACE_MB ]]; then
+          echo "[install] ERROR: insufficient disk space for database download"
+          echo "[install]        Required: ${REQUIRED_SPACE_MB} MB"
+          echo "[install]        Available: ${AVAIL_MB} MB"
+          echo "[install]        Please free up space and retry."
+          exit 1
+        fi
+        echo "[install] disk space check: ${AVAIL_MB} MB available (need ${REQUIRED_SPACE_MB} MB)"
+      fi
+
+      # Create staging directory inside data/ for same-filesystem atomic move
+      TEMP_DIR="$(mktemp -d "$REPO_ROOT/data/.staging.XXXXXX")"
+      trap 'rm -rf "$TEMP_DIR"' EXIT
+
+      # Download checksums file if present
+      CHECKSUMS_FILE=""
+      if [[ -n "$CHECKSUMS_URL" ]]; then
+        echo "[install]   → $CHECKSUMS_URL"
+        if curl -fL --progress-bar -o "$TEMP_DIR/SHA256SUMS" "$CHECKSUMS_URL"; then
+          CHECKSUMS_FILE="$TEMP_DIR/SHA256SUMS"
+        else
+          echo "[install] NOTE: checksum file download failed; integrity verification will be skipped"
+        fi
+      else
+        echo "[install] NOTE: SHA256SUMS not present in release $RESOLVED_TAG; integrity cannot be verified"
+      fi
+
+      # Download and verify main database
       echo "[install]   → $DB_URL"
-      curl -fL --progress-bar -o "$REPO_ROOT/data/insider_signals.db.xz" "$DB_URL"
+      if ! curl -fL --progress-bar -o "$TEMP_DIR/insider_signals.db.xz" "$DB_URL"; then
+        echo "[install] ERROR: database download failed"
+        exit 1
+      fi
+
+      if [[ -n "$CHECKSUMS_FILE" ]]; then
+        if ! verify_checksum "$TEMP_DIR/insider_signals.db.xz" "$CHECKSUMS_FILE"; then
+          echo "[install] ERROR: database failed checksum verification"
+          echo "[install]        This indicates a corrupted or incomplete download."
+          echo "[install]        The existing database (if any) has been left untouched."
+          echo "[install]        Please retry the installation."
+          exit 1
+        fi
+      else
+        echo "[install] WARNING: proceeding without checksum verification (pre-dates SHA256SUMS)"
+      fi
+
       echo "[install] decompressing (this may take 30-60s) …"
-      xz -dkf "$REPO_ROOT/data/insider_signals.db.xz"
-      rm "$REPO_ROOT/data/insider_signals.db.xz"
+      if ! xz -dkf "$TEMP_DIR/insider_signals.db.xz"; then
+        echo "[install] ERROR: decompression failed"
+        echo "[install]        The existing database (if any) has been left untouched."
+        exit 1
+      fi
+
+      # Sanity check the decompressed database
+      if ! sanity_check_db "$TEMP_DIR/insider_signals.db"; then
+        echo "[install] ERROR: database sanity check failed"
+        echo "[install]        The downloaded database appears corrupted or incomplete."
+        echo "[install]        The existing database (if any) has been left untouched."
+        exit 1
+      fi
+
+      # All checks passed — move into place atomically (same filesystem, so this is a rename)
+      mv -f "$TEMP_DIR/insider_signals.db" "$DB_PATH"
       echo "[install]   → $DB_PATH"
+
+      # Download optional assets (no checksum verification for these — they're informational)
       if [[ -n "$CSV_URL" ]]; then
         echo "[install]   → $CSV_URL"
         curl -fL --progress-bar -o "$REPO_ROOT/data/latest_signals.csv" "$CSV_URL"

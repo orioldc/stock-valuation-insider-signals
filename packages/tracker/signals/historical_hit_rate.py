@@ -53,7 +53,7 @@ def compute_hit_rates(csv_path=None):
     """
     path = csv_path or _resolve_csv_path()
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, keep_default_na=False, na_values=[''])
         df = df.dropna(subset=["excess_ret_12m"])
 
         result = {}
@@ -91,7 +91,7 @@ def get_sector_hit_rates(csv_path=None):
     """Compute per-sector average excess returns for sector favorability scoring."""
     path = csv_path or _resolve_csv_path()
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, keep_default_na=False, na_values=[''])
         df = df.dropna(subset=["excess_ret_12m"])
 
         result = {}

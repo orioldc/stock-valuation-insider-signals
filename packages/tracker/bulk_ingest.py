@@ -72,12 +72,12 @@ def download_and_extract(quarter):
 def load_quarter(extract_dir):
     """Load and join the 3 TSVs for a quarter."""
     try:
-        trans = pd.read_csv(os.path.join(extract_dir, "NONDERIV_TRANS.tsv"), 
-                           sep='\t', low_memory=False, dtype=str)
-        sub = pd.read_csv(os.path.join(extract_dir, "SUBMISSION.tsv"), 
-                         sep='\t', low_memory=False, dtype=str)
-        owner = pd.read_csv(os.path.join(extract_dir, "REPORTINGOWNER.tsv"), 
-                           sep='\t', low_memory=False, dtype=str)
+        trans = pd.read_csv(os.path.join(extract_dir, "NONDERIV_TRANS.tsv"),
+                           sep='\t', low_memory=False, dtype=str, keep_default_na=False, na_values=[''])
+        sub = pd.read_csv(os.path.join(extract_dir, "SUBMISSION.tsv"),
+                         sep='\t', low_memory=False, dtype=str, keep_default_na=False, na_values=[''])
+        owner = pd.read_csv(os.path.join(extract_dir, "REPORTINGOWNER.tsv"),
+                           sep='\t', low_memory=False, dtype=str, keep_default_na=False, na_values=[''])
     except Exception as e:
         logger.warning(f"Failed to load TSVs from {extract_dir}: {e}")
         return None

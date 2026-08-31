@@ -35,7 +35,7 @@ def main():
         print(f"ERROR: {SIGNALS_CSV} not found. Run the pipeline first.")
         sys.exit(1)
 
-    df = pd.read_csv(SIGNALS_CSV)
+    df = pd.read_csv(SIGNALS_CSV, keep_default_na=False, na_values=[''])
     print(f"Loaded {len(df)} tickers from latest_signals.csv")
 
     # Enrich with conviction scores

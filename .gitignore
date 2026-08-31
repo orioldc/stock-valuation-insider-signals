@@ -18,6 +18,7 @@ data/*.db-shm
 data/*.db-wal
 data/*.db.xz
 data/*.csv
+data/.staging.*
 data/*.json
 data/.data_release
 packages/tracker/db/*.db

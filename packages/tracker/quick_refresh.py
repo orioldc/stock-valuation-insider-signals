@@ -46,7 +46,7 @@ def run_quick_refresh():
     old_path = os.path.join(OUTPUT_DIR, "latest_signals.csv")
     if os.path.exists(old_path):
         try:
-            old_signals = pd.read_csv(old_path)
+            old_signals = pd.read_csv(old_path, keep_default_na=False, na_values=[''])
         except:
             pass
 

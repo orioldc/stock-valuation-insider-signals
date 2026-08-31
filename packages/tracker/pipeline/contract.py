@@ -989,13 +989,13 @@ def check_market_cap_plausibility(conn):
       HSDT  $34.5T
       PKG   $21.4T
 
-    Threshold: $5T (5,000,000,000,000)
+    Threshold: $10T (10,000,000,000,000)
     Threshold type: Target (physically impossible values, zero tolerance)
     """
     cur = conn.cursor()
 
-    # Ceiling: $5 trillion
-    ceiling = 5e12
+    # Ceiling: $10 trillion (updated 2026-08-31 for NVDA at $5.3T)
+    ceiling = 10e12
 
     # Count companies above ceiling
     cur.execute("""
@@ -1031,7 +1031,7 @@ def check_market_cap_plausibility(conn):
         'expected': {
             'market_caps_above_ceiling': 0,
             'ceiling_usd': ceiling,
-            'ceiling_display': '$5T',
+            'ceiling_display': '$10T',
             'note': 'Physically impossible; signals corrupt recompute (stale price × current shares)',
             'threshold_type': 'target'
         }
@@ -2187,6 +2187,69 @@ def check_insider_transaction_price_plausibility(conn):
     }
 
 
+def check_aggregate_value_as_price(conn):
+    """
+    No insider transactions where aggregate value was written into the price field.
+
+    Detects group-level pattern: within a (ticker, transaction_date, price) group,
+    flag when 3+ distinct insiders (reporting_cik) share an identical price AND
+    that price is >= $1,000 and an exact multiple of $1,000.
+
+    This catches cases where the total transaction value was mistakenly written
+    into the price field (e.g., NUTX: 5 insiders at $20,000 "price" on 2020-08-12,
+    implying $0.63/share vs no price history to compare against).
+
+    Cannot be detected at ingestion time — this is a group-level pattern, and
+    insiders' Form 4s for a given date arrive over days or weeks. No single row
+    carries enough information to detect it.
+
+    The round-number requirement (exact $1k multiple) separates dollar amounts
+    from share prices. Across all 171,077 type-'P' transactions, 4,781 groups
+    have >=3 distinct insiders at identical price, but only 3 match the round
+    >=$$1k multiple criterion — all three are corrupt, zero false positives.
+
+    Threshold type: Target (zero tolerance after cleanup)
+    """
+    cur = conn.cursor()
+
+    # Find groups with 3+ distinct insiders at identical price >= $1k and exact multiple
+    cur.execute("""
+        SELECT c.ticker, it.transaction_date, it.price,
+               COUNT(DISTINCT it.reporting_cik) as insider_count,
+               SUM(it.shares_transacted) as total_shares,
+               COUNT(it.id) as txn_count
+        FROM insider_transactions it
+        JOIN companies c ON it.company_id = c.id
+        WHERE it.transaction_type = 'P'
+          AND it.price IS NOT NULL
+          AND it.price >= 1000.0
+          AND it.price = CAST(it.price / 1000.0 AS INTEGER) * 1000.0
+        GROUP BY c.ticker, it.transaction_date, it.price
+        HAVING COUNT(DISTINCT it.reporting_cik) >= 3
+        ORDER BY it.price DESC
+    """)
+
+    violations = cur.fetchall()
+
+    examples = [
+        f"{ticker} on {txn_date}: price=${price:,.0f}, {insider_count} insiders, {txn_count} txns, {total_shares:,.0f} shares"
+        for ticker, txn_date, price, insider_count, total_shares, txn_count in violations[:20]
+    ]
+
+    return {
+        'passed': len(violations) == 0,
+        'measured': {
+            'aggregate_value_as_price_count': len(violations),
+            'examples': examples
+        },
+        'expected': {
+            'aggregate_value_as_price_violations': 0,
+            'note': '>=3 insiders at identical round >=$$1k price (aggregate value written as price)',
+            'threshold_type': 'target'
+        }
+    }
+
+
 def check_no_prices_for_unknown_tickers(conn):
     """
     No prices for tickers absent from companies table (except benchmark ETFs).
@@ -2857,6 +2920,12 @@ CHECKS = [
         'description': 'No corrupt insider_transactions.price values (ceiling violations or market divergence)',
         'severity': CRITICAL,
         'check_fn': check_insider_transaction_price_plausibility
+    },
+    {
+        'id': 'integrity.aggregate_value_as_price',
+        'description': 'No aggregate-value-as-price violations (>=3 insiders at identical round >=$$1k price)',
+        'severity': CRITICAL,
+        'check_fn': check_aggregate_value_as_price
     },
 
     # Derived artifacts

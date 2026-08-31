@@ -278,6 +278,57 @@ def find_corrupt_prices(conn):
     logger.info(f"    {flag_low_side} rows FLAGGED ONLY (low side, likely incomplete split_events)")
     logger.info(f"    {flag_other} rows FLAGGED ONLY (market price itself looks corrupt)")
 
+    # Check 5: Aggregate-value-as-price pattern (group-level, cannot run at ingestion)
+    # Within a (ticker, transaction_date, price) group, flag when:
+    # - 3+ distinct insiders (reporting_cik) share an identical price, AND
+    # - that price is >= $1,000 and an exact multiple of $1,000
+    #
+    # This catches cases where the aggregate transaction value was written into the
+    # price field (e.g., NUTX at $20,000 "price" for 5 insiders on 2020-08-12).
+    # Cannot be detected at ingestion time because Form 4s arrive over days/weeks.
+    logger.info("Checking for aggregate-value-as-price pattern (>=3 insiders, round >=$1k)...")
+
+    # Get all (ticker, transaction_date, price) groups with 3+ distinct insiders at identical price
+    cur.execute("""
+        SELECT c.ticker, it.transaction_date, it.price,
+               COUNT(DISTINCT it.reporting_cik) as insider_count,
+               GROUP_CONCAT(DISTINCT it.id) as row_ids
+        FROM insider_transactions it
+        JOIN companies c ON it.company_id = c.id
+        WHERE it.transaction_type = 'P'
+          AND it.price IS NOT NULL
+          AND it.price > 0
+        GROUP BY c.ticker, it.transaction_date, it.price
+        HAVING COUNT(DISTINCT it.reporting_cik) >= 3
+    """)
+
+    groups = cur.fetchall()
+    already_flagged = {r[0] for r in corrupt}
+    aggregate_value_price = 0
+
+    for ticker, txn_date, price, insider_count, row_ids_str in groups:
+        # Check if price is >= $1,000 and exact multiple of $1,000
+        if price >= 1000.0 and price % 1000.0 == 0.0:
+            # This is likely aggregate value written as price
+            row_ids = [int(rid) for rid in row_ids_str.split(',')]
+
+            for row_id in row_ids:
+                if row_id in already_flagged:
+                    continue
+
+                # Get shares for this specific row
+                cur.execute("SELECT shares_transacted FROM insider_transactions WHERE id = ?", (row_id,))
+                shares = cur.fetchone()[0]
+
+                corrupt.append((
+                    row_id, ticker, txn_date, price, shares,
+                    f"aggregate_value_as_price (price=${price:,.0f}, {insider_count} insiders at identical round >=$$1k price)"
+                ))
+                aggregate_value_price += 1
+
+    logger.info(f"  Found {aggregate_value_price} aggregate-value-as-price violations")
+    logger.info(f"    Pattern: >=3 distinct insiders at identical price that is round >=$$1,000 multiple")
+
     return corrupt, flagged_only
 
 

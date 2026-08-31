@@ -56,7 +56,7 @@ MAX_DATE_MISALIGNMENT_DAYS = 400  # Price and shares dates must be within 400 da
 # Justification for 400d: market_cap feeds get_tier() with boundaries at $300M/$2B/$10B/$200B
 # (6x-7x gaps). Shares drift by a few percent annually from dilution/buybacks, which cannot
 # cross a 6x tier boundary. 400d covers quarterly reporting + filing lag + one missed quarter.
-MAX_PLAUSIBLE_MARKET_CAP = 5e12   # $5T ceiling - accommodates largest companies (MSFT, AAPL, NVDA)
+MAX_PLAUSIBLE_MARKET_CAP = 10e12   # $10T ceiling - accommodates largest companies (MSFT, AAPL, NVDA, future growth)
 
 # Discrepancy threshold for logging basis mismatches
 # When yfinance and derived disagree by more than this ratio, log it as a data quality signal
@@ -121,6 +121,9 @@ def _cross_check_with_yfinance(ticker, derived_mcap):
     The derived value serves as a reverse cross-check: when the two disagree by
     more than ~3x, log it (signals bad share data worth surfacing).
 
+    Distinguishes permanent unavailability (delisted ticker) from transient errors
+    (network failures) so we can mark 404s explicitly and avoid retrying them forever.
+
     Args:
         ticker: Stock ticker symbol
         derived_mcap: Our computed market cap (price × shares)
@@ -128,24 +131,29 @@ def _cross_check_with_yfinance(ticker, derived_mcap):
     Returns:
         (use_yfinance, mcap_to_use, source_label, reason)
         - use_yfinance: True if we used yfinance's value
-        - mcap_to_use: The market cap to write (yfinance or derived)
-        - source_label: 'yfinance' or 'derived'
+        - mcap_to_use: The market cap to write, or None to skip (network error)
+        - source_label: 'yfinance', 'unavailable', or None (skip on error)
         - reason: Human-readable explanation
     """
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        if not info or 'marketCap' not in info or info['marketCap'] is None:
-            # yfinance fetch failed or no market cap available
-            # Fall back to our derived value
-            return (False, derived_mcap, "derived", "yfinance_unavailable")
+        # Distinguish empty response (network error) from successful fetch with no data
+        if not info:
+            # Network error or API failure - skip this ticker, will retry next run
+            return (False, None, None, "yfinance_error_no_info")
+
+        if 'marketCap' not in info or info['marketCap'] is None:
+            # Successfully fetched info but no marketCap - permanent unavailability
+            # (delisted, merged, or ticker doesn't exist)
+            return (False, derived_mcap, "unavailable", "yfinance_no_marketcap")
 
         yf_mcap = float(info['marketCap'])
 
         if yf_mcap <= 0:
-            # Invalid yfinance data - fall back to our derived value
-            return (False, derived_mcap, "derived", "yfinance_invalid")
+            # Invalid yfinance data - treat as unavailable
+            return (False, derived_mcap, "unavailable", "yfinance_invalid")
 
         # yfinance has a usable value - use it as primary source
         # Compare against derived as a sanity check
@@ -159,12 +167,12 @@ def _cross_check_with_yfinance(ticker, derived_mcap):
         return (True, yf_mcap, "yfinance", f"validated_{ratio:.2f}x")
 
     except Exception as e:
-        # Network error or other exception - fall back to our derived value
+        # Network error or other exception - skip this ticker, will retry next run
         logger.debug(f"{ticker}: yfinance fetch failed: {e}")
-        return (False, derived_mcap, "derived", f"yfinance_error")
+        return (False, None, None, f"yfinance_exception")
 
 
-def compute_market_caps(dry_run=True, db_path=None):
+def compute_market_caps(dry_run=True, db_path=None, unverified_only=False):
     """
     Recompute market caps for all companies from latest prices and shares.
 
@@ -183,6 +191,11 @@ def compute_market_caps(dry_run=True, db_path=None):
     Companies lacking price or shares data, or failing any guard, keep their
     existing market_cap (a stale tier beats an impossible one).
 
+    Args:
+        dry_run: If True, report changes without writing to database
+        db_path: Path to database file
+        unverified_only: If True, process only companies with market_cap_source IS NULL
+
     Returns dict with run statistics.
     """
     logger.info("=" * 60)
@@ -191,6 +204,9 @@ def compute_market_caps(dry_run=True, db_path=None):
 
     if dry_run:
         logger.info("DRY RUN MODE — No data will be written")
+
+    if unverified_only:
+        logger.info("TARGETED MODE — Processing only unverified companies (market_cap_source IS NULL)")
 
     logger.info(f"Guards: price_age<{MAX_PRICE_AGE_DAYS}d, date_align<{MAX_DATE_MISALIGNMENT_DAYS}d, "
                 f"mcap<${MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T")
@@ -201,8 +217,13 @@ def compute_market_caps(dry_run=True, db_path=None):
     # Ensure market_cap_asof and market_cap_source columns exist
     _ensure_market_cap_columns(conn)
 
-    # Get all companies
-    cur.execute("SELECT id, ticker, market_cap FROM companies ORDER BY ticker")
+    # Get companies to process
+    if unverified_only:
+        query = "SELECT id, ticker, market_cap FROM companies WHERE market_cap_source IS NULL ORDER BY ticker"
+    else:
+        query = "SELECT id, ticker, market_cap FROM companies ORDER BY ticker"
+
+    cur.execute(query)
     all_companies = cur.fetchall()
     total = len(all_companies)
 
@@ -216,14 +237,24 @@ def compute_market_caps(dry_run=True, db_path=None):
     skipped_misaligned = 0
     skipped_invalid_input = 0
     skipped_implausible = 0
+    skipped_network_error = 0
+    marked_unavailable = 0
     changed_mcap_count = 0
     changed_tier_count = 0
-    mcap_changes = []  # (ticker, old_mcap, new_mcap, old_tier, new_tier)
+    mcap_changes = []  # (ticker, old_mcap, new_mcap, pct_change, old_tier, new_tier)
+    tier_changes = []  # (ticker, old_tier, new_tier, old_mcap, new_mcap)
+    mega_crossings = []  # (ticker, direction, old_tier, new_tier, old_mcap, new_mcap)
     rejections = []  # (ticker, reason, details) for data quality logging
     yfinance_checks_performed = 0
     yfinance_values_used = 0  # Count of times we used yfinance's value instead of derived
 
     for i, (company_id, ticker, old_mcap) in enumerate(all_companies):
+        # In unverified-only mode, we're verifying existing market caps against yfinance,
+        # not recomputing them. Skip companies with no existing market cap.
+        if unverified_only and old_mcap is None:
+            skipped_no_data += 1
+            continue
+
         # Get latest price with date
         price_row = cur.execute("""
             SELECT date, close FROM prices
@@ -241,9 +272,66 @@ def compute_market_caps(dry_run=True, db_path=None):
         """, (company_id,)).fetchone()
 
         # Guard 1: Check data availability
+        # In unverified-only mode, use existing market cap as fallback even if price/shares are missing
         if not price_row or not shares_row or price_row[1] is None or shares_row[1] is None:
-            skipped_no_data += 1
-            continue
+            if unverified_only and old_mcap is not None:
+                # Use existing market cap for verification
+                derived_mcap = old_mcap
+                price_date_str = run_date.strftime("%Y-%m-%d")
+                # Skip to yfinance check
+                yfinance_checks_performed += 1
+                use_yfinance, mcap_to_use, source_label, reason = _cross_check_with_yfinance(ticker, derived_mcap)
+
+                if mcap_to_use is None:
+                    skipped_network_error += 1
+                    continue
+
+                new_mcap = mcap_to_use
+                mcap_source = source_label
+
+                if source_label == "unavailable":
+                    marked_unavailable += 1
+                elif use_yfinance:
+                    yfinance_values_used += 1
+
+                # Compute tier changes
+                old_tier = get_tier(old_mcap)
+                new_tier = get_tier(new_mcap)
+
+                if abs(new_mcap - old_mcap) > 0.01:
+                    changed_mcap_count += 1
+                    pct_change = (new_mcap - old_mcap) / old_mcap * 100 if old_mcap > 0 else 0
+                    if abs(pct_change) > 10:
+                        mcap_changes.append((ticker, old_mcap, new_mcap, pct_change, old_tier, new_tier))
+
+                if old_tier != new_tier:
+                    changed_tier_count += 1
+                    tier_changes.append((ticker, old_tier, new_tier, old_mcap, new_mcap))
+                    if old_tier == "mega" or new_tier == "mega":
+                        direction = "into" if new_tier == "mega" else "out of"
+                        mega_crossings.append((ticker, direction, old_tier, new_tier, old_mcap, new_mcap))
+
+                if not dry_run:
+                    cur.execute("""
+                        UPDATE companies
+                        SET market_cap = ?, market_cap_asof = ?, market_cap_source = ?
+                        WHERE id = ?
+                    """, (new_mcap, price_date_str, mcap_source, company_id))
+
+                updated += 1
+
+                # Progress logging
+                if (i + 1) % BATCH_SIZE == 0:
+                    logger.info(f"Progress: {i+1:,}/{total:,} ({updated:,} updated, "
+                               f"{skipped_stale_price + skipped_misaligned + skipped_invalid_input + skipped_implausible + skipped_no_data + skipped_network_error:,} skipped)")
+                    if not dry_run:
+                        conn.commit()
+
+                time.sleep(0.02)  # Rate limit
+                continue
+            else:
+                skipped_no_data += 1
+                continue
 
         price_date_str = price_row[0]
         close_price = float(price_row[1])
@@ -261,8 +349,9 @@ def compute_market_caps(dry_run=True, db_path=None):
             continue
 
         # Guard 2: Price recency check
+        # In unverified-only mode, we're verifying existing values, so use them even if stale
         price_age_days = (run_date - price_date).days
-        if price_age_days > MAX_PRICE_AGE_DAYS:
+        if price_age_days > MAX_PRICE_AGE_DAYS and not unverified_only:
             skipped_stale_price += 1
             if price_age_days > 365:  # Log extreme staleness
                 rejections.append((ticker, "stale_price",
@@ -270,8 +359,9 @@ def compute_market_caps(dry_run=True, db_path=None):
             continue
 
         # Guard 3: Temporal alignment check
+        # In unverified-only mode, we're verifying existing values, so use them even if misaligned
         date_misalignment_days = abs((price_date - shares_date).days)
-        if date_misalignment_days > MAX_DATE_MISALIGNMENT_DAYS:
+        if date_misalignment_days > MAX_DATE_MISALIGNMENT_DAYS and not unverified_only:
             skipped_misaligned += 1
             if date_misalignment_days > 365:  # Log severe misalignment
                 rejections.append((ticker, "misaligned_dates",
@@ -295,6 +385,11 @@ def compute_market_caps(dry_run=True, db_path=None):
         yfinance_checks_performed += 1
         use_yfinance, mcap_to_use, source_label, reason = _cross_check_with_yfinance(ticker, derived_mcap)
 
+        # Handle network errors - skip this company, will retry next run
+        if mcap_to_use is None:
+            skipped_network_error += 1
+            continue
+
         if use_yfinance:
             yfinance_values_used += 1
             new_mcap = mcap_to_use
@@ -309,6 +404,10 @@ def compute_market_caps(dry_run=True, db_path=None):
             # yfinance unavailable/invalid - use derived value
             new_mcap = derived_mcap
             mcap_source = source_label
+
+            # Track permanent unavailability (delisted tickers)
+            if source_label == "unavailable":
+                marked_unavailable += 1
 
         # Rate limit: polite delay between yfinance calls (20ms)
         # This adds ~2.5 minutes to a full run of 7630 companies but prevents API throttling
@@ -338,6 +437,12 @@ def compute_market_caps(dry_run=True, db_path=None):
 
         if old_tier != new_tier:
             changed_tier_count += 1
+            tier_changes.append((ticker, old_tier, new_tier, old_mcap, new_mcap))
+
+            # Track mega tier crossings (into or out of mega)
+            if old_tier == "mega" or new_tier == "mega":
+                direction = "into" if new_tier == "mega" else "out of"
+                mega_crossings.append((ticker, direction, old_tier, new_tier, old_mcap, new_mcap))
 
         if not dry_run:
             # Always write market_cap and market_cap_source
@@ -375,6 +480,8 @@ def compute_market_caps(dry_run=True, db_path=None):
     logger.info(f"Skipped (misaligned dates):     {skipped_misaligned:,}")
     logger.info(f"Skipped (invalid input):        {skipped_invalid_input:,}")
     logger.info(f"Skipped (implausible result):   {skipped_implausible:,}")
+    logger.info(f"Skipped (network error):        {skipped_network_error:,}")
+    logger.info(f"Marked unavailable (404):       {marked_unavailable:,}")
     logger.info(f"yfinance cross-checks:          {yfinance_checks_performed:,}")
     logger.info(f"yfinance values used:           {yfinance_values_used:,}")
     logger.info(f"Changed market cap:             {changed_mcap_count:,}")
@@ -387,6 +494,19 @@ def compute_market_caps(dry_run=True, db_path=None):
         logger.warning("This means size-adjusted scores in the current artifact")
         logger.warning("were computed against stale market caps.")
         logger.warning("!" * 60)
+
+    # Show mega tier crossings (critical because mega has no base rates)
+    if mega_crossings:
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"MEGA TIER CROSSINGS ({len(mega_crossings)} companies)")
+        logger.info("Critical: mega tier has no base rates, affecting score visibility")
+        logger.info("=" * 60)
+        for ticker, direction, old_tier, new_tier, old_mcap, new_mcap in mega_crossings:
+            old_b = old_mcap / 1e9 if old_mcap else 0
+            new_b = new_mcap / 1e9
+            logger.info(f"  {ticker:<6} {direction:7} mega: {old_tier:5} → {new_tier:5}  "
+                       f"(${old_b:>8.2f}B → ${new_b:>8.2f}B)")
 
     # Show top market cap changes (>10%)
     if mcap_changes:
@@ -429,6 +549,8 @@ def compute_market_caps(dry_run=True, db_path=None):
         'skipped_misaligned': skipped_misaligned,
         'skipped_invalid_input': skipped_invalid_input,
         'skipped_implausible': skipped_implausible,
+        'skipped_network_error': skipped_network_error,
+        'marked_unavailable': marked_unavailable,
         'yfinance_checks_performed': yfinance_checks_performed,
         'yfinance_values_used': yfinance_values_used,
         'changed_mcap_count': changed_mcap_count,
@@ -450,18 +572,24 @@ def main():
         default=DB_PATH,
         help=f"Database path (default: {DB_PATH})"
     )
+    parser.add_argument(
+        "--unverified-only",
+        action="store_true",
+        help="Process only companies with market_cap_source IS NULL (never verified against yfinance)"
+    )
     args = parser.parse_args()
 
     dry_run = not args.write
     db_path = args.db
+    unverified_only = args.unverified_only
 
     if dry_run:
         # Dry-run: just compute and report
-        stats = compute_market_caps(dry_run=True, db_path=db_path)
+        stats = compute_market_caps(dry_run=True, db_path=db_path, unverified_only=unverified_only)
     else:
         # Write mode: use provenance tracking
         with record_run(db_path, 'market_cap') as run:
-            stats = compute_market_caps(dry_run=False, db_path=db_path)
+            stats = compute_market_caps(dry_run=False, db_path=db_path, unverified_only=unverified_only)
             run.rows_written = stats['updated']
             run.coverage(stats['updated'], stats['total'])
             # Also track skip reasons in metadata for data quality monitoring
@@ -471,6 +599,8 @@ def main():
                 'skipped_misaligned': stats['skipped_misaligned'],
                 'skipped_invalid_input': stats['skipped_invalid_input'],
                 'skipped_implausible': stats['skipped_implausible'],
+                'skipped_network_error': stats['skipped_network_error'],
+                'marked_unavailable': stats['marked_unavailable'],
                 'yfinance_checks_performed': stats['yfinance_checks_performed'],
                 'yfinance_values_used': stats['yfinance_values_used'],
             }

@@ -311,7 +311,7 @@ jobs:
           # Without this, a CRITICAL failure would exit 1 but the step would
           # succeed (tee always returns 0), and publication would proceed.
           set -o pipefail
-          python -m tracker.pipeline.validate \
+          python -m pipeline.validate \
             --json-report validation_reports/validation.json \
             --verbose | tee validation_reports/validation.txt
 

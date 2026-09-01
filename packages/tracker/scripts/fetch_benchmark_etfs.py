@@ -42,6 +42,63 @@ logger = logging.getLogger(__name__)
 
 BENCHMARK_ETFS = ["IWM", "MDY", "QQQ", "^IXIC", "URTH", "ACWI"]  # SPY already exists
 
+# Retry configuration
+MAX_RETRIES = 4  # Initial attempt + 3 retries = 4 total
+INITIAL_BACKOFF = 2  # seconds
+MAX_BACKOFF = 60  # seconds
+
+
+def fetch_single_benchmark_with_retry(ticker, start_date, end_date, max_retries=MAX_RETRIES):
+    """
+    Fetch a single benchmark ETF with exponential backoff retry.
+
+    Returns tuple: (ticker, prices_df or None, error_reason or None)
+
+    Retries on rate limits with exponential backoff. Other errors (404, malformed)
+    are treated as permanent failures and return immediately.
+    """
+    import yfinance as yf
+
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"{ticker}: fetching prices (attempt {attempt + 1}/{max_retries})...")
+
+            # Fetch prices using the shared batch function for single ticker
+            prices_by_ticker = fetch_prices_batch([ticker], start_date, end_date)
+
+            if ticker in prices_by_ticker:
+                logger.info(f"{ticker}: success on attempt {attempt + 1}")
+                return (ticker, prices_by_ticker[ticker], None)
+            else:
+                # No data returned - could be delisted, invalid symbol, or no data for period
+                logger.warning(f"{ticker}: no data returned on attempt {attempt + 1}")
+                # Don't retry - this is likely a permanent issue
+                return (ticker, None, "no_data")
+
+        except Exception as e:
+            error_str = str(e)
+
+            # Check if it's a rate limit error
+            if "YFRateLimitError" in str(type(e).__name__) or "Too Many Requests" in error_str or "429" in error_str:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 2s, 4s, 8s, capped at MAX_BACKOFF
+                    backoff = min(INITIAL_BACKOFF * (2 ** attempt), MAX_BACKOFF)
+                    logger.warning(f"{ticker}: rate limited, retrying in {backoff}s...")
+                    import time
+                    time.sleep(backoff)
+                    continue
+                else:
+                    logger.error(f"{ticker}: rate limited after {max_retries} attempts")
+                    return (ticker, None, "rate_limited")
+            else:
+                # Other errors (404, connection error, etc.) - don't retry
+                logger.error(f"{ticker}: error: {e}")
+                return (ticker, None, f"error: {type(e).__name__}")
+
+    # Exhausted all retries
+    logger.error(f"{ticker}: failed after {max_retries} attempts")
+    return (ticker, None, "max_retries_exceeded")
+
 
 def _ensure_failures_table(conn):
     """
@@ -120,29 +177,25 @@ def fetch_benchmarks(dry_run=False):
 
     logger.info(f"Missing benchmarks: {missing}")
 
-    # Fetch prices
-    logger.info(f"Fetching {len(missing)} benchmark ETFs...")
-    prices_by_ticker = fetch_prices_batch(missing, min_date, max_date)
-
-    if not prices_by_ticker:
-        logger.error("Failed to fetch any benchmark data")
-        conn.close()
-        return
-
-    # Insert
+    # Fetch prices individually with retry logic
+    logger.info(f"Fetching {len(missing)} benchmark ETFs individually with retry...")
     total_inserted = 0
     successful = []
     failed = []
 
     for ticker in missing:
-        if ticker not in prices_by_ticker:
-            logger.warning(f"{ticker}: no data returned")
-            # Record permanent failure
-            _record_permanent_failure(conn, ticker, "no_data", dry_run=dry_run)
+        # Fetch with retry
+        _, prices_df, error_reason = fetch_single_benchmark_with_retry(ticker, min_date, max_date)
+
+        if prices_df is None:
+            logger.warning(f"{ticker}: failed to fetch ({error_reason})")
+            # Record permanent failure for non-transient errors
+            if error_reason not in ["rate_limited", "max_retries_exceeded"]:
+                _record_permanent_failure(conn, ticker, error_reason, dry_run=dry_run)
             failed.append(ticker)
             continue
 
-        prices_df = prices_by_ticker[ticker]
+        # Insert prices
         rows_inserted = insert_prices(conn, ticker, prices_df, dry_run=dry_run)
 
         if rows_inserted > 0:

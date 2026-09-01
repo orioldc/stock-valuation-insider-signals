@@ -361,8 +361,12 @@ def compute_forward_returns(clusters_df, prices, split_events):
         'ret_12m': 252,
     }
 
-    # All benchmarks to compare against
-    additional_benchmarks = ['QQQ', '^IXIC', 'URTH', 'ACWI']
+    # Split benchmarks into required and optional
+    # Required: SPY (excess return basis), IWM/MDY (size-matched benchmarks)
+    # Optional: QQQ, ^IXIC, URTH, ACWI (comparison-only)
+    required_benchmarks = ['SPY', 'IWM', 'MDY']
+    optional_benchmarks = ['QQQ', '^IXIC', 'URTH', 'ACWI']
+
     benchmark_suffixes = {
         'SPY': 'spy',
         'QQQ': 'qqq',
@@ -372,16 +376,25 @@ def compute_forward_returns(clusters_df, prices, split_events):
     }
 
     # Verify required benchmarks present
-    required = ['SPY', 'IWM', 'MDY'] + additional_benchmarks
-    missing = [b for b in required if b not in prices]
-    if missing:
-        logger.error(f"Missing benchmark prices: {missing}")
+    missing_required = [b for b in required_benchmarks if b not in prices]
+    if missing_required:
+        logger.error(f"Missing required benchmark prices: {missing_required}")
+        logger.error(f"Required benchmarks (SPY, IWM, MDY) are needed for size-matched excess returns")
         return pd.DataFrame()
+
+    # Warn about missing optional benchmarks
+    missing_optional = [b for b in optional_benchmarks if b not in prices]
+    if missing_optional:
+        logger.warning(f"Missing optional benchmark prices: {missing_optional}")
+        logger.warning(f"Excess return columns for {missing_optional} will be omitted")
+
+    # Available benchmarks for iteration
+    available_benchmarks = [b for b in (required_benchmarks + optional_benchmarks) if b in prices]
 
     results = []
     tier_stats = {"historical": 0, "fallback": 0, "missing": 0, "unknown": 0}
     alignment_drops = 0
-    benchmark_alignment_drops = {b: 0 for b in required}
+    benchmark_alignment_drops = {b: 0 for b in available_benchmarks}
 
     # Max lag tolerance for benchmark entry vs signal_date
     MAX_ENTRY_LAG_DAYS = 7  # ~5 trading days tolerance for weekends/holidays
@@ -409,23 +422,31 @@ def compute_forward_returns(clusters_df, prices, split_events):
         tier = get_tier(market_cap)
         benchmark_ticker = get_benchmark_for_tier(tier)
 
-        # Get all benchmark prices and check alignment
+        # Get all available benchmark prices and check alignment
         benchmark_data = {}
         skip_cluster = False
 
-        for bench in required:
+        for bench in available_benchmarks:
             bench_prices = prices[bench]
             bench_valid = bench_prices.index[bench_prices.index >= signal_date]
 
             if len(bench_valid) == 0:
-                skip_cluster = True
-                break
+                # For required benchmarks, this is an error (skip cluster)
+                if bench in required_benchmarks:
+                    skip_cluster = True
+                    break
+                # For optional benchmarks, just skip this one
+                continue
 
             bench_entry_date = bench_valid[0]
             if (bench_entry_date - signal_date).days > MAX_ENTRY_LAG_DAYS:
                 benchmark_alignment_drops[bench] += 1
-                skip_cluster = True
-                break
+                # For required benchmarks, this is an error (skip cluster)
+                if bench in required_benchmarks:
+                    skip_cluster = True
+                    break
+                # For optional benchmarks, just skip this one
+                continue
 
             benchmark_data[bench] = {
                 'prices': bench_prices,
@@ -463,8 +484,13 @@ def compute_forward_returns(clusters_df, prices, split_events):
 
             row[period_name] = round(stock_ret, 2)
 
-            # Compute excess returns for each benchmark
+            # Compute excess returns for each benchmark (only if available)
             for bench, suffix in benchmark_suffixes.items():
+                if bench not in benchmark_data:
+                    # Benchmark missing (optional benchmark not fetched)
+                    row[f'excess_{period_name}_{suffix}'] = None
+                    continue
+
                 bench_info = benchmark_data[bench]
                 bench_future = bench_info['prices'].index[
                     bench_info['prices'].index > bench_info['entry_date']

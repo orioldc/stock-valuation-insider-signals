@@ -206,7 +206,7 @@ def compute_market_caps(dry_run=True, db_path=None, unverified_only=False):
         logger.info("DRY RUN MODE — No data will be written")
 
     if unverified_only:
-        logger.info("TARGETED MODE — Processing only unverified companies (market_cap_source IS NULL)")
+        logger.info("TARGETED MODE — Processing unverified (market_cap_source IS NULL) OR implausible (>${MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T) companies")
 
     logger.info(f"Guards: price_age<{MAX_PRICE_AGE_DAYS}d, date_align<{MAX_DATE_MISALIGNMENT_DAYS}d, "
                 f"mcap<${MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T")
@@ -219,7 +219,14 @@ def compute_market_caps(dry_run=True, db_path=None, unverified_only=False):
 
     # Get companies to process
     if unverified_only:
-        query = "SELECT id, ticker, market_cap FROM companies WHERE market_cap_source IS NULL ORDER BY ticker"
+        # Targeted mode: unverified (no source) OR implausible (exceeds ceiling)
+        # This makes the job self-healing: a bad value gets reprocessed rather than being permanently skipped
+        query = f"""
+            SELECT id, ticker, market_cap FROM companies
+            WHERE market_cap_source IS NULL
+               OR market_cap > {MAX_PLAUSIBLE_MARKET_CAP}
+            ORDER BY ticker
+        """
     else:
         query = "SELECT id, ticker, market_cap FROM companies ORDER BY ticker"
 

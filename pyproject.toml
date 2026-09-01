@@ -21,7 +21,7 @@ dependencies = [
     "requests>=2.31.0",
     "aiohttp>=3.9.0",
     # Market data providers
-    "yfinance>=0.2.36",
+    "yfinance>=1.4.0,<1.7.0",  # Pin to working range; 1.7.0+ breaks batch download with pandas 3.x
     # SEC EDGAR XBRL / Form-4 parsing
     "lxml>=5.0.0",
     "html5lib>=1.1",

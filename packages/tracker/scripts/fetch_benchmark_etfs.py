@@ -56,6 +56,9 @@ def fetch_single_benchmark_with_retry(ticker, start_date, end_date, max_retries=
 
     Retries on rate limits with exponential backoff. Other errors (404, malformed)
     are treated as permanent failures and return immediately.
+
+    Fallback: if batch download fails (e.g., yfinance 1.7.0 pandas 3.x MultiIndex bug),
+    falls back to per-ticker Ticker().history() which avoids the broken code path.
     """
     import yfinance as yf
 
@@ -63,17 +66,41 @@ def fetch_single_benchmark_with_retry(ticker, start_date, end_date, max_retries=
         try:
             logger.info(f"{ticker}: fetching prices (attempt {attempt + 1}/{max_retries})...")
 
-            # Fetch prices using the shared batch function for single ticker
+            # Try batch download first (shared function)
             prices_by_ticker = fetch_prices_batch([ticker], start_date, end_date)
 
             if ticker in prices_by_ticker:
                 logger.info(f"{ticker}: success on attempt {attempt + 1}")
                 return (ticker, prices_by_ticker[ticker], None)
             else:
-                # No data returned - could be delisted, invalid symbol, or no data for period
-                logger.warning(f"{ticker}: no data returned on attempt {attempt + 1}")
-                # Don't retry - this is likely a permanent issue
-                return (ticker, None, "no_data")
+                # Batch returned no data - try per-ticker fallback
+                logger.warning(f"{ticker}: batch download returned no data, trying per-ticker fallback...")
+                try:
+                    stock = yf.Ticker(ticker)
+                    hist = stock.history(start=start_date, end=end_date, auto_adjust=True)
+
+                    if hist.empty or 'Close' not in hist.columns:
+                        logger.warning(f"{ticker}: fallback also returned no data")
+                        return (ticker, None, "no_data")
+
+                    # Convert to same format as batch download
+                    df = pd.DataFrame({
+                        'date': hist.index,
+                        'close': hist['Close'].values
+                    })
+                    df = df.dropna(subset=['close'])
+
+                    if len(df) > 0:
+                        logger.info(f"{ticker}: fallback succeeded with {len(df)} rows")
+                        return (ticker, df, None)
+                    else:
+                        logger.warning(f"{ticker}: fallback returned no valid prices")
+                        return (ticker, None, "no_data")
+
+                except Exception as fallback_error:
+                    logger.warning(f"{ticker}: fallback failed: {fallback_error}")
+                    # Fall through to normal error handling
+                    return (ticker, None, "no_data")
 
         except Exception as e:
             error_str = str(e)

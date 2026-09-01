@@ -878,25 +878,40 @@ def run_backfill(dry_run=False, max_tickers=None, size_check=False):
                         # Do NOT checkpoint transient failures
             else:
                 # No data returned for fetch_symbol
-                # Classify based on ticker format
-                if stored_ticker.startswith('*') or stored_ticker.startswith('(') or stored_ticker in ['[NONE]', '[N/A]', '-']:
-                    # Malformed ticker symbol
-                    reason = "malformed"
-                    failed_permanent.append((stored_ticker, reason))
-                    resolved[stored_ticker] = reason
-                    _record_permanent_failure(conn, stored_ticker, reason, dry_run=dry_run)
-                else:
-                    # Could be delisted or no data available; treat as permanent
-                    # (rate limits usually error, not return empty)
-                    reason = "no_data"
-                    failed_permanent.append((stored_ticker, reason))
-                    resolved[stored_ticker] = reason
-                    _record_permanent_failure(conn, stored_ticker, reason, dry_run=dry_run)
+                # Check if ticker already has prices in DB before marking as permanent failure
+                # (prevents contradiction where fetch fails for a ticker with historical prices)
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM prices WHERE ticker = ?", (stored_ticker,))
+                existing_prices = cur.fetchone()[0]
 
-                log_msg = f"  {stored_ticker}: {reason}"
-                if fetch_symbol != stored_ticker:
-                    log_msg += f" (tried {fetch_symbol})"
-                logger.debug(log_msg)
+                if existing_prices > 0:
+                    # Ticker already has prices - this is a transient fetch failure, not "no_data"
+                    # Don't mark as permanent failure (will retry next run)
+                    failed_transient.append((stored_ticker, "fetch_failed_but_has_data"))
+                    log_msg = f"  {stored_ticker}: fetch failed but ticker has {existing_prices} existing prices (not marking as permanent failure)"
+                    if fetch_symbol != stored_ticker:
+                        log_msg += f" (tried {fetch_symbol})"
+                    logger.debug(log_msg)
+                else:
+                    # Truly no data available - classify as permanent
+                    if stored_ticker.startswith('*') or stored_ticker.startswith('(') or stored_ticker in ['[NONE]', '[N/A]', '-']:
+                        # Malformed ticker symbol
+                        reason = "malformed"
+                        failed_permanent.append((stored_ticker, reason))
+                        resolved[stored_ticker] = reason
+                        _record_permanent_failure(conn, stored_ticker, reason, dry_run=dry_run)
+                    else:
+                        # Could be delisted or no data available; treat as permanent
+                        # (rate limits usually error, not return empty)
+                        reason = "no_data"
+                        failed_permanent.append((stored_ticker, reason))
+                        resolved[stored_ticker] = reason
+                        _record_permanent_failure(conn, stored_ticker, reason, dry_run=dry_run)
+
+                    log_msg = f"  {stored_ticker}: {reason}"
+                    if fetch_symbol != stored_ticker:
+                        log_msg += f" (tried {fetch_symbol})"
+                    logger.debug(log_msg)
 
         # Save checkpoint after each batch
         if not dry_run:

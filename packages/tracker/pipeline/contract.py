@@ -593,8 +593,9 @@ def check_inactive_price_growth(conn):
 
 def check_benchmark_etf_coverage(conn):
     """
-    All benchmark ETFs are present and continuous from the earliest signal_date
-    to present, with no interior gaps in consecutive trading days.
+    Required benchmark ETFs (SPY, IWM, MDY) are present and continuous from the
+    earliest signal_date to present, with no interior gaps in consecutive trading days.
+    Optional benchmarks (QQQ, ^IXIC, URTH, ACWI) are checked but reported as warnings.
 
     A benchmark with an interior gap corrupts every excess-return calculation. We scope
     this to the backtest window (earliest signal onward) rather than the full price history
@@ -641,12 +642,19 @@ def check_benchmark_etf_coverage(conn):
     # Trailing edge tolerance: 7 calendar days (~5 trading days)
     trailing_tolerance_days = 7
 
-    benchmarks = ['SPY', 'IWM', 'MDY', 'QQQ', '^IXIC', 'URTH', 'ACWI']
+    # Required benchmarks: SPY, IWM, MDY (used in historical_backtest.py)
+    # Optional benchmarks: QQQ, ^IXIC, URTH, ACWI (nice-to-have comparisons)
+    required_benchmarks = ['SPY', 'IWM', 'MDY']
+    optional_benchmarks = ['QQQ', '^IXIC', 'URTH', 'ACWI']
+    all_benchmarks = required_benchmarks + optional_benchmarks
+
     results = {}
     all_passed = True
     failure_reasons = []
+    optional_warnings = []
 
-    for ticker in benchmarks:
+    for ticker in all_benchmarks:
+        is_required = ticker in required_benchmarks
         # Get all dates for this benchmark within the window
         cur.execute("""
             SELECT date
@@ -661,14 +669,18 @@ def check_benchmark_etf_coverage(conn):
         if not dates:
             results[ticker] = {
                 'present': False,
+                'required': is_required,
                 'min_date': None,
                 'max_date': None,
                 'row_count': 0,
                 'interior_gaps': [],
                 'trailing_lag_days': None
             }
-            all_passed = False
-            failure_reasons.append(f"{ticker}: NOT PRESENT in backtest window")
+            if is_required:
+                all_passed = False
+                failure_reasons.append(f"{ticker}: NOT PRESENT in backtest window")
+            else:
+                optional_warnings.append(f"{ticker}: NOT PRESENT in backtest window")
             continue
 
         # Check for interior gaps: missing consecutive trading days
@@ -697,6 +709,7 @@ def check_benchmark_etf_coverage(conn):
 
         results[ticker] = {
             'present': True,
+            'required': is_required,
             'min_date': dates[0],
             'max_date': dates[-1],
             'row_count': len(dates),
@@ -705,19 +718,31 @@ def check_benchmark_etf_coverage(conn):
             'interior_gaps': interior_gaps[:5] if interior_gaps else []  # Show first 5
         }
 
-        # Fail conditions
+        # Fail conditions (only fail CRITICAL for required benchmarks)
         if not covers_start:
-            all_passed = False
-            failure_reasons.append(f"{ticker}: MISSING LEADING EDGE (starts {dates[0]}, window starts {window_start})")
+            msg = f"{ticker}: MISSING LEADING EDGE (starts {dates[0]}, window starts {window_start})"
+            if is_required:
+                all_passed = False
+                failure_reasons.append(msg)
+            else:
+                optional_warnings.append(msg)
 
         if interior_gaps:
-            all_passed = False
             gap_summary = f"{len(interior_gaps)} gap(s), first: {interior_gaps[0]['from']} → {interior_gaps[0]['to']} ({interior_gaps[0]['days']} days)"
-            failure_reasons.append(f"{ticker}: INTERIOR GAPS — {gap_summary}")
+            msg = f"{ticker}: INTERIOR GAPS — {gap_summary}"
+            if is_required:
+                all_passed = False
+                failure_reasons.append(msg)
+            else:
+                optional_warnings.append(msg)
 
         if trailing_lag_days > trailing_tolerance_days:
-            all_passed = False
-            failure_reasons.append(f"{ticker}: TRAILING LAG EXCESSIVE (ends {dates[-1]}, {trailing_lag_days} days behind window end {window_end}, tolerance {trailing_tolerance_days} days)")
+            msg = f"{ticker}: TRAILING LAG EXCESSIVE (ends {dates[-1]}, {trailing_lag_days} days behind window end {window_end}, tolerance {trailing_tolerance_days} days)"
+            if is_required:
+                all_passed = False
+                failure_reasons.append(msg)
+            else:
+                optional_warnings.append(msg)
 
     return {
         'passed': all_passed,
@@ -725,16 +750,18 @@ def check_benchmark_etf_coverage(conn):
             'benchmarks': results,
             'backtest_window': f"{window_start} to {window_end}",
             'window_derived_from': f"earliest signal ({window_start}) to latest price ({window_end})",
-            'failure_reasons': failure_reasons if failure_reasons else []
+            'failure_reasons': failure_reasons if failure_reasons else [],
+            'optional_warnings': optional_warnings if optional_warnings else []
         },
         'expected': {
-            'required_etfs': benchmarks,
+            'required_etfs': required_benchmarks,
+            'optional_etfs': optional_benchmarks,
             'must_cover_window_start': True,
             'must_be_continuous_interior': True,
             'max_interior_gap_days': 4,
             'max_trailing_lag_days': trailing_tolerance_days,
             'threshold_type': 'target',
-            'note': 'Zero tolerance for interior gaps; tolerance for trailing lag (fetch timing)'
+            'note': 'CRITICAL failures only for required benchmarks (SPY, IWM, MDY); optional benchmarks (QQQ, ^IXIC, URTH, ACWI) reported as warnings'
         }
     }
 

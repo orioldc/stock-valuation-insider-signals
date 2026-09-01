@@ -206,7 +206,7 @@ def compute_market_caps(dry_run=True, db_path=None, unverified_only=False):
         logger.info("DRY RUN MODE — No data will be written")
 
     if unverified_only:
-        logger.info("TARGETED MODE — Processing unverified (market_cap_source IS NULL) OR implausible (>${MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T) companies")
+        logger.info(f"TARGETED MODE — Processing unverified (market_cap_source IS NULL) OR implausible (>${MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T) companies")
 
     logger.info(f"Guards: price_age<{MAX_PRICE_AGE_DAYS}d, date_align<{MAX_DATE_MISALIGNMENT_DAYS}d, "
                 f"mcap<${MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T")
@@ -421,12 +421,34 @@ def compute_market_caps(dry_run=True, db_path=None, unverified_only=False):
         time.sleep(0.02)
 
         # Guard 6: Output plausibility check (on the FINAL value we're going to use)
+        # If the computed value exceeds the ceiling, it's noise not measurement.
+        # Write NULL with source='implausible' rather than preserving the impossible value.
         if new_mcap > MAX_PLAUSIBLE_MARKET_CAP:
             skipped_implausible += 1
             rejections.append((ticker, "implausible_mcap",
                              f"${new_mcap/1e12:.1f}T (source={mcap_source}, "
                              f"price={close_price:,.0f}, shares={shares:,.0f}, "
                              f"price_date={price_date_str}, shares_date={shares_date_str})"))
+
+            # NULL the value instead of preserving the impossible number
+            if not dry_run:
+                cur.execute("""
+                    UPDATE companies
+                    SET market_cap = NULL, market_cap_asof = NULL, market_cap_source = 'implausible'
+                    WHERE id = ?
+                """, (company_id,))
+
+            # Track as a change if we NULLed a previously non-NULL value
+            if old_mcap is not None:
+                old_tier = get_tier(old_mcap)
+                new_tier = 'unknown'
+                changed_tier_count += 1
+                tier_changes.append((ticker, old_tier, new_tier, old_mcap, None))
+
+                if old_tier == "mega":
+                    mega_crossings.append((ticker, "out of", old_tier, new_tier, old_mcap, None))
+
+            updated += 1
             continue
 
         # All guards passed: compute tier and update

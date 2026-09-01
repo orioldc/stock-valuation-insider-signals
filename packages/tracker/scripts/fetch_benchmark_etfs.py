@@ -98,9 +98,18 @@ def fetch_single_benchmark_with_retry(ticker, start_date, end_date, max_retries=
                         return (ticker, None, "no_data")
 
                 except Exception as fallback_error:
-                    logger.warning(f"{ticker}: fallback failed: {fallback_error}")
-                    # Fall through to normal error handling
-                    return (ticker, None, "no_data")
+                    fallback_error_str = str(fallback_error)
+                    # Check if fallback error is a rate limit - re-raise to trigger retry
+                    if ("YFRateLimitError" in str(type(fallback_error).__name__) or
+                        "Too Many Requests" in fallback_error_str or
+                        "429" in fallback_error_str or
+                        "Rate limit" in fallback_error_str):
+                        logger.warning(f"{ticker}: fallback hit rate limit: {fallback_error}")
+                        raise fallback_error
+                    else:
+                        logger.warning(f"{ticker}: fallback failed: {fallback_error}")
+                        # Genuine error (404, connection, etc.) - return terminal failure
+                        return (ticker, None, "no_data")
 
         except Exception as e:
             error_str = str(e)

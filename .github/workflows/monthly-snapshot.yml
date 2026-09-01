@@ -229,19 +229,19 @@ jobs:
           cd packages/tracker
           python scripts/fix_ticker_symbols.py --write
 
-      - name: Backfill pre-2021 prices
-        timeout-minutes: 60
-        continue-on-error: true
-        run: |
-          cd packages/tracker
-          python scripts/backfill_prices.py
-
       - name: Fetch benchmark ETF prices
         timeout-minutes: 10
         continue-on-error: true
         run: |
           cd packages/tracker
           python scripts/fetch_benchmark_etfs.py
+
+      - name: Backfill pre-2021 prices
+        timeout-minutes: 60
+        continue-on-error: true
+        run: |
+          cd packages/tracker
+          python scripts/backfill_prices.py
 
       - name: Backfill splits
         timeout-minutes: 45

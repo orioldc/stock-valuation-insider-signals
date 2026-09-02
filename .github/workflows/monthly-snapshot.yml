@@ -359,7 +359,7 @@ jobs:
 
       - name: Compress DB
         run: |
-          # xz -9 -T0 (multi-threaded) takes ~1 min for ~900MB → ~98MB.
+          # xz -9 -T0 (multi-threaded) takes ~1 min for ~1.9 GB → ~194 MB.
           xz -9 -T0 -k data/insider_signals.db
           ls -lh data/
 

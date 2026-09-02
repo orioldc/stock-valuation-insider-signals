@@ -79,7 +79,7 @@ The signal ranking uses **size-adjusted scoring** — a 3% buyback at a $130B co
 
 ## Limitations
 
-- **Data is a monthly snapshot.** The DB is rebuilt on the 1st of each month from SEC EDGAR Form 4 filings and shares-outstanding data. Activity from the last few days/weeks may be missing.
+- **Data is a monthly snapshot.** The DB is rebuilt monthly from SEC EDGAR Form 4 filings and shares-outstanding data via a scheduled GitHub Actions workflow (requires a self-hosted runner; see `RUNNER-SETUP.md` for maintainers). Activity from the last few days/weeks may be missing.
 - **US equities only.** SEC EDGAR coverage.
 - **macOS only at launch.** Windows DXT support is on the roadmap.
 - **Not investment advice.** This surfaces signals; Claude's commentary is not personalized financial advice.
@@ -187,11 +187,16 @@ stock-valuation-insider-signals/
 │   └── mcp/                         # Node MCP server + FastAPI bridge
 ├── scripts/
 │   ├── install.sh                   # idempotent first-run setup
-│   └── start.sh                     # launch FastAPI + MCP
+│   ├── start.sh                     # launch FastAPI + MCP
+│   └── install-runner.sh            # self-hosted runner installer (maintainers)
 ├── data/                            # DB lives here; populated at install
 └── .github/workflows/
-    └── monthly-snapshot.yml         # cron: rebuild DB, publish release
+    └── monthly-snapshot.yml         # monthly rebuild (self-hosted runner)
 ```
+
+### Maintaining the monthly snapshot
+
+The monthly database refresh runs on a self-hosted GitHub Actions runner (the repo owner's machine) to work around Yahoo Finance's IP-based blocking of GitHub's hosted runners. See `RUNNER-SETUP.md` for installation, triggering runs on demand, and troubleshooting failed builds.
 
 ### Credits
 

@@ -33,6 +33,7 @@ logs/
 
 # Install sentinel
 .install_complete
+.runner_install_failed
 
 # Secrets
 .env

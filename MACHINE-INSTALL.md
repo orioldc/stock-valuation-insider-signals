@@ -10,6 +10,16 @@ curl -fsSL https://raw.githubusercontent.com/orioldc/stock-valuation-insider-sig
 
 Exit code 0 ⇒ installed and registered. User must then **restart Claude Desktop** for the new MCP server to appear.
 
+## Self-Hosted Runner (Optional)
+
+**If this machine will run the monthly database build**, you also need to install a GitHub Actions self-hosted runner. This is separate from the MCP server installation above.
+
+**Why**: The monthly snapshot workflow fetches data from Yahoo Finance, which blocks GitHub's hosted runner IPs. Running the workflow on your machine (with a residential IP) avoids the block.
+
+**When you need it**: Only if you are the repo owner or maintainer running the monthly builds. MCP server users do not need this.
+
+**Setup instructions**: See [`RUNNER-SETUP.md`](RUNNER-SETUP.md) for installation, verification, and maintenance.
+
 ## What the bootstrap does (in order)
 
 | Step | Action | Failure mode | Exit code |

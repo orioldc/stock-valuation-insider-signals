@@ -12,6 +12,14 @@ name: Monthly DB snapshot
 # `force_full_rebuild: true` on manual dispatch falls back to the slow path
 # (run_expanded_pipeline.py, ~45-60 min) for cases where the prior DB is
 # corrupted or the schema changed.
+#
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ SECURITY WARNING: Do NOT add a pull_request trigger to this workflow.  ┃
+# ┃                                                                         ┃
+# ┃ This workflow runs on a self-hosted runner (the owner's machine).      ┃
+# ┃ A pull_request trigger would allow any fork to execute arbitrary code  ┃
+# ┃ on that machine. Only schedule and workflow_dispatch are safe here.    ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
 on:
   schedule:
@@ -37,9 +45,16 @@ on:
 permissions:
   contents: write
 
+# Prevent concurrent runs on the same runner (self-hosted has single instance).
+# Queue mode: new runs wait rather than cancelling in-progress runs, which is
+# safer for workflows that mutate a shared database.
+concurrency:
+  group: monthly-snapshot-runner
+  cancel-in-progress: false
+
 jobs:
   build-snapshot:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, insider-signals]
     timeout-minutes: 360
     env:
       FMP_API_KEY: ${{ secrets.FMP_API_KEY }}

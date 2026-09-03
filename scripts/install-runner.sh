@@ -170,6 +170,31 @@ else
   echo "[install-runner]          Install from https://cli.github.com or provide token manually when prompted."
 fi
 
+# Check for virtualenv pollution in PATH
+# The runner service captures $PATH at registration time and bakes it into .path,
+# so if a project-specific virtualenv is active now, it will be baked into the
+# service and break unrelated jobs when that project is deleted or moved.
+if echo "$PATH" | grep -qE '\.venv/bin|/virtualenv/'; then
+  cat >&2 <<EOF
+
+[install-runner] WARNING: Your PATH contains a virtualenv or .venv/bin entry:
+
+$(echo "$PATH" | tr ':' '\n' | grep -E '\.venv/bin|/virtualenv/')
+
+The runner will capture this PATH and bake it into the service configuration.
+If that virtualenv is project-specific, jobs will break when the project is
+moved or deleted, and the failure will be non-obvious (wrong interpreter).
+
+Recommended: deactivate the virtualenv and re-run this script:
+
+  deactivate
+  bash scripts/install-runner.sh
+
+Press Ctrl+C to abort, or Enter to continue anyway (not recommended).
+EOF
+  read -r
+fi
+
 # ── 2. detect OS and architecture ──
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -287,11 +312,36 @@ if [[ $SKIP_CONFIG -eq 0 ]]; then
   if [[ $GH_AUTH_OK -eq 1 ]]; then
     echo "[install-runner] generating registration token via gh CLI …"
 
-    REG_TOKEN=$(gh api -X POST "repos/$REPO_SLUG/actions/runners/registration-token" --jq .token 2>/dev/null || echo "")
+    # Capture both the API response and any error output
+    API_RESPONSE=$(gh api -X POST "repos/$REPO_SLUG/actions/runners/registration-token" 2>&1 || echo "")
+    REG_TOKEN=$(echo "$API_RESPONSE" | jq -r .token 2>/dev/null || echo "")
 
-    if [[ -z "$REG_TOKEN" ]]; then
-      echo "[install-runner] ERROR: failed to generate registration token via gh CLI"
-      echo "[install-runner]        Check that gh is authenticated and you have admin access to the repo"
+    if [[ -z "$REG_TOKEN" || "$REG_TOKEN" == "null" ]]; then
+      # Token generation failed; provide actionable diagnostics
+      cat >&2 <<EOF
+
+[install-runner] ERROR: Failed to generate registration token for $REPO_SLUG
+
+The GitHub API call returned an error. This usually means the authenticated
+account does not have admin (or maintain) access to the repository.
+
+Current gh authentication status:
+EOF
+      gh auth status 2>&1 | sed 's/^/  /' >&2
+
+      cat >&2 <<EOF
+
+Possible fixes:
+  1. If you have multiple GitHub accounts, switch to one with admin access:
+       gh auth switch
+  2. If this account should have access, verify your permissions at:
+       https://github.com/$REPO_SLUG/settings/access
+  3. Re-authenticate with the correct account:
+       gh auth login
+
+API response (may contain diagnostics):
+EOF
+      echo "$API_RESPONSE" | head -5 | sed 's/^/  /' >&2
       exit 1
     fi
   else
@@ -350,34 +400,26 @@ fi
 echo "[install-runner] verifying service status …"
 sleep 2  # Give the service a moment to start
 
-SERVICE_STATUS="unknown"
-case "$OS" in
-  darwin)
-    # macOS launchd
-    PLIST_LABEL="actions.runner.$(basename "$REPO_SLUG").$(hostname -s)-insider-signals"
-    if launchctl list | grep -q "$PLIST_LABEL"; then
-      SERVICE_STATUS="running"
-    else
-      SERVICE_STATUS="not running"
-    fi
-    ;;
-  linux)
-    # Linux systemd
-    SERVICE_NAME="actions.runner.$(basename "$REPO_SLUG").$(hostname -s)-insider-signals.service"
-    if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-      SERVICE_STATUS="running"
-    elif systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-      SERVICE_STATUS="running"
-    else
-      SERVICE_STATUS="not running"
-    fi
-    ;;
-esac
+# Use svc.sh status for reliable state reporting (works on both macOS and Linux).
+# Output is either "Started: <PID>" or "Stopped" (or error if svc.sh doesn't exist).
+SVC_OUTPUT=$(./svc.sh status 2>&1 || echo "error")
 
-if [[ "$SERVICE_STATUS" == "running" ]]; then
-  echo "[install-runner] ✓ service is running"
+if echo "$SVC_OUTPUT" | grep -q "^Started:"; then
+  # Extract PID if present (format: "Started: 12345")
+  PID=$(echo "$SVC_OUTPUT" | sed -n 's/^Started: \([0-9]*\).*/\1/p')
+  if [[ -n "$PID" ]]; then
+    echo "[install-runner] ✓ service is running (PID: $PID)"
+  else
+    echo "[install-runner] ✓ service is running"
+  fi
+elif echo "$SVC_OUTPUT" | grep -qi "stopped"; then
+  echo "[install-runner] ERROR: service failed to start"
+  echo "[install-runner]        Output: $SVC_OUTPUT"
+  echo "[install-runner]        Check logs in $RUNNER_DIR/_diag/ for details"
+  exit 1
 else
-  echo "[install-runner] WARNING: service may not be running (status: $SERVICE_STATUS)"
+  echo "[install-runner] WARNING: unable to determine service status"
+  echo "[install-runner]          Output: $SVC_OUTPUT"
   echo "[install-runner]          Check logs in $RUNNER_DIR/_diag/ for details"
 fi
 

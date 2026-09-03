@@ -68,9 +68,13 @@ gh auth login
 
 ## Installation
 
-From the repository root:
+**IMPORTANT**: Deactivate any project-specific virtualenv before running the installer. The runner captures your current `$PATH` at registration time and bakes it into the service. If a virtualenv is active, the runner will inherit that virtualenv's `bin/` directory in its PATH, and jobs will break when that project is moved or deleted. The installer will warn you if it detects this condition, but it is safer to deactivate first:
 
 ```bash
+# If you have a virtualenv active, deactivate it first
+deactivate
+
+# Then run the installer
 bash scripts/install-runner.sh
 ```
 

@@ -362,6 +362,14 @@ def populate_sector_yfinance(ticker):
         info = yf.Ticker(ticker).info
         sector = info.get('sector', 'Unknown')
         market_cap = info.get('marketCap', None)
+
+        # Validate market cap before writing
+        if market_cap is not None:
+            valid, reason = _validate_market_cap_value(market_cap)
+            if not valid:
+                logger.warning(f"{ticker}: Rejected implausible market cap from yfinance: {market_cap:,.0f} ({reason})")
+                market_cap = None  # NULL instead of writing implausible value
+
         cur.execute("UPDATE companies SET sector=?, market_cap=? WHERE ticker=?",
                     (sector, market_cap, ticker))
         conn.commit()
@@ -443,6 +451,34 @@ def ingest_insider_trades(ticker, ticker_map=None):
     else:
         logger.info(f"{ticker}: Inserted {inserted} insider transactions")
     return inserted
+
+
+def _validate_market_cap_value(market_cap):
+    """
+    Validate market cap value for plausibility.
+
+    Returns (valid: bool, reason: str or None)
+
+    Uses the same $10T ceiling as recompute_market_caps.py to ensure consistency
+    across all market cap writes.
+
+    Args:
+        market_cap: Value to validate (in dollars)
+    """
+    # Ceiling matches recompute_market_caps.py MAX_PLAUSIBLE_MARKET_CAP
+    # Accommodates largest companies (MSFT, AAPL, NVDA) with headroom for growth
+    MAX_PLAUSIBLE_MARKET_CAP = 10e12  # $10T
+
+    if market_cap is None:
+        return True, None
+
+    if market_cap <= 0:
+        return False, f"non_positive ({market_cap:.2f})"
+
+    if market_cap > MAX_PLAUSIBLE_MARKET_CAP:
+        return False, f"above_ceiling ({market_cap/1e12:.2f}T > {MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T)"
+
+    return True, None
 
 
 def _validate_shares_value(shares, company_id, date, ticker, cur):

@@ -290,21 +290,43 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
             price_date = price_row[0]
             close_price = float(price_row[1])
             shares = float(shares_row[0])
-            market_cap = close_price * shares
+            computed_market_cap = close_price * shares
 
-            if has_asof_column:
-                cur.execute("""
-                    UPDATE companies
-                    SET market_cap = ?, market_cap_asof = ?
-                    WHERE id = ?
-                """, (market_cap, price_date, company_id))
+            # Validate before writing
+            from data_ingestion.data_loader import _validate_market_cap_value
+            valid, reason = _validate_market_cap_value(computed_market_cap)
+
+            if valid:
+                market_cap = computed_market_cap
+                if has_asof_column:
+                    cur.execute("""
+                        UPDATE companies
+                        SET market_cap = ?, market_cap_asof = ?
+                        WHERE id = ?
+                    """, (market_cap, price_date, company_id))
+                else:
+                    cur.execute("""
+                        UPDATE companies
+                        SET market_cap = ?
+                        WHERE id = ?
+                    """, (market_cap, company_id))
+                updated_count += 1
             else:
-                cur.execute("""
-                    UPDATE companies
-                    SET market_cap = ?
-                    WHERE id = ?
-                """, (market_cap, company_id))
-            updated_count += 1
+                # Implausible value: NULL it instead of writing
+                logger.warning(f"{ticker}: Rejecting implausible computed market cap: ${computed_market_cap/1e12:.2f}T ({reason})")
+                if has_asof_column:
+                    cur.execute("""
+                        UPDATE companies
+                        SET market_cap = NULL, market_cap_asof = NULL
+                        WHERE id = ?
+                    """, (company_id,))
+                else:
+                    cur.execute("""
+                        UPDATE companies
+                        SET market_cap = NULL
+                        WHERE id = ?
+                    """, (company_id,))
+                preserved_stale += 1  # Count as preserved (didn't update to a valid value)
         else:
             # Missing price or shares: preserve existing market_cap (stale is better than None)
             preserved_stale += 1

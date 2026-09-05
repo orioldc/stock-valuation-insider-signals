@@ -20,7 +20,7 @@ import os
 import sqlite3
 import logging
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Add parent to path for shared functions
 sys.path.insert(0, os.path.dirname(__file__))
@@ -46,6 +46,10 @@ BENCHMARK_ETFS = ["IWM", "MDY", "QQQ", "^IXIC", "URTH", "ACWI"]  # SPY already e
 MAX_RETRIES = 4  # Initial attempt + 3 retries = 4 total
 INITIAL_BACKOFF = 2  # seconds
 MAX_BACKOFF = 60  # seconds
+
+# Staleness threshold: refresh benchmarks older than this
+# Set below the 7-day contract tolerance so we refresh before the gate can fail
+MAX_BENCHMARK_STALENESS_DAYS = 5
 
 
 def fetch_single_benchmark_with_retry(ticker, start_date, end_date, max_retries=MAX_RETRIES):
@@ -198,7 +202,7 @@ def fetch_benchmarks(dry_run=False):
 
     logger.info(f"Fetching benchmark ETFs over {min_date} → {max_date}")
 
-    # Check which benchmarks are missing
+    # Check which benchmarks are missing or stale
     cur.execute(
         f"SELECT ticker FROM prices WHERE ticker IN ({','.join('?' * len(BENCHMARK_ETFS))}) GROUP BY ticker",
         BENCHMARK_ETFS,
@@ -206,20 +210,41 @@ def fetch_benchmarks(dry_run=False):
     existing = {row[0] for row in cur.fetchall()}
     missing = [t for t in BENCHMARK_ETFS if t not in existing]
 
-    if not missing:
-        logger.info("All benchmark ETFs already present in DB")
+    # Check staleness for existing benchmarks
+    stale = []
+    run_date = datetime.now().date()
+    for ticker in existing:
+        cur.execute("""
+            SELECT MAX(date) FROM prices WHERE ticker = ?
+        """, (ticker,))
+        max_date_row = cur.fetchone()
+        if max_date_row and max_date_row[0]:
+            latest_date = datetime.strptime(max_date_row[0], "%Y-%m-%d").date()
+            lag_days = (run_date - latest_date).days
+            if lag_days > MAX_BENCHMARK_STALENESS_DAYS:
+                stale.append((ticker, lag_days))
+                logger.info(f"{ticker}: stale (latest {max_date_row[0]}, {lag_days} days old)")
+
+    to_fetch = missing + [t for t, _ in stale]
+
+    if not to_fetch:
+        logger.info("All benchmark ETFs present and fresh")
         conn.close()
         return
 
-    logger.info(f"Missing benchmarks: {missing}")
+    if missing:
+        logger.info(f"Missing benchmarks: {missing}")
+    if stale:
+        logger.info(f"Stale benchmarks (>{MAX_BENCHMARK_STALENESS_DAYS}d): {[t for t, _ in stale]}")
+    logger.info(f"Total to fetch: {len(to_fetch)}")
 
     # Fetch prices individually with retry logic
-    logger.info(f"Fetching {len(missing)} benchmark ETFs individually with retry...")
+    logger.info(f"Fetching {len(to_fetch)} benchmark ETFs individually with retry...")
     total_inserted = 0
     successful = []
     failed = []
 
-    for ticker in missing:
+    for ticker in to_fetch:
         # Fetch with retry
         _, prices_df, error_reason = fetch_single_benchmark_with_retry(ticker, min_date, max_date)
 

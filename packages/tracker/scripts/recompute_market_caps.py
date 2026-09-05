@@ -43,6 +43,7 @@ sys.path.insert(0, SIGNALS_DIR)
 
 from pipeline.provenance import record_run
 from signals.size_adjustment import get_tier
+from data_ingestion.data_loader import _validate_market_cap_value
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -290,11 +291,53 @@ def compute_market_caps(dry_run=True, db_path=None, unverified_only=False):
                 use_yfinance, mcap_to_use, source_label, reason = _cross_check_with_yfinance(ticker, derived_mcap)
 
                 if mcap_to_use is None:
-                    skipped_network_error += 1
+                    # yfinance lookup failed (network error or delisted ticker)
+                    # Check if the existing value is implausible - if so, NULL it instead of preserving
+                    if old_mcap and old_mcap > MAX_PLAUSIBLE_MARKET_CAP:
+                        logger.warning(f"{ticker}: yfinance unavailable but existing value ${old_mcap/1e12:.2f}T exceeds ceiling - NULLing")
+                        if not dry_run:
+                            cur.execute("""
+                                UPDATE companies
+                                SET market_cap = NULL, market_cap_asof = NULL, market_cap_source = 'implausible'
+                                WHERE id = ?
+                            """, (company_id,))
+
+                        # Track as a tier change if we NULLed a mega-tier company
+                        old_tier = get_tier(old_mcap)
+                        if old_tier == "mega":
+                            mega_crossings.append((ticker, "out of", old_tier, "unknown", old_mcap, None))
+                        tier_changes.append((ticker, old_tier, "unknown", old_mcap, None))
+                        changed_tier_count += 1
+                        updated += 1
+                    else:
+                        # Old value is plausible or missing - skip (will retry next run)
+                        skipped_network_error += 1
                     continue
 
                 new_mcap = mcap_to_use
                 mcap_source = source_label
+
+                # Check for implausible values that can't be verified
+                # When yfinance says "unavailable" (delisted/404) but the derived value exceeds
+                # the ceiling, NULL it instead of preserving the impossible number
+                if source_label == "unavailable" and new_mcap > MAX_PLAUSIBLE_MARKET_CAP:
+                    logger.warning(f"{ticker}: yfinance unavailable, existing value ${new_mcap/1e12:.2f}T exceeds ceiling - NULLing")
+                    if not dry_run:
+                        cur.execute("""
+                            UPDATE companies
+                            SET market_cap = NULL, market_cap_asof = NULL, market_cap_source = 'implausible'
+                            WHERE id = ?
+                        """, (company_id,))
+
+                    # Track as a tier change
+                    old_tier = get_tier(old_mcap)
+                    if old_tier == "mega":
+                        mega_crossings.append((ticker, "out of", old_tier, "unknown", old_mcap, None))
+                    tier_changes.append((ticker, old_tier, "unknown", old_mcap, None))
+                    changed_tier_count += 1
+                    updated += 1
+                    time.sleep(0.02)  # Rate limit
+                    continue
 
                 if source_label == "unavailable":
                     marked_unavailable += 1
@@ -392,9 +435,29 @@ def compute_market_caps(dry_run=True, db_path=None, unverified_only=False):
         yfinance_checks_performed += 1
         use_yfinance, mcap_to_use, source_label, reason = _cross_check_with_yfinance(ticker, derived_mcap)
 
-        # Handle network errors - skip this company, will retry next run
+        # Handle network errors - but first check if we need to NULL an implausible old value
         if mcap_to_use is None:
-            skipped_network_error += 1
+            # yfinance lookup failed (network error or delisted ticker)
+            # Check if the existing value is implausible - if so, NULL it instead of preserving
+            if old_mcap and old_mcap > MAX_PLAUSIBLE_MARKET_CAP:
+                logger.warning(f"{ticker}: yfinance unavailable but existing value ${old_mcap/1e12:.2f}T exceeds ceiling - NULLing")
+                if not dry_run:
+                    cur.execute("""
+                        UPDATE companies
+                        SET market_cap = NULL, market_cap_asof = NULL, market_cap_source = 'implausible'
+                        WHERE id = ?
+                    """, (company_id,))
+
+                # Track as a tier change if we NULLed a mega-tier company
+                old_tier = get_tier(old_mcap)
+                if old_tier == "mega":
+                    mega_crossings.append((ticker, "out of", old_tier, "unknown", old_mcap, None))
+                tier_changes.append((ticker, old_tier, "unknown", old_mcap, None))
+                changed_tier_count += 1
+                updated += 1
+            else:
+                # Old value is plausible or missing - skip (will retry next run)
+                skipped_network_error += 1
             continue
 
         if use_yfinance:

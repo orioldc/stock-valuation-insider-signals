@@ -70,6 +70,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Hold PreventSystemSleep assertion (prevent clamshell sleep)
+        run: |
+          # caffeinate -s prevents clamshell sleep when on AC power.
+          # Refuse to run on battery: the assertion is silently ignored there,
+          # and we would discover the lid-close failure an hour later.
+
+          POWER_STATUS=$(pmset -g ps | head -1)
+          if echo "$POWER_STATUS" | grep -q "Battery Power"; then
+            echo "❌ ERROR: Machine is on battery power."
+            echo "   caffeinate -s only prevents clamshell sleep on AC power."
+            echo "   Plug in AC adapter and re-trigger the workflow."
+            exit 1
+          fi
+
+          echo "✓ On AC power: $POWER_STATUS"
+
+          # Start caffeinate in the background, bounded by -t slightly above the
+          # 360-minute job timeout. This is the safety net: a cancelled job may
+          # not run cleanup at all, and without the bound a leaked assertion
+          # would keep the Mac awake indefinitely.
+          # 360 minutes = 21600 seconds; use 22000 to stay above the timeout.
+          caffeinate -s -t 22000 &
+          CAFFEINATE_PID=$!
+
+          echo "Started caffeinate (PID $CAFFEINATE_PID, timeout 22000s)"
+          echo "CAFFEINATE_PID=$CAFFEINATE_PID" >> "$GITHUB_ENV"
+
       - name: Set up Python
         run: |
           # actions/setup-python hardcodes /Users/runner/hostedtoolcache on macOS
@@ -505,3 +532,19 @@ jobs:
 
           echo ""
           echo "✅ Publication complete for $TAG"
+
+      - name: Cleanup caffeinate process
+        if: always()
+        run: |
+          # Kill the caffeinate process started at the beginning of the job.
+          # Tolerate it already being gone (either the -t timeout fired or
+          # the process was already cleaned up for some other reason).
+          if [ -n "$CAFFEINATE_PID" ]; then
+            if kill "$CAFFEINATE_PID" 2>/dev/null; then
+              echo "Stopped caffeinate (PID $CAFFEINATE_PID)"
+            else
+              echo "caffeinate (PID $CAFFEINATE_PID) already stopped"
+            fi
+          else
+            echo "No CAFFEINATE_PID recorded (may have failed to start)"
+          fi

@@ -243,11 +243,22 @@ The workflow is idempotent — you can re-run it as many times as needed. Each r
 
 The workflow is scheduled to run at 06:00 UTC on the 1st of every month.
 
-**What happens if the machine is asleep or offline?**
+**What happens if the machine is asleep or offline when the schedule fires?**
 
 GitHub queues the workflow run for self-hosted runners. When the machine wakes or comes online and the runner service starts, the queued run executes. This is different from GitHub-hosted runners, which fail immediately if unavailable.
 
 In practice: if your machine is asleep at the scheduled time, the workflow will run when you wake it. The database will be slightly delayed but not skipped.
+
+**What happens if the machine sleeps DURING a run?**
+
+On a laptop, closing the lid triggers clamshell sleep even when on AC power, unless a `PreventSystemSleep` assertion is held. Without this assertion, the machine sleeps mid-job, causing:
+- GitHub to cancel the workflow after the runner stops sending heartbeats (~5 minutes)
+- The runner to continue executing locally after waking, unaware of the cancellation
+- The job to eventually fail with `TaskOrchestrationJobNotFoundException: job ref not found` when it tries to report results to a server-side job that no longer exists
+
+The workflow now holds the `PreventSystemSleep` assertion for the duration of the job via `caffeinate -s`, preventing clamshell sleep. This is bounded by a timeout slightly above the 360-minute job timeout, so a leaked assertion (from a cancelled job that skips cleanup) will not keep the Mac awake indefinitely.
+
+**AC power requirement**: The workflow **requires AC power** and will refuse to start on battery. `caffeinate -s` only prevents clamshell sleep when on AC — on battery it is silently ignored, and the lid-close failure would be discovered an hour later. If the workflow fails at the first step with "Machine is on battery power", plug in the AC adapter and re-trigger.
 
 ## Security Constraints
 

@@ -38,13 +38,15 @@ import logging
 import argparse
 from datetime import datetime
 from collections import defaultdict
-import urllib.request
 import pandas as pd
 import yfinance as yf
 
 # Add tracker to path for provenance
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+# Add data_ingestion to path for edgar_client's bulk_edgar import
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_ingestion"))
 from pipeline.provenance import record_run
+from data_ingestion.edgar_client import fetch_company_tickers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -78,7 +80,7 @@ def get_db():
 
 def _fetch_sec_ticker_map():
     """
-    Fetch SEC's authoritative company_tickers.json map.
+    Fetch SEC's authoritative company_tickers.json map using edgar_client.
 
     Returns dict mapping CIK (int) -> set of ticker strings.
 
@@ -91,45 +93,29 @@ def _fetch_sec_ticker_map():
     if _SEC_TICKER_MAP is not None:
         return _SEC_TICKER_MAP
 
-    url = "https://www.sec.gov/files/company_tickers.json"
+    logger.info("Fetching SEC company_tickers.json via edgar_client...")
 
-    # SEC requires User-Agent format: "Company/App Contact@email.com"
-    # See: https://www.sec.gov/os/accessing-edgar-data
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "InsiderSignalTracker oriol.diaz@ozoneproject.com",
-        "Accept": "application/json"
-    })
+    # Use edgar_client which bundles CA roots via requests/certifi
+    ticker_to_cik = fetch_company_tickers()
 
-    # Retry with exponential backoff
-    for attempt in range(3):
-        try:
-            logger.info(f"Fetching SEC company_tickers.json (attempt {attempt + 1}/3)...")
-            with urllib.request.urlopen(req, timeout=30) as response:
-                data = json.loads(response.read().decode('utf-8'))
+    if not ticker_to_cik:
+        # Failed to fetch - this is a critical error, not a soft fallback case
+        error_msg = (
+            "Failed to fetch SEC ticker map. Cannot resolve stale ticker symbols. "
+            "Check network connectivity and SEC API availability."
+        )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
-            # Build CIK -> set of tickers
-            cik_to_tickers = defaultdict(set)
-            for entry in data.values():
-                cik = int(entry['cik_str'])
-                ticker = entry['ticker'].upper()  # Normalize to uppercase
-                cik_to_tickers[cik].add(ticker)
+    # Transform ticker->CIK to CIK->set(tickers)
+    cik_to_tickers = defaultdict(set)
+    for ticker, cik in ticker_to_cik.items():
+        cik_to_tickers[int(cik)].add(ticker.upper())
 
-            _SEC_TICKER_MAP = dict(cik_to_tickers)
-            logger.info(f"  Loaded {len(_SEC_TICKER_MAP):,} CIKs with ticker mappings")
+    _SEC_TICKER_MAP = dict(cik_to_tickers)
+    logger.info(f"  Loaded {len(_SEC_TICKER_MAP):,} CIKs with ticker mappings")
 
-            return _SEC_TICKER_MAP
-
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed: {e}")
-            if attempt < 2:  # Don't sleep on last attempt
-                sleep_time = 2 ** attempt  # 1s, 2s
-                logger.info(f"  Retrying in {sleep_time}s...")
-                time.sleep(sleep_time)
-
-    logger.warning("Failed to fetch SEC ticker map after 3 attempts")
-    logger.warning("Will fall back to stored tickers for all companies")
-    logger.warning("(This means stale ticker symbols won't be resolved)")
-    return {}
+    return _SEC_TICKER_MAP
 
 
 def resolve_ticker_symbol(stored_ticker, cik, sec_map):

@@ -26,13 +26,20 @@ Adding a new check:
 import sqlite3
 import logging
 import os
-import urllib.request
+import sys
 import json
 import csv
 import gzip
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
+
+# Add data_ingestion to path for edgar_client's bulk_edgar import
+_script_dir = Path(__file__).resolve().parent
+_tracker_dir = _script_dir.parent
+sys.path.insert(0, str(_tracker_dir / "data_ingestion"))
+
+from data_ingestion.edgar_client import fetch_company_tickers
 
 logger = logging.getLogger(__name__)
 
@@ -1509,16 +1516,11 @@ def check_ticker_cik_absent_from_sec(conn):
     """
     cur = conn.cursor()
 
-    # Fetch SEC ticker map
-    url = "https://www.sec.gov/files/company_tickers.json"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "InsiderSignalTracker oriol.diaz@ozoneproject.com",
-        "Accept": "application/json"
-    })
-
+    # Fetch SEC ticker map using edgar_client (requests/certifi, not urllib)
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode('utf-8'))
+        ticker_to_cik = fetch_company_tickers()
+        if not ticker_to_cik:
+            raise RuntimeError("fetch_company_tickers returned None")
     except Exception as e:
         logger.warning(f"Failed to fetch SEC ticker map: {e}")
         return {
@@ -1529,7 +1531,7 @@ def check_ticker_cik_absent_from_sec(conn):
         }
 
     # Build set of CIKs in SEC map
-    sec_ciks = set(int(entry['cik_str']) for entry in data.values())
+    sec_ciks = set(int(cik) for cik in ticker_to_cik.values())
 
     # Get all companies with CIKs
     cur.execute("""
@@ -1578,16 +1580,11 @@ def check_ticker_validity_for_cik(conn):
     """
     cur = conn.cursor()
 
-    # Fetch SEC ticker map
-    url = "https://www.sec.gov/files/company_tickers.json"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "InsiderSignalTracker oriol.diaz@ozoneproject.com",
-        "Accept": "application/json"
-    })
-
+    # Fetch SEC ticker map using edgar_client (requests/certifi, not urllib)
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode('utf-8'))
+        ticker_to_cik = fetch_company_tickers()
+        if not ticker_to_cik:
+            raise RuntimeError("fetch_company_tickers returned None")
     except Exception as e:
         logger.warning(f"Failed to fetch SEC ticker map: {e}")
         return {
@@ -1599,10 +1596,8 @@ def check_ticker_validity_for_cik(conn):
 
     # Build CIK -> set of valid tickers
     cik_to_tickers = defaultdict(set)
-    for entry in data.values():
-        cik = int(entry['cik_str'])
-        ticker = entry['ticker'].upper()
-        cik_to_tickers[cik].add(ticker)
+    for ticker, cik in ticker_to_cik.items():
+        cik_to_tickers[int(cik)].add(ticker.upper())
 
     # Get all companies with CIKs present in SEC map
     cur.execute("""

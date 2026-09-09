@@ -38,11 +38,123 @@ def _safe_float(val, default=0.0) -> float:
         return default
 
 
+def _get_fx_rate(from_currency: str, to_currency: str) -> float | None:
+    """
+    Fetch spot FX rate from yfinance using currency pairs (e.g., TWDUSD=X).
+
+    Returns the rate to convert from_currency to to_currency.
+    Returns None if the rate cannot be fetched.
+
+    Examples:
+        _get_fx_rate("TWD", "USD") fetches TWDUSD=X and returns ~0.032
+        _get_fx_rate("EUR", "USD") fetches EURUSD=X and returns ~1.08
+    """
+    if from_currency == to_currency:
+        return 1.0
+
+    try:
+        # Try direct pair: FROMUSD=X (e.g., TWDUSD=X)
+        pair = f"{from_currency}{to_currency}=X"
+        ticker = yf.Ticker(pair)
+        info = ticker.info
+
+        # Try current price first, then regularMarketPrice, then previousClose
+        rate = (
+            info.get("regularMarketPrice")
+            or info.get("currentPrice")
+            or info.get("previousClose")
+        )
+
+        if rate and rate > 0:
+            return float(rate)
+
+        # If direct pair failed, try inverse: USDTWD=X
+        pair_inverse = f"{to_currency}{from_currency}=X"
+        ticker_inv = yf.Ticker(pair_inverse)
+        info_inv = ticker_inv.info
+
+        rate_inv = (
+            info_inv.get("regularMarketPrice")
+            or info_inv.get("currentPrice")
+            or info_inv.get("previousClose")
+        )
+
+        if rate_inv and rate_inv > 0:
+            return 1.0 / float(rate_inv)
+
+        return None
+
+    except Exception as e:
+        print(f"[financials] Failed to fetch FX rate {from_currency}/{to_currency}: {e}")
+        return None
+
+
+def _convert_financials_currency(
+    financials: dict,
+    fx_rate: float,
+    from_currency: str,
+    to_currency: str
+) -> dict:
+    """
+    Convert monetary fields in financials dict from one currency to another.
+
+    Converts only monetary amounts (revenue, EBIT, debt, etc.), not ratios,
+    percentages, share counts, or per-share figures already in price currency.
+
+    Args:
+        financials: dict with financial data
+        fx_rate: exchange rate to apply (from_currency to to_currency)
+        from_currency: source currency (e.g., "TWD")
+        to_currency: target currency (e.g., "USD")
+
+    Returns:
+        dict with converted values and currency metadata
+    """
+    result = financials.copy()
+
+    # Monetary fields to convert (absolute amounts, not ratios or per-share)
+    monetary_fields = [
+        "revenue_ttm", "ebitda_ttm", "ebit_ttm", "net_income_ttm",
+        "d_and_a_ttm", "capex_ttm", "delta_wc_ttm",
+        "total_debt", "cash", "net_debt",
+        "interest_expense_ttm", "total_equity",
+        "rd_expense_ttm",
+    ]
+
+    # Convert scalar monetary fields
+    for field in monetary_fields:
+        if field in result and result[field] != 0:
+            result[field] = result[field] * fx_rate
+
+    # Convert 5-year arrays
+    array_fields = ["revenue_5yr", "ebit_5yr", "net_income_5yr", "capex_5yr"]
+    for field in array_fields:
+        if field in result and result[field]:
+            result[field] = [v * fx_rate if v else 0 for v in result[field]]
+
+    # R&D 5-year (if present)
+    if "rd_expense_5yr" in result and result["rd_expense_5yr"]:
+        result["rd_expense_5yr"] = [v * fx_rate if v else 0 for v in result["rd_expense_5yr"]]
+
+    # Add currency metadata
+    result["currency_original"] = from_currency
+    result["currency_converted_to"] = to_currency
+    result["fx_rate_applied"] = fx_rate
+    result["fx_rate_type"] = "spot"
+
+    return result
+
+
 def _yfinance_fallback(ticker: str) -> dict:
     """Pull financials from yfinance as fallback for all critical fields."""
     try:
         t = yf.Ticker(ticker)
         info = t.info
+
+        # Capture currency information
+        financial_currency = info.get("financialCurrency") or "USD"
+        price_currency = info.get("currency") or "USD"
+
         result = {
             "revenue_ttm": _safe_float(info.get("totalRevenue")),
             "ebitda_ttm": _safe_float(info.get("ebitda")),
@@ -66,6 +178,8 @@ def _yfinance_fallback(ticker: str) -> dict:
             "capex_5yr": [],
             "total_equity": 0.0,
             "source": "yfinance",
+            "financial_currency": financial_currency,
+            "price_currency": price_currency,
         }
 
         # Try to get annual + quarterly statements from yfinance
@@ -266,6 +380,25 @@ def _yfinance_fallback(ticker: str) -> dict:
         elif result.get("_nonrecurring_charges", 0) > 0:
             result["ebitda_ttm"] = result["ebit_ttm"] + result["d_and_a_ttm"]
 
+        # Currency conversion check
+        financial_curr = result.get("financial_currency")
+        price_curr = result.get("price_currency")
+
+        if financial_curr and price_curr and financial_curr != price_curr:
+            print(f"[financials] {ticker}: Currency mismatch detected - "
+                  f"financials in {financial_curr}, price in {price_curr}")
+
+            fx_rate = _get_fx_rate(financial_curr, price_curr)
+
+            if fx_rate is None:
+                print(f"[financials] {ticker}: Cannot fetch FX rate {financial_curr}/{price_curr} - "
+                      "returning None (insufficient data)")
+                return None  # Refuse to value rather than assume USD
+
+            print(f"[financials] {ticker}: Converting financials from {financial_curr} to {price_curr} "
+                  f"at spot rate {fx_rate:.6f}")
+            result = _convert_financials_currency(result, fx_rate, financial_curr, price_curr)
+
         return result
 
     except Exception as e:
@@ -285,10 +418,12 @@ def _empty_financials() -> dict:
         "revenue_5yr": [], "ebit_5yr": [], "net_income_5yr": [],
         "roe_5yr": [], "retention_5yr": [], "capex_5yr": [],
         "source": "empty",
+        "financial_currency": None,
+        "price_currency": None,
     }
 
 
-def get_ttm_financials(ticker: str, no_cache: bool = False) -> dict:
+def get_ttm_financials(ticker: str, no_cache: bool = False) -> dict | None:
     """
     Fetch trailing twelve-month (TTM) and 5-year financial data.
 
@@ -296,7 +431,13 @@ def get_ttm_financials(ticker: str, no_cache: bool = False) -> dict:
     SEC XBRL is especially important for banks where yfinance EBIT is unreliable.
     yfinance quarterly data is used to compute TTM when XBRL only has annual.
 
-    Returns standardized dict with all fields needed by valuation modules.
+    Currency handling: If financials are reported in a different currency than
+    the stock's trading currency, they are converted to the trading currency
+    using the current spot FX rate from yfinance. If the FX rate cannot be
+    fetched, returns None (insufficient data) rather than assuming USD.
+
+    Returns standardized dict with all fields needed by valuation modules,
+    or None if data is insufficient or currency conversion is required but fails.
     """
     # Try SEC XBRL first — authoritative data directly from filings
     try:
@@ -309,6 +450,11 @@ def get_ttm_financials(ticker: str, no_cache: bool = False) -> dict:
                 info = t.info
                 # Add forward PE from yfinance (not in XBRL)
                 xbrl["forward_pe"] = _safe_float(info.get("forwardPE"))
+
+                # Capture currency information from yfinance
+                # XBRL doesn't provide currency metadata, so we get it from yfinance
+                xbrl["financial_currency"] = info.get("financialCurrency") or "USD"
+                xbrl["price_currency"] = info.get("currency") or "USD"
 
                 # Compute TTM from quarterly if available (more current than annual)
                 q_inc = t.quarterly_income_stmt
@@ -385,6 +531,26 @@ def get_ttm_financials(ticker: str, no_cache: bool = False) -> dict:
 
             # Marginal tax rate (Ch 10, p.250): 21% US post-TCJA
             xbrl.setdefault("marginal_tax_rate", 0.21)
+
+            # Currency conversion check (XBRL branch)
+            financial_curr = xbrl.get("financial_currency")
+            price_curr = xbrl.get("price_currency")
+
+            if financial_curr and price_curr and financial_curr != price_curr:
+                print(f"[financials] {ticker}: Currency mismatch detected - "
+                      f"financials in {financial_curr}, price in {price_curr}")
+
+                fx_rate = _get_fx_rate(financial_curr, price_curr)
+
+                if fx_rate is None:
+                    print(f"[financials] {ticker}: Cannot fetch FX rate {financial_curr}/{price_curr} - "
+                          "returning None (insufficient data)")
+                    return None  # Refuse to value rather than assume USD
+
+                print(f"[financials] {ticker}: Converting financials from {financial_curr} to {price_curr} "
+                      f"at spot rate {fx_rate:.6f}")
+                xbrl = _convert_financials_currency(xbrl, fx_rate, financial_curr, price_curr)
+
             return xbrl
     except Exception as e:
         print(f"[financials] SEC XBRL failed for {ticker}: {e}")
@@ -430,6 +596,9 @@ def get_ttm_financials(ticker: str, no_cache: bool = False) -> dict:
     total_debt = _safe_float(bs.get("totalDebt") or bs.get("longTermDebt", 0))
     cash = _safe_float(bs.get("cashAndCashEquivalents") or bs.get("cash", 0))
 
+    # Capture currency from FMP (reportedCurrency field)
+    reported_currency = inc.get("reportedCurrency") or "USD"
+
     result = {
         "revenue_ttm": _safe_float(inc.get("revenue")),
         "ebit_ttm": _safe_float(inc.get("operatingIncome")),
@@ -457,7 +626,37 @@ def get_ttm_financials(ticker: str, no_cache: bool = False) -> dict:
         "retention_5yr": retention_5yr,
         "capex_5yr": capex_5yr,
         "source": "fmp",
+        "financial_currency": reported_currency,
+        "price_currency": "USD",  # FMP typically normalizes to USD for US-listed stocks
     }
+
+    # Get actual price currency from yfinance to verify FMP assumption
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        yf_info = yf_ticker.info
+        actual_price_currency = yf_info.get("currency") or "USD"
+        result["price_currency"] = actual_price_currency
+    except Exception:
+        pass  # Keep FMP default if yfinance fails
+
+    # Currency conversion check
+    financial_curr = result.get("financial_currency")
+    price_curr = result.get("price_currency")
+
+    if financial_curr and price_curr and financial_curr != price_curr:
+        print(f"[financials] {ticker}: Currency mismatch detected - "
+              f"financials in {financial_curr}, price in {price_curr}")
+
+        fx_rate = _get_fx_rate(financial_curr, price_curr)
+
+        if fx_rate is None:
+            print(f"[financials] {ticker}: Cannot fetch FX rate {financial_curr}/{price_curr} - "
+                  "returning None (insufficient data)")
+            return None  # Refuse to value rather than assume USD
+
+        print(f"[financials] {ticker}: Converting financials from {financial_curr} to {price_curr} "
+              f"at spot rate {fx_rate:.6f}")
+        result = _convert_financials_currency(result, fx_rate, financial_curr, price_curr)
 
     return result
 

@@ -64,10 +64,23 @@ def run_valuation(
     print(f"\n[2/6] Fetching financial data...")
     try:
         financials = get_ttm_financials(ticker)
+        if financials is None:
+            error_msg = (f"Insufficient financial data for {ticker}. "
+                        "This typically means currency conversion was required but the FX rate "
+                        "could not be fetched, or the data source returned no usable data.")
+            print(f"      ERROR: {error_msg}")
+            results["errors"].append(error_msg)
+            return results
         results["financials"] = financials
         rev = financials.get("revenue_ttm", 0)
         ebit = financials.get("ebit_ttm", 0)
-        print(f"      Revenue: ${rev/1e9:.2f}B | EBIT: ${ebit/1e6:.0f}M | Source: {financials.get('source','?')}")
+        currency_note = ""
+        if financials.get("currency_converted_to"):
+            orig = financials.get("currency_original")
+            target = financials.get("currency_converted_to")
+            rate = financials.get("fx_rate_applied")
+            currency_note = f" (converted from {orig} at {rate:.4f})"
+        print(f"      Revenue: ${rev/1e9:.2f}B | EBIT: ${ebit/1e6:.0f}M | Source: {financials.get('source','?')}{currency_note}")
     except Exception as e:
         print(f"      ERROR: {e}")
         results["errors"].append(f"Financials fetch failed: {e}")

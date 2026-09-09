@@ -115,6 +115,20 @@ def _build_full_report(r: dict) -> str:
     lines.append("")
     lines.append("## 3. Company Fundamentals")
     lines.append("")
+
+    # Currency conversion disclosure
+    if financials.get("currency_converted_to"):
+        orig_curr = financials.get("currency_original")
+        target_curr = financials.get("currency_converted_to")
+        fx_rate = financials.get("fx_rate_applied")
+        fx_type = financials.get("fx_rate_type", "spot")
+        lines.append(f"> **Currency Conversion Applied:** Financials originally reported in {orig_curr} "
+                     f"have been converted to {target_curr} at a {fx_type} rate of {fx_rate:.6f} "
+                     f"({orig_curr}/{target_curr}). All monetary figures below reflect the converted values. "
+                     f"The spot rate is an approximation — period-end versus average rates would be more rigorous "
+                     f"but the approximation is vastly superior to the alternative of mixing currencies.")
+        lines.append("")
+
     rev = financials.get("revenue_ttm", 0)
     ebit = financials.get("ebit_ttm", 0)
     ebitda = financials.get("ebitda_ttm", 0)

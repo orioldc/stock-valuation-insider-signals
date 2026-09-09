@@ -154,6 +154,9 @@ def _fetch_stable_profile(ticker: str) -> dict | None:
             profile["book_value"] = info.get("bookValue") or 0
             profile["payout_ratio"] = info.get("payoutRatio") or 0.0
             profile["institutional_pct"] = info.get("heldPercentInstitutions") or 0.0
+            # Currency fields
+            profile["currency"] = info.get("currency") or "USD"
+            profile["financial_currency"] = info.get("financialCurrency") or "USD"
             yf_success = True
         else:
             raise ValueError(f"yfinance returned no data for {ticker}")
@@ -182,6 +185,9 @@ def _fetch_stable_profile(ticker: str) -> dict | None:
                         profile["book_value"] = info.get("bookValue") or 0
                         profile["payout_ratio"] = info.get("payoutRatio") or 0.0
                         profile["institutional_pct"] = info.get("heldPercentInstitutions") or 0.0
+                        # Currency fields
+                        profile["currency"] = info.get("currency") or "USD"
+                        profile["financial_currency"] = info.get("financialCurrency") or "USD"
                         profile["resolved_ticker"] = canonical_ticker  # record the substitution
                         yf_success = True
                     else:
@@ -207,6 +213,8 @@ def _fetch_stable_profile(ticker: str) -> dict | None:
                 profile.setdefault("book_value", 0)
                 profile.setdefault("payout_ratio", 0.0)
                 profile.setdefault("institutional_pct", 0.0)
+                profile.setdefault("currency", "USD")
+                profile.setdefault("financial_currency", "USD")
                 yf_success = True  # mark as successful so we don't return None
             else:
                 print(f"[company_profile] FMP also returned no data for {canonical_ticker or ticker}")

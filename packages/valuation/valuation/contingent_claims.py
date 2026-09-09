@@ -27,11 +27,20 @@ def run_contingent_claims(profile: dict, financials: dict) -> dict:
         distance_to_default, model_inputs, caveat, warnings
     """
     warnings_list = []
-    shares = profile.get("shares_outstanding") or financials.get("shares_outstanding", 1)
+    shares = profile.get("shares_outstanding") or financials.get("shares_outstanding")
     current_price = profile.get("current_price", 0)
     market_cap = profile.get("market_cap", 0)
     net_debt = financials.get("net_debt", 0)
     total_debt = financials.get("total_debt", 0)
+
+    if not shares or shares <= 0:
+        warnings_list.append("Shares outstanding not available — cannot compute per-share value.")
+        return {
+            "equity_value_per_share": None,
+            "current_price": round(current_price, 2),
+            "insufficient_data": True,
+            "warnings": warnings_list + ["Missing share count: per-share valuation unavailable."],
+        }
 
     # Firm value S = market cap + total debt (enterprise value)
     S = market_cap + total_debt

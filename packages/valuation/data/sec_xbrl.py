@@ -7,6 +7,7 @@ No API key needed. Requires SEC-compliant User-Agent.
 
 import json
 import os
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,9 @@ CACHE_TTL_DAYS = 7
 SEC_UA = "InsiderSignalTracker admin@fuertesito.dev"
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 XBRL_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+
+# Path to the tracker database (for CIK lookup when ticker not in SEC map)
+DB_PATH = Path(__file__).resolve().parents[2] / "tracker" / "db" / "insider_signals.db"
 
 # ── CIK Resolution ──────────────────────────────────────────────────────────
 
@@ -52,8 +56,32 @@ def _load_ticker_map() -> dict[str, str]:
 
 
 def ticker_to_cik(ticker: str) -> str | None:
+    """Resolve ticker to CIK, trying SEC map first then database lookup.
+
+    For tickers not in SEC's canonical map (e.g., stale ticker symbols like FI
+    for Fiserv which is now FISV), falls back to the tracker database CIK.
+    """
+    # Try SEC map first (canonical tickers)
     m = _load_ticker_map()
-    return m.get(ticker.upper())
+    cik = m.get(ticker.upper())
+    if cik:
+        return cik
+
+    # Fall back to database lookup (handles stale tickers)
+    if not DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT cik FROM companies WHERE ticker = ? AND cik IS NOT NULL", (ticker.upper(),))
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return str(row[0])
+    except Exception as e:
+        print(f"[sec_xbrl] Database CIK lookup failed for {ticker}: {e}")
+
+    return None
 
 
 # ── XBRL Fetch ──────────────────────────────────────────────────────────────
@@ -84,12 +112,19 @@ def _fetch_company_facts(cik: str, use_cache: bool = True) -> dict | None:
 
 # ── Value Extraction Helpers ─────────────────────────────────────────────────
 
-def _get_concept_values(facts: dict, concept: str, unit: str = "USD") -> list[dict]:
-    """Get all values for a XBRL concept, sorted by period end date descending."""
-    us_gaap = facts.get("facts", {}).get("us-gaap", {})
-    if concept not in us_gaap:
+def _get_concept_values(facts: dict, concept: str, unit: str = "USD", taxonomy: str = "us-gaap") -> list[dict]:
+    """Get all values for a XBRL concept, sorted by period end date descending.
+
+    Args:
+        facts: CompanyFacts JSON from SEC API
+        concept: XBRL concept name (e.g. "StockholdersEquity", "EntityCommonStockSharesOutstanding")
+        unit: Unit type (e.g. "USD", "shares")
+        taxonomy: Taxonomy namespace (e.g. "us-gaap", "dei")
+    """
+    taxonomy_data = facts.get("facts", {}).get(taxonomy, {})
+    if concept not in taxonomy_data:
         return []
-    units = us_gaap[concept].get("units", {})
+    units = taxonomy_data[concept].get("units", {})
     values = units.get(unit, [])
     # Filter to 10-K and 10-Q only, sort by end date descending
     values = [v for v in values if v.get("form") in ("10-K", "10-Q")]
@@ -97,14 +132,14 @@ def _get_concept_values(facts: dict, concept: str, unit: str = "USD") -> list[di
     return values
 
 
-def _latest_annual(facts: dict, concept: str, unit: str = "USD") -> tuple[float | None, str]:
+def _latest_annual(facts: dict, concept: str, unit: str = "USD", taxonomy: str = "us-gaap") -> tuple[float | None, str]:
     """Get the most recent 10-K value for a concept.
 
     Returns (value, end_date) tuple. end_date is used by _try_concepts to
     pick the concept with the most recent data when a company switched
     XBRL concept names (e.g. Revenues → RevenueFromContract...).
     """
-    values = _get_concept_values(facts, concept, unit)
+    values = _get_concept_values(facts, concept, unit, taxonomy)
     for v in values:
         if v.get("form") == "10-K":
             # Annual = full-year (start to end is ~12 months, or no start)
@@ -149,12 +184,12 @@ def _annual_series(facts: dict, concept: str, n_years: int = 5, unit: str = "USD
     return annuals
 
 
-def _latest_value(facts: dict, concept: str, unit: str = "USD") -> tuple[float | None, str]:
+def _latest_value(facts: dict, concept: str, unit: str = "USD", taxonomy: str = "us-gaap") -> tuple[float | None, str]:
     """Get the most recent value (10-K or 10-Q) for a concept.
 
     Returns (value, end_date) tuple.
     """
-    values = _get_concept_values(facts, concept, unit)
+    values = _get_concept_values(facts, concept, unit, taxonomy)
     if values:
         return float(values[0]["val"]), values[0].get("end", "")
     return None, ""
@@ -263,8 +298,11 @@ def get_xbrl_financials(ticker: str, use_cache: bool = True) -> dict | None:
 
     # Balance sheet
     total_assets = _try_concepts(["Assets"], annual=False)
+    # Equity: corporate stockholders equity first, then MLP partners' capital
+    # (can legitimately be negative for partnerships, so don't filter negatives)
     total_equity = _try_concepts([
         "StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        "PartnersCapital", "LimitedPartnersCapitalAccount",
     ], annual=False)
     total_debt = _try_concepts([
         "LongTermDebt", "LongTermDebtAndCapitalLeaseObligations",
@@ -276,13 +314,23 @@ def get_xbrl_financials(ticker: str, use_cache: bool = True) -> dict | None:
     ], annual=False)
     tangible_book = _try_concepts(["TangibleBookValue"], annual=False)
 
-    # Shares
+    # Tangible assets for replacement-cost asset valuation
+    ppe_net = _try_concepts(["PropertyPlantAndEquipmentNet"], annual=False)
+    oil_gas_full_cost = _try_concepts(["OilAndGasPropertyFullCostMethodNet"], annual=False)
+    oil_gas_successful_efforts = _try_concepts(["OilAndGasPropertySuccessfulEffortMethodNet"], annual=False)
+
+    # Shares: corporate common stock first, then MLP units from DEI taxonomy
     shares = _try_concepts(
-        ["CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding",
+        ["CommonStockSharesOutstanding",
          "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
          "WeightedAverageNumberOfDilutedSharesOutstanding"],
         annual=False, unit="shares"
     )
+    # MLP units from DEI taxonomy (for partnerships like NGL, DKL)
+    if shares == 0:
+        dei_units, _ = _latest_value(facts, "EntityCommonStockSharesOutstanding", unit="shares", taxonomy="dei")
+        if dei_units:
+            shares = dei_units
 
     # Capex & D&A
     capex = abs(_try_concepts([
@@ -391,6 +439,9 @@ def get_xbrl_financials(ticker: str, use_cache: bool = True) -> dict | None:
         "total_equity": total_equity,
         "total_assets": total_assets,
         "tangible_book_value": tangible_book,
+        "ppe_net": ppe_net,
+        "oil_gas_property_full_cost": oil_gas_full_cost,
+        "oil_gas_property_successful_efforts": oil_gas_successful_efforts,
         "forward_pe": 0.0,  # not available from XBRL
         "revenue_5yr": revenue_5yr,
         "ebit_5yr": ebit_5yr,

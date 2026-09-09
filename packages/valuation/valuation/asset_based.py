@@ -31,10 +31,19 @@ def run_asset_based(profile: dict, financials: dict, decision: dict = None) -> d
         (REITs also get: nav_per_share, estimated_cap_rate, noi)
     """
     warnings_list = []
-    shares = profile.get("shares_outstanding") or financials.get("shares_outstanding", 1)
+    shares = profile.get("shares_outstanding") or financials.get("shares_outstanding")
     current_price = profile.get("current_price", 0)
     market_cap = profile.get("market_cap", 0)
     net_debt = financials.get("net_debt", 0)
+
+    if not shares or shares <= 0:
+        warnings_list.append("Shares outstanding not available — cannot compute per-share values.")
+        return {
+            "book_value_per_share": None,
+            "liquidation_value_per_share": None,
+            "insufficient_data": True,
+            "warnings": warnings_list,
+        }
 
     # Check if REIT or BDC
     is_reit = (decision or {}).get("is_reit", False)
@@ -48,8 +57,12 @@ def run_asset_based(profile: dict, financials: dict, decision: dict = None) -> d
 
     # Book value approximation: market cap - net debt as proxy for equity book value
     # Better: use balance sheet equity from financials if available
-    equity_book = _estimate_equity_book(financials, market_cap, net_debt)
+    # For asset-heavy firms: use tangible assets (PP&E, oil-gas properties) as replacement-cost proxy
+    equity_book, tangible_asset_source = _estimate_equity_book(financials, market_cap, net_debt)
     book_per_share = equity_book / shares if shares > 0 else 0
+
+    # Check if we used tangible assets for the calculation (source field will be set)
+    used_tangible_assets = tangible_asset_source is not None
 
     # Price-to-Book
     pb = current_price / book_per_share if book_per_share > 0 else None
@@ -104,6 +117,29 @@ def run_asset_based(profile: dict, financials: dict, decision: dict = None) -> d
     if anchor > 0 and current_price > 0:
         upside_pct = (anchor - current_price) / current_price * 100
 
+    # Build method note with source field if tangible assets were used
+    if is_reit:
+        method_note = (
+            "REIT NAV valuation: NOI / market cap rate, minus net debt (Damodaran Ch 26). "
+            "NAV represents liquidation value of the property portfolio."
+        )
+    elif is_bdc:
+        method_note = (
+            "BDC NAV: reported book value per share (ASC 820 mark-to-market). "
+            "Loan portfolio is fair-valued quarterly; book value ≈ NAV."
+        )
+    elif used_tangible_assets:
+        method_note = (
+            f"Asset-based valuation using tangible assets ({tangible_asset_source}) as replacement-cost proxy. "
+            "NOTE: This is NOT a reserve-based NAV (PV-10 standardized measure unavailable in XBRL). "
+            "Replacement-cost proxy provides an asset floor for capital-intensive businesses."
+        )
+    else:
+        method_note = (
+            "Asset-based valuation using book value as primary anchor. "
+            "Liquidation value applies standard haircuts to balance sheet assets."
+        )
+
     result = {
         "book_value_per_share": round(book_per_share, 2),
         "liquidation_value_per_share": round(liquidation_per_share, 2),
@@ -111,16 +147,8 @@ def run_asset_based(profile: dict, financials: dict, decision: dict = None) -> d
         "equity_book_value": round(equity_book, 0),
         "upside_pct_to_book": round(upside_pct, 1),
         "replacement_note": replacement_note,
-        "method_note": (
-            "REIT NAV valuation: NOI / market cap rate, minus net debt (Damodaran Ch 26). "
-            "NAV represents liquidation value of the property portfolio."
-        ) if is_reit else (
-            "BDC NAV: reported book value per share (ASC 820 mark-to-market). "
-            "Loan portfolio is fair-valued quarterly; book value ≈ NAV."
-        ) if is_bdc else (
-            "Asset-based valuation using book value as primary anchor. "
-            "Liquidation value applies standard haircuts to balance sheet assets."
-        ),
+        "method_note": method_note,
+        "tangible_asset_source": tangible_asset_source,
         "warnings": warnings_list,
     }
 
@@ -141,22 +169,51 @@ def run_asset_based(profile: dict, financials: dict, decision: dict = None) -> d
     return result
 
 
-def _estimate_equity_book(financials: dict, market_cap: float, net_debt: float) -> float:
+def _estimate_equity_book(financials: dict, market_cap: float, net_debt: float) -> tuple[float, str | None]:
     """
     Estimate book value of equity.
-    Prefers explicit balance sheet data if available in financials dict,
-    otherwise approximates from market data.
+    For E&P companies: prefers oil-and-gas properties (E&P-specific tangible assets)
+    as a replacement-cost proxy over generic balance sheet equity.
+    For other companies: uses total_equity from balance sheet if available.
+
+    Returns: (equity_book_value, source_field_name)
     """
-    # If FMP provided total stockholders equity directly
+    # For E&P companies: prefer oil-and-gas properties (E&P-specific assets)
+    # over generic total_equity. Filers use either full-cost or successful-efforts method.
+    # This is the point of reading these fields: E&P value is driven by owned reserves.
+    oil_gas_full_cost = financials.get("oil_gas_property_full_cost", 0)
+    oil_gas_successful_efforts = financials.get("oil_gas_property_successful_efforts", 0)
+
+    # E&P companies file one method or the other, not both
+    if oil_gas_full_cost > 0:
+        tangible_assets = oil_gas_full_cost
+        source = "oil_gas_property_full_cost"
+        # Tangible assets minus net debt gives a replacement-cost equity proxy
+        # This is NOT a NAV (we can't value reserves without PV-10 data),
+        # but it provides a floor for E&P companies
+        return max(tangible_assets - net_debt, 0), source
+    elif oil_gas_successful_efforts > 0:
+        tangible_assets = oil_gas_successful_efforts
+        source = "oil_gas_property_successful_efforts"
+        return max(tangible_assets - net_debt, 0), source
+
+    # For non-E&P companies: prefer balance sheet equity if available
     if financials.get("total_equity"):
-        return float(financials["total_equity"])
-    # Fallback: book equity ≈ market cap / P/B  (circular but useful floor)
+        return float(financials["total_equity"]), None
+
+    # Fall back to generic PP&E for other industrials
+    ppe_net = financials.get("ppe_net", 0)
+    if ppe_net > 0:
+        # Tangible assets minus net debt gives a replacement-cost equity proxy
+        return max(ppe_net - net_debt, 0), "ppe_net"
+
+    # Final fallback: book equity ≈ market cap / P/B  (circular but useful floor)
     # Or: total assets - total liabilities ≈ (net_debt + equity) - net_debt = equity
     # Simple proxy: assume book equity = net income × 8 (8x earnings = rough 12.5% ROE)
     ni = financials.get("net_income_ttm", 0)
     if ni > 0:
-        return ni * 8  # rough proxy
-    return max(market_cap - net_debt, 0)
+        return ni * 8, None  # rough proxy
+    return max(market_cap - net_debt, 0), None
 
 
 def _compute_reit_nav(

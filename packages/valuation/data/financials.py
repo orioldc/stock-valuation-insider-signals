@@ -583,9 +583,10 @@ def compute_ffo(financials: dict) -> dict:
     maintenance_capex = min(capex, dna * 0.15) if capex > 0 else dna * 0.10
     affo = ffo - maintenance_capex
 
-    shares = financials.get("shares_outstanding", 0) or 1
-    ffo_per_share = ffo / shares if shares > 0 else 0
-    affo_per_share = affo / shares if shares > 0 else 0
+    shares = financials.get("shares_outstanding", 0)
+    # Don't compute per-share if shares are missing (return None instead of dividing by 1)
+    ffo_per_share = ffo / shares if shares and shares > 0 else None
+    affo_per_share = affo / shares if shares and shares > 0 else None
 
     return {
         "ffo": ffo,

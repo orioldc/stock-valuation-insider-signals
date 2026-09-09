@@ -182,6 +182,19 @@ def run_valuation(
         results["asset_result"] = asset_result
         results["contingent_result"] = contingent_result
 
+        # Check for router/model disagreement: decision tree routed to contingent_claims
+        # on distress grounds, but the model returns P(default) near zero
+        if primary == "contingent_claims" and contingent_result:
+            pod = contingent_result.get("probability_of_default", 0)
+            if pod < 0.05:  # Less than 5% default probability
+                warning_msg = (
+                    f"Router/model disagreement: Decision tree routed to contingent claims "
+                    f"(distress), but P(default) = {pod:.1%}. The distress routing may have been "
+                    f"triggered by temporary factors rather than structural distress."
+                )
+                results.setdefault("red_flags", []).append(warning_msg)
+                print(f"      ⚠️ {warning_msg}")
+
         # Damodaran Ch 12, p.319: Survival adjustment for distressed firms
         # Adjusted = DCF × (1 - P_distress) + Distressed_sale × P_distress
         # Ch 21: Do NOT apply to financial firms — their high leverage and
@@ -288,21 +301,43 @@ def _synthesize(
             values_and_weights.append((asset_result["nav_per_share"], 0.25))
     elif primary_method in ("dcf_fcff", "dcf_fcfe", "dcf_normalized"):
         if dcf_result and _pos(dcf_result.get("intrinsic_value_per_share")):
-            values_and_weights.append((dcf_result["intrinsic_value_per_share"], 0.60))
+            # Down-weight DCF when quality is compromised
+            dcf_quality_flag = dcf_result.get("dcf_quality_warning")
+            if dcf_quality_flag:
+                # Reduce from 0.60 to 0.30 when flagged for negative base FCF or excessive terminal value
+                dcf_weight = 0.30
+                rel_weight = 0.70  # Increase relative weight to compensate
+                print(f"      ⚠️ DCF quality flag '{dcf_quality_flag}' detected — reducing DCF weight: 0.60 → {dcf_weight}")
+            else:
+                dcf_weight = 0.60
+                rel_weight = 0.40
+            values_and_weights.append((dcf_result["intrinsic_value_per_share"], dcf_weight))
+        else:
+            rel_weight = 1.0  # If no DCF, relative gets full weight
         if relative_result and _pos(relative_result.get("composite_implied_price")):
-            values_and_weights.append((relative_result["composite_implied_price"], 0.40))
+            values_and_weights.append((relative_result["composite_implied_price"], rel_weight))
 
     elif primary_method == "relative":
         if relative_result and _pos(relative_result.get("composite_implied_price")):
             values_and_weights.append((relative_result["composite_implied_price"], 0.60))
         if dcf_result and _pos(dcf_result.get("intrinsic_value_per_share")):
-            values_and_weights.append((dcf_result["intrinsic_value_per_share"], 0.40))
+            # Down-weight DCF when quality is compromised (secondary position)
+            dcf_quality_flag = dcf_result.get("dcf_quality_warning")
+            dcf_weight = 0.20 if dcf_quality_flag else 0.40
+            if dcf_quality_flag:
+                print(f"      ⚠️ DCF quality flag '{dcf_quality_flag}' detected — reducing DCF weight: 0.40 → {dcf_weight}")
+            values_and_weights.append((dcf_result["intrinsic_value_per_share"], dcf_weight))
 
     elif primary_method == "asset_based":
         if asset_result and _pos(asset_result.get("book_value_per_share")):
             values_and_weights.append((asset_result["book_value_per_share"], 0.50))
         if dcf_result and _pos(dcf_result.get("intrinsic_value_per_share")):
-            values_and_weights.append((dcf_result["intrinsic_value_per_share"], 0.30))
+            # Down-weight DCF when quality is compromised (secondary position)
+            dcf_quality_flag = dcf_result.get("dcf_quality_warning")
+            dcf_weight = 0.15 if dcf_quality_flag else 0.30
+            if dcf_quality_flag:
+                print(f"      ⚠️ DCF quality flag '{dcf_quality_flag}' detected — reducing DCF weight: 0.30 → {dcf_weight}")
+            values_and_weights.append((dcf_result["intrinsic_value_per_share"], dcf_weight))
         if relative_result and _pos(relative_result.get("composite_implied_price")):
             values_and_weights.append((relative_result["composite_implied_price"], 0.20))
 
@@ -310,7 +345,12 @@ def _synthesize(
         if contingent_result and _pos(contingent_result.get("equity_value_per_share")):
             values_and_weights.append((contingent_result["equity_value_per_share"], 0.70))
         if dcf_result and _pos(dcf_result.get("intrinsic_value_per_share")):
-            values_and_weights.append((dcf_result["intrinsic_value_per_share"], 0.30))
+            # Down-weight DCF when quality is compromised (secondary position)
+            dcf_quality_flag = dcf_result.get("dcf_quality_warning")
+            dcf_weight = 0.15 if dcf_quality_flag else 0.30
+            if dcf_quality_flag:
+                print(f"      ⚠️ DCF quality flag '{dcf_quality_flag}' detected — reducing DCF weight: 0.30 → {dcf_weight}")
+            values_and_weights.append((dcf_result["intrinsic_value_per_share"], dcf_weight))
 
     if not values_and_weights:
         return {"weighted_value": 0, "upside_pct": 0, "verdict": "INSUFFICIENT DATA"}

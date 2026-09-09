@@ -22,9 +22,18 @@ def run_relative_valuation(
     sector = profile.get("sector", "")
     current_price = profile.get("current_price", 0)
     market_cap = profile.get("market_cap", 0)
-    shares = profile.get("shares_outstanding", 0) or financials.get("shares_outstanding", 1)
+    shares = profile.get("shares_outstanding", 0) or financials.get("shares_outstanding")
     net_debt = financials.get("net_debt", 0)
     warnings_list = []
+
+    if not shares or shares <= 0:
+        warnings_list.append("Shares outstanding not available — relative valuation cannot compute per-share values.")
+        return {
+            "multiples_used": [],
+            "composite_implied_price": None,
+            "insufficient_data": True,
+            "warnings": warnings_list,
+        }
 
     results = {
         "multiples_used": [],

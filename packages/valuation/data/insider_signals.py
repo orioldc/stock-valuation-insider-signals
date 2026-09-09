@@ -80,7 +80,7 @@ def get_signal_for_ticker(ticker: str, use_cache: bool = True) -> dict | None:
     Tries live SEC EDGAR fetch first, then falls back to frozen snapshot.
 
     Returns dict with:
-        ticker, in_universe, conviction_score, quality, cluster_detected,
+        ticker, in_universe, quality, cluster_detected,
         n_insiders, total_value, share_delta_4q, share_delta_qoq, share_trend,
         latest_transaction_date, insider_summary,
         source ("live_edgar" | "frozen_snapshot"),
@@ -88,6 +88,9 @@ def get_signal_for_ticker(ticker: str, use_cache: bool = True) -> dict | None:
         cluster_window_days (90),
         count_window_days (120)
     or None if ticker is not found.
+
+    Note: The deprecated 'conviction_score' field (if present in frozen data) is
+    removed, as the base-rate scorer has shipped.
     """
     ticker = ticker.upper()
 
@@ -119,6 +122,11 @@ def get_signal_for_ticker(ticker: str, use_cache: bool = True) -> dict | None:
                 entry["as_of"] = "unknown"
             entry["cluster_window_days"] = 90
             entry["count_window_days"] = 120  # Frozen file was built with 120-day count window
+
+            # Drop deprecated conviction_score field (base-rate scorer has shipped)
+            entry.pop("conviction_score", None)
+            entry.pop("conviction", None)  # handle both possible field names
+
             return entry
 
     return None

@@ -196,6 +196,23 @@ def _build_full_report(r: dict) -> str:
         lines.append(f"| **Intrinsic Value per Share** | **${dcf.get('intrinsic_value_per_share', 0):.2f}** | — |")
         lines.append("")
 
+        # DCF quality warnings (plain language with specific figures)
+        dcf_quality_flag = dcf.get("dcf_quality_warning")
+        if dcf_quality_flag == "negative_base_fcf":
+            base_fcf = dcf.get("base_fcf", 0)
+            fcf_label = "FCFF" if dcf["assumptions"].get("method") == "fcff" else "FCFE"
+            lines.append(f"> ⚠️ **DCF Quality Warning:** Base {fcf_label} is negative (${base_fcf/1e6:.2f}M). "
+                         f"The DCF is extrapolating from a cash outflow, so the result is not meaningful on its own. "
+                         f"This valuation should be heavily cross-checked against other methods.")
+            lines.append("")
+        elif dcf_quality_flag == "excessive_terminal_value":
+            terminal_pct = dcf.get("terminal_value_pct", 0)
+            lines.append(f"> ⚠️ **DCF Quality Warning:** Terminal value represents {terminal_pct:.0f}% of total value. "
+                         f"Most of the value sits in the terminal stub, so this number is primarily a long-run growth "
+                         f"assumption rather than a near-term cash-flow estimate. Treat as directional and verify "
+                         f"with sensitivity analysis.")
+            lines.append("")
+
         for w in dcf.get("warnings", []):
             lines.append(f"> ⚠️ {w}")
         if dcf.get("warnings"):

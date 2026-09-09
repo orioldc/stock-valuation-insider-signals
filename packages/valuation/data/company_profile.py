@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,49 @@ FMP_BASE = "https://financialmodelingprep.com"
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "company"
 CACHE_TTL_STABLE_DAYS = 7
 CACHE_TTL_VOLATILE_HOURS = 4
+
+# Path to the tracker database (for CIK lookup)
+DB_PATH = Path(__file__).resolve().parents[2] / "tracker" / "db" / "insider_signals.db"
+
+# SEC User-Agent (required for SEC API access; use requests not urllib to avoid cert issues on macOS)
+SEC_UA = "InsiderSignalTracker admin@fuertesito.dev"
+
+
+def _get_cik_from_db(ticker: str) -> int | None:
+    """Get CIK from the companies table in tracker database."""
+    if not DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT cik FROM companies WHERE ticker = ? AND cik IS NOT NULL", (ticker.upper(),))
+        row = cur.fetchone()
+        conn.close()
+        return int(row[0]) if row and row[0] else None
+    except Exception as e:
+        print(f"[company_profile] Failed to get CIK from DB for {ticker}: {e}")
+        return None
+
+
+def _get_canonical_ticker_from_sec(cik: int) -> str | None:
+    """Get canonical ticker from SEC's company_tickers.json given a CIK.
+
+    Uses requests (not urllib) to avoid macOS certificate verification issues.
+    """
+    try:
+        url = "https://www.sec.gov/files/company_tickers.json"
+        resp = requests.get(url, headers={"User-Agent": SEC_UA}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # SEC format: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "..."}, ...}
+        for entry in data.values():
+            if int(entry["cik_str"]) == cik:
+                return entry["ticker"]
+        return None
+    except Exception as e:
+        print(f"[company_profile] Failed to fetch SEC ticker map for CIK {cik}: {e}")
+        return None
 
 
 def _cache_path_stable(ticker: str) -> Path:
@@ -72,51 +116,122 @@ def _fmp_profile(ticker: str) -> dict:
     return {}
 
 
-def _fetch_stable_profile(ticker: str) -> dict:
+def _fetch_stable_profile(ticker: str) -> dict | None:
     """Fetch stable company fields (name, sector, etc.) from yfinance + FMP.
 
     These fields change rarely and are cached for 7 days.
-    """
-    profile = {"ticker": ticker}
 
+    Before giving up on a ticker, tries to resolve it via SEC's canonical ticker map:
+    1. Look up CIK from companies table
+    2. Get canonical ticker from SEC company_tickers.json
+    3. Retry yfinance with canonical ticker
+    4. Fall back to FMP if available
+    5. Return None if all sources fail (caller must handle)
+
+    Returns dict with ticker (original) and resolved_ticker (canonical if different).
+    """
+    original_ticker = ticker
+    profile = {"ticker": original_ticker}
+    canonical_ticker = None
+    yf_success = False
+
+    # Try yfinance with original ticker
     try:
         yf_ticker = yf.Ticker(ticker)
         info = yf_ticker.info
 
-        profile["name"] = info.get("longName") or info.get("shortName") or ticker
-        profile["sector"] = _normalize_sector(info.get("sector", ""), info.get("industry", ""))
-        profile["industry"] = info.get("industry", "")
-        profile["description"] = (info.get("longBusinessSummary") or "")[:500]
-        profile["country"] = info.get("country", "US")
-        profile["exchange"] = info.get("exchange", "")
-        profile["shares_outstanding"] = info.get("sharesOutstanding") or 0
-        profile["float_shares"] = info.get("floatShares") or 0
-        profile["beta"] = info.get("beta") or 1.0
-        profile["book_value"] = info.get("bookValue") or 0
-        profile["payout_ratio"] = info.get("payoutRatio") or 0.0
-        profile["institutional_pct"] = info.get("heldPercentInstitutions") or 0.0
+        # Check if yfinance returned real data (it returns empty dict or stub on failure)
+        if info and info.get("longName") or info.get("shortName"):
+            profile["name"] = info.get("longName") or info.get("shortName") or ticker
+            profile["sector"] = _normalize_sector(info.get("sector", ""), info.get("industry", ""))
+            profile["industry"] = info.get("industry", "")
+            profile["description"] = (info.get("longBusinessSummary") or "")[:500]
+            profile["country"] = info.get("country", "US")
+            profile["exchange"] = info.get("exchange", "")
+            profile["shares_outstanding"] = info.get("sharesOutstanding") or 0
+            profile["float_shares"] = info.get("floatShares") or 0
+            profile["beta"] = info.get("beta") or 1.0
+            profile["book_value"] = info.get("bookValue") or 0
+            profile["payout_ratio"] = info.get("payoutRatio") or 0.0
+            profile["institutional_pct"] = info.get("heldPercentInstitutions") or 0.0
+            yf_success = True
+        else:
+            raise ValueError(f"yfinance returned no data for {ticker}")
 
     except Exception as e:
-        print(f"[company_profile] yfinance failed for {ticker} (stable): {e}")
-        profile.setdefault("name", ticker)
-        profile.setdefault("sector", "Unknown")
-        profile.setdefault("industry", "")
-        profile.setdefault("shares_outstanding", 0)
-        profile.setdefault("beta", 1.0)
+        print(f"[company_profile] yfinance failed for {ticker}: {e}")
+        # Try to resolve via SEC canonical ticker before giving up
+        cik = _get_cik_from_db(ticker)
+        if cik:
+            canonical_ticker = _get_canonical_ticker_from_sec(cik)
+            if canonical_ticker and canonical_ticker != ticker:
+                print(f"[company_profile] Retrying with SEC canonical ticker: {ticker} → {canonical_ticker}")
+                try:
+                    yf_ticker = yf.Ticker(canonical_ticker)
+                    info = yf_ticker.info
+                    if info and (info.get("longName") or info.get("shortName")):
+                        profile["name"] = info.get("longName") or info.get("shortName") or canonical_ticker
+                        profile["sector"] = _normalize_sector(info.get("sector", ""), info.get("industry", ""))
+                        profile["industry"] = info.get("industry", "")
+                        profile["description"] = (info.get("longBusinessSummary") or "")[:500]
+                        profile["country"] = info.get("country", "US")
+                        profile["exchange"] = info.get("exchange", "")
+                        profile["shares_outstanding"] = info.get("sharesOutstanding") or 0
+                        profile["float_shares"] = info.get("floatShares") or 0
+                        profile["beta"] = info.get("beta") or 1.0
+                        profile["book_value"] = info.get("bookValue") or 0
+                        profile["payout_ratio"] = info.get("payoutRatio") or 0.0
+                        profile["institutional_pct"] = info.get("heldPercentInstitutions") or 0.0
+                        profile["resolved_ticker"] = canonical_ticker  # record the substitution
+                        yf_success = True
+                    else:
+                        raise ValueError(f"yfinance returned no data for canonical {canonical_ticker}")
+                except Exception as e2:
+                    print(f"[company_profile] yfinance also failed for canonical ticker {canonical_ticker}: {e2}")
 
-    # Supplement with FMP for missing fields
-    try:
-        fmp = _fmp_profile(ticker)
-        if fmp:
-            if not profile.get("beta") or profile["beta"] == 1.0:
-                profile["beta"] = fmp.get("beta") or profile["beta"]
-            if not profile.get("description"):
-                profile["description"] = (fmp.get("description") or "")[:500]
-            if profile.get("sector") == "Unknown" and fmp.get("sector"):
-                profile["sector"] = _normalize_sector(fmp["sector"])
+    # If yfinance failed, try FMP as primary source (not just supplement)
+    if not yf_success:
+        try:
+            fmp = _fmp_profile(canonical_ticker or ticker)
+            if fmp and fmp.get("companyName"):
+                profile["name"] = fmp["companyName"]
+                profile["sector"] = _normalize_sector(fmp.get("sector", ""))
                 profile["industry"] = fmp.get("industry", "")
-    except Exception:
-        pass
+                profile["description"] = (fmp.get("description") or "")[:500]
+                profile["country"] = fmp.get("country", "US")
+                profile["exchange"] = fmp.get("exchangeShortName", "")
+                profile["beta"] = fmp.get("beta") or 1.0
+                # FMP doesn't have shares_outstanding in profile endpoint, set to 0
+                profile.setdefault("shares_outstanding", 0)
+                profile.setdefault("float_shares", 0)
+                profile.setdefault("book_value", 0)
+                profile.setdefault("payout_ratio", 0.0)
+                profile.setdefault("institutional_pct", 0.0)
+                yf_success = True  # mark as successful so we don't return None
+            else:
+                print(f"[company_profile] FMP also returned no data for {canonical_ticker or ticker}")
+        except Exception as e:
+            print(f"[company_profile] FMP fallback failed for {canonical_ticker or ticker}: {e}")
+
+    # If all sources failed, return None (caller must handle)
+    if not yf_success:
+        print(f"[company_profile] All data sources failed for {ticker}")
+        return None
+
+    # Supplement with FMP for missing fields (when yfinance succeeded)
+    if yf_success and profile.get("name") != ticker:
+        try:
+            fmp = _fmp_profile(canonical_ticker or ticker)
+            if fmp:
+                if not profile.get("beta") or profile["beta"] == 1.0:
+                    profile["beta"] = fmp.get("beta") or profile["beta"]
+                if not profile.get("description"):
+                    profile["description"] = (fmp.get("description") or "")[:500]
+                if profile.get("sector") == "Unknown" and fmp.get("sector"):
+                    profile["sector"] = _normalize_sector(fmp["sector"])
+                    profile["industry"] = fmp.get("industry", "")
+        except Exception:
+            pass
 
     return profile
 
@@ -218,9 +333,18 @@ def get_profile(ticker: str, use_cache: bool = True) -> dict:
         stable = json.loads(stable_cache.read_text())
     else:
         stable = _fetch_stable_profile(ticker)
+        if stable is None:
+            # All data sources failed — return None to signal lookup failure
+            return None
         stable_cache.write_text(json.dumps(stable, indent=2))
 
+    # Determine which ticker to use for volatile fetch (resolved or original)
+    fetch_ticker = stable.get("resolved_ticker", ticker)
+
     # Try volatile cache first (4-hour TTL)
+    # Cache by the fetch ticker (canonical) so price data is consistent
+    volatile_cache_key = fetch_ticker if fetch_ticker != ticker else ticker
+    volatile_cache = _cache_path_volatile(volatile_cache_key)
     volatile_ttl = CACHE_TTL_VOLATILE_HOURS * 3600
     volatile = None
     if use_cache and not _is_stale(volatile_cache, volatile_ttl):
@@ -229,15 +353,15 @@ def get_profile(ticker: str, use_cache: bool = True) -> dict:
     # If volatile stale or missing, fetch fresh with fallback
     if volatile is None:
         try:
-            volatile = _fetch_volatile_profile(ticker)
+            volatile = _fetch_volatile_profile(fetch_ticker)
             volatile_cache.write_text(json.dumps(volatile, indent=2))
         except Exception as e:
             # Fallback to stale cache if available
             if volatile_cache.exists():
-                print(f"[company_profile] Fresh price fetch failed for {ticker}, using cached data: {e}")
+                print(f"[company_profile] Fresh price fetch failed for {fetch_ticker}, using cached data: {e}")
                 volatile = json.loads(volatile_cache.read_text())
             else:
-                print(f"[company_profile] Fresh price fetch failed for {ticker}, no cache available: {e}")
+                print(f"[company_profile] Fresh price fetch failed for {fetch_ticker}, no cache available: {e}")
                 volatile = {
                     "current_price": 0,
                     "price_date": None,
@@ -255,6 +379,28 @@ def get_profile(ticker: str, use_cache: bool = True) -> dict:
 
     # Merge stable and volatile
     profile = {**stable, **volatile}
+
+    # For MLPs and partnerships, yfinance often returns 0 shares but has XBRL unit counts
+    # Get shares from XBRL if yfinance doesn't have them
+    if (not profile.get("shares_outstanding") or profile["shares_outstanding"] == 0):
+        try:
+            from data.sec_xbrl import get_xbrl_financials
+            xbrl = get_xbrl_financials(fetch_ticker, use_cache=use_cache)
+            if xbrl and xbrl.get("shares_outstanding"):
+                profile["shares_outstanding"] = xbrl["shares_outstanding"]
+                profile["shares_source"] = "xbrl"
+        except Exception as e:
+            print(f"[company_profile] XBRL shares lookup failed for {fetch_ticker}: {e}")
+
+    # Derive market cap from price × shares when vendor doesn't provide it
+    # (e.g., MLPs like NGL have price but no marketCap field in yfinance)
+    if (not profile.get("market_cap") or profile["market_cap"] == 0):
+        price = profile.get("current_price", 0)
+        shares = profile.get("shares_outstanding", 0)
+        # Only derive when both inputs are genuinely present (no default fallbacks)
+        if price and price > 0 and shares and shares > 0:
+            profile["market_cap"] = price * shares
+            profile["market_cap_derived"] = True
 
     # Add derived fields
     profile["market_cap_label"] = _mcap_label(profile.get("market_cap", 0))

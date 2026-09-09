@@ -35,11 +35,15 @@ FINANCIAL_KEYWORDS = ["bank", "insurance", "financial", "brokerage", "asset mana
 BDC_KEYWORDS = ["business development company"]
 ASSET_HEAVY_SECTORS = {"Real Estate", "Energy", "Basic Materials"}
 ASSET_HEAVY_KEYWORDS = ["reit", "oil", "gas", "mining", "mineral", "gold", "silver", "coal"]
+# Midstream/pipeline MLPs are fee-based toll businesses, not asset-heavy in the reserve sense
+# Include refining & marketing as they operate pipelines/terminals (e.g., DKL)
+MIDSTREAM_KEYWORDS = ["midstream", "pipeline", "gathering", "processing", "storage", "terminal", "mlp", "refining & marketing", "logistics partners"]
 CYCLICAL_SECTORS = {"Basic Materials", "Industrials", "Consumer Cyclical", "Energy"}
 
 # Distress thresholds (from dcf_formulas.md)
-DISTRESS_ND_EBITDA = 4.0      # net debt / EBITDA
-DISTRESS_INTEREST_COVER = 1.5  # EBIT / interest expense
+DISTRESS_ND_EBITDA = 5.0      # net debt / EBITDA (extreme leverage)
+DISTRESS_INTEREST_COVER = 1.5  # EBIT / interest expense (cannot service debt)
+DISTRESS_COMBINED_COVER = 3.0  # when leverage is extreme, this coverage level signals distress
 
 
 def classify_company(profile: dict, financials: dict) -> dict:
@@ -78,11 +82,12 @@ def classify_company(profile: dict, financials: dict) -> dict:
     notes = []
 
     # ── Derived flags ────────────────────────────────────────────────────────
+    description = profile.get("description", "").lower()
     is_financial = _is_financial(sector, industry)
-    is_asset_heavy = _is_asset_heavy(sector, industry)
+    is_asset_heavy = _is_asset_heavy(sector, industry, description)
     is_cyclical = sector in CYCLICAL_SECTORS
     is_reit = "real estate" in sector.lower() or "reit" in industry
-    is_bdc = any(k in profile.get("description", "").lower() for k in BDC_KEYWORDS)
+    is_bdc = any(k in description for k in BDC_KEYWORDS)
 
     has_revenue = revenue > 1_000_000  # > $1M revenue threshold
     has_positive_ebit = ebit > 0
@@ -107,8 +112,13 @@ def classify_company(profile: dict, financials: dict) -> dict:
     )
     # Ch 21: Financial firms are structurally leveraged (debt is raw material).
     # ND/EBITDA and EBIT/Interest are meaningless for banks/BDCs — skip distress check.
+    # Distress is the inability to SERVICE debt, not merely the presence of debt.
+    # Two distress paths:
+    # 1. Cannot service debt regardless of leverage (coverage < 1.5x)
+    # 2. Extreme leverage (>5.0x) with thin coverage (<3.0x)
     distress_risk = (not is_financial) and (not is_bdc) and has_meaningful_debt and (
-        (nd_ebitda > DISTRESS_ND_EBITDA) or (interest_cover < DISTRESS_INTEREST_COVER)
+        (interest_cover < DISTRESS_INTEREST_COVER) or
+        (nd_ebitda > DISTRESS_ND_EBITDA and interest_cover < DISTRESS_COMBINED_COVER)
     )
 
     # Override distress flag for companies in a temporary earnings trough:
@@ -138,10 +148,11 @@ def classify_company(profile: dict, financials: dict) -> dict:
             )
 
     if distress_risk:
-        if nd_ebitda > DISTRESS_ND_EBITDA:
-            notes.append(f"High leverage: Net Debt/EBITDA = {nd_ebitda:.1f}x (threshold: {DISTRESS_ND_EBITDA}x)")
         if interest_cover < DISTRESS_INTEREST_COVER:
-            notes.append(f"Low interest coverage: EBIT/Interest = {interest_cover:.1f}x (threshold: {DISTRESS_INTEREST_COVER}x)")
+            notes.append(f"Cannot service debt: EBIT/Interest = {interest_cover:.1f}x (threshold: {DISTRESS_INTEREST_COVER}x)")
+        elif nd_ebitda > DISTRESS_ND_EBITDA and interest_cover < DISTRESS_COMBINED_COVER:
+            notes.append(f"Extreme leverage + thin coverage: ND/EBITDA = {nd_ebitda:.1f}x (threshold: {DISTRESS_ND_EBITDA}x), "
+                       f"coverage = {interest_cover:.1f}x (threshold: {DISTRESS_COMBINED_COVER}x)")
 
     # Normalization required for cyclical companies with sufficient history
     normalization_required = (
@@ -223,7 +234,11 @@ def classify_company(profile: dict, financials: dict) -> dict:
 
     # PRIORITY 3: Asset-heavy — separable, marketable assets
     if is_asset_heavy and not is_reit:
-        secondary = ["dcf_fcff"] if has_positive_ebit else ["relative"]
+        # Give asset-heavy names both DCF and relative as secondary where inputs allow
+        secondary = []
+        if has_positive_ebit:
+            secondary.append("dcf_fcff")
+        secondary.append("relative")  # always include relative for cross-check
         return _result(
             primary="asset_based",
             secondary=secondary,
@@ -236,7 +251,7 @@ def classify_company(profile: dict, financials: dict) -> dict:
             rationale=(
                 f"Asset-heavy sector ({sector}): firm value driven by owned assets "
                 "(reserves, properties, commodities). Asset-based valuation is primary. "
-                "DCF used as secondary if positive earnings exist."
+                "DCF and relative valuation used as cross-checks."
             ),
             notes=notes,
         )
@@ -271,6 +286,10 @@ def classify_company(profile: dict, financials: dict) -> dict:
 
     # PRIORITY 5: Distress (non-financial, non-asset-heavy)
     if distress_risk:
+        # NOTE: Router/model contradiction detection
+        # The orchestrator should warn if this distress routing produces P(default) ≈ 0%,
+        # as that indicates the router was wrong. Currently silent.
+        # Requires orchestrator access to both routing decision and model output.
         secondary = ["dcf_fcff"] if has_positive_ebit else []
         return _result(
             primary="contingent_claims",
@@ -445,10 +464,30 @@ def _is_financial(sector: str, industry: str) -> bool:
            any(k in industry for k in FINANCIAL_KEYWORDS)
 
 
-def _is_asset_heavy(sector: str, industry: str) -> bool:
+def _is_asset_heavy(sector: str, industry: str, description: str = "") -> bool:
+    # Exclude midstream/pipeline — they're fee-based toll businesses, not reserve plays
+    # Only exclude if midstream is the PRIMARY business (industry contains midstream keywords,
+    # OR description starts with midstream activities as the main business)
+    industry_lower = industry.lower()
+
+    # Check if industry itself is midstream/pipeline (primary business)
+    if any(k in industry_lower for k in ["midstream", "pipeline", "refining & marketing", "logistics"]):
+        return False
+
+    # Check if description indicates PRIMARY midstream business
+    # (e.g., "provides pipeline services", "operates gathering systems")
+    # Exclude phrases that indicate a segment (e.g., "operates through...segments...Midstream")
+    desc_words = description.split()
+    for i, word in enumerate(desc_words):
+        if word in ["provides", "operates", "owns"] and i + 1 < len(desc_words):
+            # Check if next 3-4 words contain midstream keywords
+            next_words = " ".join(desc_words[i+1:i+5])
+            if any(k in next_words for k in ["pipeline", "gathering", "storage", "terminal", "logistics"]):
+                return False
+
     if sector in ASSET_HEAVY_SECTORS:
         return True
-    return any(k in industry for k in ASSET_HEAVY_KEYWORDS)
+    return any(k in industry_lower for k in ASSET_HEAVY_KEYWORDS)
 
 
 def _result(

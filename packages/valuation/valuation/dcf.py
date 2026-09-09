@@ -156,7 +156,10 @@ def run_dcf(
         base_fcf = compute_fcfe(financials)
         discount_rate = ke
 
+    # Flag for DCF quality: negative base FCF makes projection unreliable
+    dcf_quality_warning = None
     if base_fcf <= 0:
+        dcf_quality_warning = "negative_base_fcf"
         warnings_list.append(
             f"Base {'FCFF' if method == 'fcff' else 'FCFE/Dividends'} is negative (${base_fcf:,.0f}). "
             "DCF reliability is low — treat result as directional only."
@@ -235,6 +238,8 @@ def run_dcf(
     terminal_pct = pv_terminal / total_ev * 100 if total_ev > 0 else 0
 
     if terminal_pct > 80:
+        if not dcf_quality_warning:
+            dcf_quality_warning = "excessive_terminal_value"
         warnings_list.append(
             f"WARNING: {terminal_pct:.0f}% of firm value is in the terminal value. "
             "This DCF is highly sensitive to long-run growth and discount rate assumptions. "
@@ -248,10 +253,18 @@ def run_dcf(
     else:
         equity_value = total_ev  # FCFE already equity-level
 
-    shares = profile.get("shares_outstanding") or financials.get("shares_outstanding") or 1
-    if shares <= 0:
-        shares = 1
-        warnings_list.append("Shares outstanding not found — using 1 share (equity value not per-share).")
+    shares = profile.get("shares_outstanding") or financials.get("shares_outstanding")
+    if not shares or shares <= 0:
+        warnings_list.append("Shares outstanding not available — cannot compute per-share value.")
+        return {
+            "intrinsic_value_per_share": None,
+            "current_price": round(current_price, 2),
+            "upside_pct": None,
+            "margin_of_safety": None,
+            "equity_value": round(equity_value, 0),
+            "insufficient_data": True,
+            "warnings": warnings_list + ["Missing share count: per-share valuation unavailable."],
+        }
 
     intrinsic_per_share = equity_value / shares
     current_price = profile.get("current_price", 0)
@@ -288,6 +301,7 @@ def run_dcf(
         "equity_value": round(equity_value, 0),
         "shares": int(shares),
         "terminal_value_pct": round(terminal_pct, 1),
+        "dcf_quality_warning": dcf_quality_warning,
         "projections": projections,
         "sensitivity_table": sensitivity,
         "wacc_components": wacc_result,

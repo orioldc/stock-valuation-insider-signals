@@ -314,6 +314,15 @@ def get_xbrl_financials(ticker: str, use_cache: bool = True) -> dict | None:
     ], annual=False)
     tangible_book = _try_concepts(["TangibleBookValue"], annual=False)
 
+    # Minority interest (noncontrolling interest) — balance sheet item
+    # For companies with consolidated subsidiaries they don't fully own.
+    # Returns 0 if concept not found (company has no minority interest).
+    minority_interest = _try_concepts([
+        "MinorityInterest",
+        "MinorityInterestInNetAssets",
+        "PartnersCapitalAttributableToNoncontrollingInterest",
+    ], annual=False)
+
     # Tangible assets for replacement-cost asset valuation
     ppe_net = _try_concepts(["PropertyPlantAndEquipmentNet"], annual=False)
     oil_gas_full_cost = _try_concepts(["OilAndGasPropertyFullCostMethodNet"], annual=False)
@@ -435,6 +444,7 @@ def get_xbrl_financials(ticker: str, use_cache: bool = True) -> dict | None:
         "total_debt": total_debt,
         "cash": cash,
         "net_debt": total_debt - cash,
+        "minority_interest": minority_interest,
         "shares_outstanding": shares,
         "total_equity": total_equity,
         "total_assets": total_assets,

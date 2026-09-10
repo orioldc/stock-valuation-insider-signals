@@ -48,6 +48,7 @@ def run_relative_valuation(
         "justified_pe": None,
         "justified_ev_ebitda": None,
         "warnings": warnings_list,
+        "sector_source": f"{sector} (Damodaran sector aggregates)",
     }
 
     implied_prices = []
@@ -70,15 +71,27 @@ def run_relative_valuation(
 
         if sector_ev_ebitda and sector_ev_ebitda > 0:
             implied_ev = sector_ev_ebitda * ebitda
-            implied_price = _ev_to_equity_price(implied_ev, net_debt, shares)
+            implied_equity_value = implied_ev - net_debt
+            implied_price = implied_equity_value / shares if shares > 0 else 0.0
             results["ev_ebitda_implied"] = round(implied_price, 2)
             implied_prices.append(implied_price)
             results["multiples_used"].append("EV/EBITDA")
+
+            # Check for leverage amplification (residual equity is small fraction of EV)
+            residual_equity_pct = (implied_equity_value / implied_ev * 100) if implied_ev > 0 else 0
+            leverage_flag = None
+            if residual_equity_pct < 20 and implied_ev > 0:
+                leverage_flag = f"⚠️ High leverage: residual equity is only {residual_equity_pct:.0f}% of implied EV. Small changes in the multiple or net debt produce large swings in equity value."
+
             results["vs_sector"]["EV/EBITDA"] = {
                 "company_value": round(company_ev_ebitda, 2) if company_ev_ebitda else None,
                 "sector_avg": round(sector_ev_ebitda, 2),
+                "implied_ev": round(implied_ev, 0),
+                "net_debt_deducted": round(net_debt, 0),
+                "implied_equity_value": round(implied_equity_value, 0),
                 "implied_price": round(implied_price, 2),
                 "premium_pct": round((company_ev_ebitda / sector_ev_ebitda - 1) * 100, 1) if company_ev_ebitda else None,
+                "leverage_flag": leverage_flag,
             }
 
             # Justified EV/EBITDA (Ch 17, p.461):
@@ -261,15 +274,27 @@ def run_relative_valuation(
 
         if sector_ev_sales and sector_ev_sales > 0:
             implied_ev = sector_ev_sales * revenue
-            implied_price = _ev_to_equity_price(implied_ev, net_debt, shares)
+            implied_equity_value = implied_ev - net_debt
+            implied_price = implied_equity_value / shares if shares > 0 else 0.0
             results["ev_sales_implied"] = round(implied_price, 2)
             implied_prices.append(implied_price)
             results["multiples_used"].append("EV/Sales")
+
+            # Check for leverage amplification
+            residual_equity_pct = (implied_equity_value / implied_ev * 100) if implied_ev > 0 else 0
+            leverage_flag = None
+            if residual_equity_pct < 20 and implied_ev > 0:
+                leverage_flag = f"⚠️ High leverage: residual equity is only {residual_equity_pct:.0f}% of implied EV. Small changes in the multiple or net debt produce large swings in equity value."
+
             results["vs_sector"]["EV/Sales"] = {
                 "company_value": round(company_ev_sales, 2) if company_ev_sales else None,
                 "sector_avg": round(sector_ev_sales, 2),
+                "implied_ev": round(implied_ev, 0),
+                "net_debt_deducted": round(net_debt, 0),
+                "implied_equity_value": round(implied_equity_value, 0),
                 "implied_price": round(implied_price, 2),
                 "premium_pct": round((company_ev_sales / sector_ev_sales - 1) * 100, 1) if company_ev_sales else None,
+                "leverage_flag": leverage_flag,
             }
 
     # 4. P/B — primary for financial firms (Ch 21, p.601: P/B and P/E are
@@ -309,15 +334,27 @@ def run_relative_valuation(
             ev_ebit_sector = sector_ev_ebitda / max(ebitda_ebit_ratio, 0.5)
             company_ev_ebit = ev / ebit if ebit > 0 else None
             implied_ev = ev_ebit_sector * ebit
-            implied_price = _ev_to_equity_price(implied_ev, net_debt, shares)
+            implied_equity_value = implied_ev - net_debt
+            implied_price = implied_equity_value / shares if shares > 0 else 0.0
             results["ev_ebit_implied"] = round(implied_price, 2)
             implied_prices.append(implied_price)
             results["multiples_used"].append("EV/EBIT")
+
+            # Check for leverage amplification
+            residual_equity_pct = (implied_equity_value / implied_ev * 100) if implied_ev > 0 else 0
+            leverage_flag = None
+            if residual_equity_pct < 20 and implied_ev > 0:
+                leverage_flag = f"⚠️ High leverage: residual equity is only {residual_equity_pct:.0f}% of implied EV."
+
             results["vs_sector"]["EV/EBIT"] = {
                 "company_value": round(company_ev_ebit, 2) if company_ev_ebit else None,
                 "sector_avg": round(ev_ebit_sector, 2),
+                "implied_ev": round(implied_ev, 0),
+                "net_debt_deducted": round(net_debt, 0),
+                "implied_equity_value": round(implied_equity_value, 0),
                 "implied_price": round(implied_price, 2),
                 "premium_pct": None,
+                "leverage_flag": leverage_flag,
             }
 
     # Composite: equal-weighted average of valid implied prices

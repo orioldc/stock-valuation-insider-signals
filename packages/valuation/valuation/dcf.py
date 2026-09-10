@@ -247,11 +247,28 @@ def run_dcf(
         )
 
     # ── 6. Bridge to equity value ─────────────────────────────────────────────
+    # Damodaran Ch 12, p.314: Equity Value = Enterprise Value - Net Debt - Minority Interest
+    # Minority interest represents the equity claim of non-controlling shareholders
+    # in consolidated subsidiaries. Must be subtracted to get parent company equity.
     if method == "fcff":
         net_debt = financials.get("net_debt", 0)
-        equity_value = total_ev - net_debt
+        minority_interest = financials.get("minority_interest")
+
+        # Record whether minority interest was present, absent, or zero
+        # (absent means the company doesn't report it; zero means they report but have none)
+        if minority_interest is None:
+            minority_interest_status = "not_reported"
+            minority_interest = 0  # treat as zero for calculation
+        elif minority_interest == 0:
+            minority_interest_status = "reported_as_zero"
+        else:
+            minority_interest_status = "present"
+
+        equity_value = total_ev - net_debt - minority_interest
     else:
         equity_value = total_ev  # FCFE already equity-level
+        minority_interest = 0
+        minority_interest_status = "not_applicable_fcfe"
 
     shares = profile.get("shares_outstanding") or financials.get("shares_outstanding")
     if not shares or shares <= 0:
@@ -298,6 +315,8 @@ def run_dcf(
         "pv_terminal_value": round(pv_terminal, 0),
         "total_ev": round(total_ev, 0),
         "net_debt": round(financials.get("net_debt", 0), 0),
+        "minority_interest": round(minority_interest, 0),
+        "minority_interest_status": minority_interest_status,
         "equity_value": round(equity_value, 0),
         "shares": int(shares),
         "terminal_value_pct": round(terminal_pct, 1),
@@ -367,7 +386,14 @@ def _estimate_wacc(profile: dict, financials: dict, sector_data: dict) -> dict:
     # Note: Damodaran Ch 12, p.311 says stable period betas should be 0.8-1.2.
     # Our model uses a single discount rate; ideally terminal value would use
     # a lower beta for mature firms. For now, cap extreme betas as a sanity check.
-    beta_r = max(0.5, min(beta_r, 3.0))
+    beta_raw = beta_r  # Store pre-clamp value
+    beta_clamped = False
+    if beta_r < 0.5:
+        beta_r = 0.5
+        beta_clamped = True
+    elif beta_r > 3.0:
+        beta_r = 3.0
+        beta_clamped = True
 
     # Small-cap premium for companies < $2B
     size_premium = 0.025 if 0 < market_cap < 2e9 else 0.0
@@ -465,6 +491,8 @@ def _estimate_wacc(profile: dict, financials: dict, sector_data: dict) -> dict:
         "kd_pretax": kd_pretax,
         "beta_unlevered": beta_u,
         "beta_relevered": beta_r,
+        "beta_raw": round(beta_raw, 3),
+        "beta_clamped": beta_clamped,
         "size_premium": size_premium,
         "w_equity": w_e,
         "w_debt": w_d,

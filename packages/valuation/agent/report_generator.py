@@ -164,12 +164,33 @@ def _build_full_report(r: dict) -> str:
         lines.append("### 4.1 WACC / Cost of Capital")
         lines.append("")
         wc = dcf.get("wacc_components", {})
+
+        # Beta provenance: show unlevering source, relevering walk, and clamp
+        beta_u = dcf['assumptions'].get('beta_unlevered', 1.0)
+        beta_r = dcf.get('beta_relevered', 1.0)
+        d_e = wc.get('d_e_ratio', 0)
+
+        lines.append("**Beta Calculation:**")
+        lines.append("")
+        lines.append(f"- Unlevered Beta (sector): {beta_u:.3f} ({sector} sector, Damodaran)")
+        lines.append(f"- Debt/Equity ratio: {d_e:.2f}x")
+        lines.append(f"- Tax rate: {dcf['assumptions'].get('tax_rate_effective', 0.21):.1%}")
+        lines.append(f"- Relevered Beta: {beta_r:.3f}")
+
+        # Check for clamping
+        if beta_r == 0.5:
+            lines.append(f"  - ⚠️ **Clamped at floor (0.5)** — raw calculation was lower")
+        elif beta_r == 3.0:
+            lines.append(f"  - ⚠️ **Clamped at ceiling (3.0)** — raw calculation was higher")
+        lines.append("")
+
+        lines.append("**Cost of Capital:**")
+        lines.append("")
         lines.append("| Component | Value | Notes |")
         lines.append("|-----------|-------|-------|")
         lines.append(f"| Risk-Free Rate (10yr Treasury) | {dcf['assumptions'].get('rf', 0):.2%} | Live as of {date} |")
         lines.append(f"| Equity Risk Premium | {dcf['assumptions'].get('erp', 0):.2%} | Damodaran implied ERP |")
-        lines.append(f"| Unlevered Beta (sector) | {dcf['assumptions'].get('beta_unlevered', 1.0):.3f} | {sector} sector |")
-        lines.append(f"| Relevered Beta | {dcf.get('beta_relevered', 'N/A')} | D/E = {wc.get('d_e_ratio', 0):.2f}x |")
+        lines.append(f"| Relevered Beta | {beta_r:.3f} | From calculation above |")
         lines.append(f"| Size Premium | {dcf['assumptions'].get('size_premium', 0):.2%} | {'Applied' if dcf['assumptions'].get('size_premium', 0) > 0 else 'None'} |")
         lines.append(f"| Cost of Equity (Ke) | {dcf.get('ke', 0):.2%} | CAPM |")
         lines.append(f"| Cost of Debt (after-tax, Kd) | {dcf.get('kd', 0):.2%} | |")
@@ -187,9 +208,94 @@ def _build_full_report(r: dict) -> str:
         lines.append(f"| Stage 2 | 6–10 | {dcf.get('stage2_growth', 0):.1%} | Linear decay to terminal |")
         lines.append(f"| Terminal | 10+ | {dcf.get('terminal_growth', 0):.1%} | Capped at RF rate |")
         lines.append("")
+        lines.append(f"**Growth Rationale:** {dcf.get('growth_rationale', 'N/A')}")
+        lines.append("")
+
+        # Base FCF derivation
+        lines.append("### 4.3 Base Free Cash Flow Derivation")
+        lines.append("")
+        base_fcf_used = dcf.get("base_fcf", 0)
+        ebit_ttm = financials.get("ebit_ttm", 0)
+        tax_rate = financials.get("tax_rate_effective", 0.21)
+        d_and_a = financials.get("d_and_a_ttm", 0)
+        capex = financials.get("capex_ttm", 0)
+        delta_wc = financials.get("delta_wc_ttm", 0)
+
+        # Calculate the trailing-year walk
+        tax_amount = ebit_ttm * tax_rate
+        nopat = ebit_ttm - tax_amount
+        after_da = nopat + d_and_a
+        after_capex = after_da - capex
+        trailing_fcf = after_capex - delta_wc
+
+        method_label = "FCFF" if dcf["assumptions"].get("method") == "fcff" else "FCFE"
+        normalization_applied = dcf["assumptions"].get("normalization_applied", False)
+
+        lines.append(f"**Method:** {method_label}")
+        lines.append("")
+        lines.append("| Component | Amount ($M) |")
+        lines.append("|-----------|-------------|")
+        lines.append(f"| EBIT (TTM) | ${ebit_ttm/1e6:,.1f} |")
+        lines.append(f"| Less: Tax @ {tax_rate:.1%} | (${tax_amount/1e6:,.1f}) |")
+        lines.append(f"| = NOPAT | ${nopat/1e6:,.1f} |")
+        lines.append(f"| Plus: D&A | ${d_and_a/1e6:,.1f} |")
+        lines.append(f"| Less: Capex | (${capex/1e6:,.1f}) |")
+        lines.append(f"| Less: Δ Working Capital | (${delta_wc/1e6:,.1f}) |")
+        lines.append(f"| = Trailing {method_label} | ${trailing_fcf/1e6:,.1f} |")
+
+        # If normalization was applied and the walk doesn't match base_fcf, show the adjustment
+        if normalization_applied and abs(trailing_fcf - base_fcf_used) > 1e6:
+            normalization_adjustment = base_fcf_used - trailing_fcf
+            lines.append(f"| Plus: Normalization Adjustment | ${normalization_adjustment/1e6:,.1f} |")
+            lines.append(f"| **= Base {method_label} (used in DCF)** | **${base_fcf_used/1e6:,.1f}** |")
+        else:
+            # Walk matches base FCF or normalization not applied
+            lines.append(f"| **= Base {method_label} (used in DCF)** | **${base_fcf_used/1e6:,.1f}** |")
+        lines.append("")
+
+        # Note explaining the derivation
+        if normalization_applied and abs(trailing_fcf - base_fcf_used) > 1e6:
+            lines.append("> **Note:** Normalization was applied to the trailing FCF to account for cyclical effects. "
+                         f"The DCF uses the normalized base FCF of ${base_fcf_used/1e6:,.1f}M, not the raw trailing figure.")
+        elif normalization_applied:
+            lines.append("> **Note:** Normalization was applied, but the normalized figure equals the trailing calculation.")
+        else:
+            lines.append("> **Note:** Base FCF is derived from trailing twelve months (TTM) data without normalization.")
+        lines.append("")
+
+        # Ten-year projection table
+        lines.append("### 4.4 Ten-Year Cash Flow Projection")
+        lines.append("")
+        projections = dcf.get("projections", [])
+        if projections:
+            lines.append("| Year | Stage | FCF ($M) | Discount Factor | Present Value ($M) |")
+            lines.append("|------|-------|----------|-----------------|-------------------|")
+            for proj in projections:
+                yr = proj["year"]
+                stage = proj["stage"]
+                fcf = proj["fcf"]
+                pv_factor = proj["pv_factor"]
+                pv = proj["pv"]
+                lines.append(f"| {yr} | {stage} | ${fcf/1e6:,.1f} | {pv_factor:.4f} | ${pv/1e6:,.1f} |")
+            lines.append("")
+
+            # Stage subtotals
+            pv1 = dcf.get("pv_fcf_stage1", 0)
+            pv2 = dcf.get("pv_fcf_stage2", 0)
+            pvtv = dcf.get("pv_terminal_value", 0)
+            lines.append("**Stage Subtotals:**")
+            lines.append("")
+            lines.append(f"- PV of Stage 1 FCFs (Years 1–5): **${pv1/1e6:,.1f}M**")
+            lines.append(f"- PV of Stage 2 FCFs (Years 6–10): **${pv2/1e6:,.1f}M**")
+            lines.append(f"- PV of Terminal Value: **${pvtv/1e6:,.1f}M**")
+            lines.append("")
 
         # Value breakdown
-        lines.append("### 4.3 Valuation Summary")
+        lines.append("### 4.5 Valuation Summary & EV-to-Equity Bridge")
+        lines.append("")
+
+        # Enterprise value composition
+        lines.append("**Enterprise Value Composition:**")
         lines.append("")
         lines.append("| | Amount | % of EV |")
         lines.append("|-|--------|---------|")
@@ -204,11 +310,52 @@ def _build_full_report(r: dict) -> str:
         lines.append(f"| PV of Stage 2 FCFs (yrs 6–10) | ${pv2/1e6:,.0f}M | {pct2:.0f}% |")
         lines.append(f"| PV of Terminal Value | ${pvtv/1e6:,.0f}M | {pcttv:.0f}% |")
         lines.append(f"| **Enterprise Value** | **${ev/1e6:,.0f}M** | 100% |")
-        lines.append(f"| Less: Net Debt | (${dcf.get('net_debt', 0)/1e6:,.0f}M) | — |")
-        lines.append(f"| Equity Value | ${dcf.get('equity_value', 0)/1e6:,.0f}M | — |")
-        lines.append(f"| Shares Outstanding | {dcf.get('shares', 0)/1e6:,.0f}M | — |")
-        lines.append(f"| **Intrinsic Value per Share** | **${dcf.get('intrinsic_value_per_share', 0):.2f}** | — |")
         lines.append("")
+
+        # EV to Equity Bridge
+        lines.append("**Bridge from Enterprise Value to Equity Value:**")
+        lines.append("")
+        equity_value = dcf.get("equity_value", 0)
+        net_debt = dcf.get("net_debt", 0)
+        minority_interest = financials.get("minority_interest")
+        shares = dcf.get("shares", 0)
+        intrinsic_per_share_original = dcf.get("intrinsic_value_per_share", 0)
+
+        lines.append("| Step | Amount |")
+        lines.append("|------|--------|")
+        lines.append(f"| Enterprise Value | ${ev/1e6:,.0f}M |")
+        lines.append(f"| Less: Net Debt | (${net_debt/1e6:,.0f}M) |")
+
+        # Check if minority interest is available (added by concurrent agent)
+        if minority_interest is not None and minority_interest != 0:
+            # Calculate baseline WITHOUT minority interest
+            equity_value_without_mi = ev - net_debt
+            intrinsic_without_mi = equity_value_without_mi / shares if shares > 0 else 0
+
+            lines.append(f"| Less: Minority Interest | (${minority_interest/1e6:,.0f}M) |")
+            # Recalculate equity value WITH minority interest
+            equity_value_with_mi = ev - net_debt - minority_interest
+            lines.append(f"| **= Equity Value (to common)** | **${equity_value_with_mi/1e6:,.0f}M** |")
+            intrinsic_per_share = equity_value_with_mi / shares if shares > 0 else 0
+        else:
+            # Minority interest not available yet (concurrent agent hasn't added it)
+            lines.append(f"| Less: Minority Interest | (Not available) |")
+            equity_value_without_mi = ev - net_debt
+            lines.append(f"| **= Equity Value** | **${equity_value_without_mi/1e6:,.0f}M** |")
+            intrinsic_per_share = equity_value_without_mi / shares if shares > 0 else 0
+            intrinsic_without_mi = intrinsic_per_share
+
+        lines.append(f"| Shares Outstanding | {shares/1e6:,.1f}M |")
+        lines.append(f"| **= Intrinsic Value per Share** | **${intrinsic_per_share:.2f}** |")
+        lines.append("")
+
+        # Note if minority interest adjustment was applied
+        if minority_interest is not None and minority_interest != 0 and shares > 0:
+            mi_impact_per_share = intrinsic_per_share - intrinsic_without_mi
+            mi_impact_pct = (mi_impact_per_share / intrinsic_without_mi * 100) if intrinsic_without_mi != 0 else 0
+            lines.append(f"> **Note:** Minority interest reduces intrinsic value by ${abs(mi_impact_per_share):.2f}/share "
+                         f"({mi_impact_pct:+.1f}%) relative to equity value before minority interest deduction.")
+            lines.append("")
 
         # DCF quality warnings (plain language with specific figures)
         dcf_quality_flag = dcf.get("dcf_quality_warning")
@@ -235,7 +382,7 @@ def _build_full_report(r: dict) -> str:
         # Sensitivity table
         sens = dcf.get("sensitivity_table", {})
         if sens:
-            lines.append("### 4.4 Sensitivity Analysis (Intrinsic Value per Share)")
+            lines.append("### 4.6 Sensitivity Analysis (Intrinsic Value per Share)")
             lines.append("")
             # Build header from first row keys
             first_row = next(iter(sens.values()), {})
@@ -253,12 +400,24 @@ def _build_full_report(r: dict) -> str:
                     row_str += f" {val_str} |"
                 lines.append(row_str)
             lines.append("")
+            lines.append("> **Note:** The sensitivity grid shows how intrinsic value changes with WACC and terminal growth assumptions. "
+                         "Negative values indicate that the base assumptions produce a negative equity value (often due to high net debt or negative base FCF).")
+            lines.append("")
 
     # ── Relative Valuation ───────────────────────────────────────────────────
     if rel:
         lines.append("---")
         lines.append("")
         lines.append("## 5. Relative Valuation")
+        lines.append("")
+
+        # Sector source disclosure
+        sector_source = rel.get("sector_source", "Sector averages")
+        lines.append(f"**Benchmark Source:** {sector_source}")
+        lines.append("")
+        lines.append("> These multiples are derived from Damodaran's sector aggregates, not peer comparables. "
+                     "They represent the average for the entire sector, which may differ from this company's "
+                     "specific peer group.")
         lines.append("")
 
         vs = rel.get("vs_sector", {})
@@ -272,6 +431,19 @@ def _build_full_report(r: dict) -> str:
                 prem = f"{data.get('premium_pct', 0):+.1f}%" if isinstance(data.get('premium_pct'), float) else "—"
                 lines.append(f"| {mult} | {co} | {sect} | {ip} | {prem} |")
         lines.append("")
+
+        # EV-based multiples breakdown
+        for mult_name in ["EV/EBITDA", "EV/Sales", "EV/EBIT"]:
+            mult_data = vs.get(mult_name)
+            if mult_data and mult_data.get("implied_ev"):
+                lines.append(f"**{mult_name} Bridge:**")
+                lines.append("")
+                lines.append(f"- Implied EV: ${mult_data['implied_ev']/1e6:,.0f}M")
+                lines.append(f"- Less: Net Debt: ${mult_data['net_debt_deducted']/1e6:,.0f}M")
+                lines.append(f"- = Residual Equity: ${mult_data['implied_equity_value']/1e6:,.0f}M")
+                if mult_data.get("leverage_flag"):
+                    lines.append(f"\n> {mult_data['leverage_flag']}")
+                lines.append("")
 
         if rel.get("composite_implied_price"):
             lines.append(f"**Composite Relative Value:** ${rel['composite_implied_price']:.2f} "

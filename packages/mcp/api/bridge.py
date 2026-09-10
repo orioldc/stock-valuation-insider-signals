@@ -1054,6 +1054,8 @@ def run_valuation(ticker):
     profile = result.get("profile") or {}
     dcf = result.get("dcf_result") or {}
     rel = result.get("relative_result") or {}
+    asset = result.get("asset_result") or {}
+    contingent = result.get("contingent_result") or {}
     syn = result.get("synthesis") or {}
     insider = result.get("insider_signal") or {}
     decision = result.get("decision") or {}
@@ -1061,6 +1063,39 @@ def run_valuation(ticker):
 
     # Get hit-rates release tag for provenance
     hit_rates_release = _get_installed_release()
+
+    # ── Extract synthesis weights from components ──
+    # The synthesis.components list contains (value, weight) tuples.
+    # Match each value to its corresponding method to build explicit weight mapping.
+    synthesis_weights = {
+        "dcf_weight": 0.0,
+        "relative_weight": 0.0,
+        "asset_weight": 0.0,
+        "contingent_weight": 0.0,
+        "total_weight": 0.0,
+    }
+
+    components = syn.get("components", [])
+    for val, weight in components:
+        # Match value to method (within 1% tolerance for float comparison)
+        # For DCF: synthesis uses the adjusted value (if present), so match against that
+        dcf_val = dcf.get("intrinsic_value_per_share")
+        rel_val = rel.get("composite_implied_price")
+        asset_val = asset.get("nav_per_share") or asset.get("book_value_per_share")
+        contingent_val = contingent.get("equity_value_per_share")
+
+        if dcf_val and abs(val - dcf_val) / max(val, dcf_val, 1) < 0.01:
+            synthesis_weights["dcf_weight"] = weight
+        elif rel_val and abs(val - rel_val) / max(val, rel_val, 1) < 0.01:
+            synthesis_weights["relative_weight"] = weight
+        elif asset_val and abs(val - asset_val) / max(val, asset_val, 1) < 0.01:
+            synthesis_weights["asset_weight"] = weight
+        elif contingent_val and abs(val - contingent_val) / max(val, contingent_val, 1) < 0.01:
+            synthesis_weights["contingent_weight"] = weight
+
+    synthesis_weights["total_weight"] = sum(
+        synthesis_weights[k] for k in ["dcf_weight", "relative_weight", "asset_weight", "contingent_weight"]
+    )
 
     # Handle conviction source provenance
     if insider:
@@ -1092,11 +1127,30 @@ def run_valuation(ticker):
         "intrinsic_value": _to_native(syn.get("weighted_value")),
         "synthesized_value": _to_native(syn.get("weighted_value")),
         "upside_pct": _to_native(syn.get("upside_pct")),
-        "dcf_value": _to_native(dcf.get("intrinsic_value_per_share")),
+        # ── All four valuation methods ──
+        # For DCF: if survival adjustment was applied, return the unadjusted value
+        # (so equity_value / shares = dcf_value), and provide adjusted value separately
+        "dcf_value": _to_native(
+            dcf.get("survival_adjustment", {}).get("unadjusted_iv") or dcf.get("intrinsic_value_per_share")
+        ),
+        "dcf_value_adjusted": _to_native(
+            dcf.get("intrinsic_value_per_share") if dcf.get("survival_adjustment") else None
+        ),
+        "survival_adjustment": dcf.get("survival_adjustment"),
         "relative_value": _to_native(rel.get("composite_implied_price")),
+        "asset_value": _to_native(asset.get("nav_per_share") or asset.get("book_value_per_share")),
+        "contingent_value": _to_native(contingent.get("equity_value_per_share")),
+        # ── Synthesis weights (pre-normalization) ──
+        "dcf_weight": _to_native(synthesis_weights.get("dcf_weight")),
+        "relative_weight": _to_native(synthesis_weights.get("relative_weight")),
+        "asset_weight": _to_native(synthesis_weights.get("asset_weight")),
+        "contingent_weight": _to_native(synthesis_weights.get("contingent_weight")),
+        "total_weight": _to_native(synthesis_weights.get("total_weight")),
+        # ── Relative valuation detail ──
         "ev_ebitda_implied": _to_native(rel.get("ev_ebitda_implied")),
         "pe_implied": _to_native(rel.get("pe_implied")),
         "multiples_used": rel.get("multiples_used") or [],
+        # ── DCF detail ──
         "wacc": _to_native(dcf.get("wacc_used")),
         "ke": _to_native(dcf.get("ke")),
         "kd": _to_native(dcf.get("kd")),
@@ -1112,6 +1166,23 @@ def run_valuation(ticker):
         "base_fcf": _to_native(dcf.get("base_fcf")),
         "terminal_value_pct": _to_native(dcf.get("terminal_value_pct")),
         "growth_rationale": dcf.get("growth_rationale"),
+        # ── DCF internals (EV-to-equity bridge) ──
+        "total_ev": _to_native(dcf.get("total_ev")),
+        "net_debt": _to_native(dcf.get("net_debt")),
+        "minority_interest": _to_native(dcf.get("minority_interest")),
+        "minority_interest_status": dcf.get("minority_interest_status"),
+        "equity_value": _to_native(dcf.get("equity_value")),
+        "pv_fcf_stage1": _to_native(dcf.get("pv_fcf_stage1")),
+        "pv_fcf_stage2": _to_native(dcf.get("pv_fcf_stage2")),
+        "pv_terminal_value": _to_native(dcf.get("pv_terminal_value")),
+        # ── Beta clamp information ──
+        "beta_raw": _to_native(dcf.get("wacc_components", {}).get("beta_raw")),
+        "beta_clamped": dcf.get("wacc_components", {}).get("beta_clamped"),
+        # ── Shares (try DCF first, fall back to profile, then asset result) ──
+        "shares_outstanding": _to_native(
+            dcf.get("shares") or profile.get("shares_outstanding") or asset.get("shares")
+        ),
+        # ── Decision ──
         "decision_method": decision.get("primary_method"),
         "decision_rationale": decision.get("rationale"),
         "verdict": syn.get("verdict"),

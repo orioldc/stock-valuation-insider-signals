@@ -21,6 +21,7 @@ data/*.csv
 data/.staging.*
 data/*.json
 data/.data_release
+data/.updating/
 packages/tracker/db/*.db
 packages/tracker/db/*.db-shm
 packages/tracker/db/*.db-wal

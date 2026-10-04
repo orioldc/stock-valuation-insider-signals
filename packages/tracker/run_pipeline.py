@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_ingestion.data_loader import load_universe, run_full_ingestion
 from signals.composite_scorer import score_universe
+from signals.share_count_change import fmt_pct
 
 def main():
     tickers = load_universe()
@@ -35,7 +36,7 @@ def main():
         print(f"{i+1:>3}. {row['ticker']:<6} | Composite: {row['composite']:.4f} | "
               f"Cluster: {row['cluster_norm']:.3f} {cluster_flag} | "
               f"Buyback: {row['share_norm']:.3f} {buyback_flag} | "
-              f"ΔQoQ: {row['share_delta_qoq']:>7.2f}% | Δ4Q: {row['share_delta_4q']:>7.2f}%")
+              f"Δ4Q: {fmt_pct(row['share_delta_4q']):>8}")
     
     # Step 4: Save CSV
     os.makedirs("output", exist_ok=True)

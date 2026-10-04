@@ -26,8 +26,9 @@ from typing import Set, List, Dict, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_ingestion"))
 
-from data_ingestion.data_loader import get_db
-from data_ingestion.edgar_client import parse_form4_xml, get_rate_stats, fetch_form4_filings
+from data_ingestion.data_loader import get_db, ensure_company, _store_filings
+from data_ingestion.edgar_client import get_rate_stats, fetch_form4_filings, fetch_sec_company_list
+from data_ingestion.form4_rules import TRANSACTION_FORM_TYPES
 
 # Add pipeline to path for provenance
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -129,7 +130,11 @@ def fetch_form_index(year: int, quarter: int) -> str:
 
 def parse_form_index(index_content: str) -> List[Dict[str, str]]:
     """
-    Parse form.idx content to extract Form 4 and 4/A filings.
+    Parse form.idx content to extract Form 4, 4/A, 5 and 5/A filings.
+
+    Each filing is listed once per CIK on it (the issuer and every reporting
+    owner), so 'cik' here is not necessarily the issuer; parse_form4_xml drops
+    filings whose issuer is a different company.
 
     Format (after header lines):
     Form Type    Company Name                     CIK        Date Filed  File Name
@@ -148,19 +153,16 @@ def parse_form_index(index_content: str) -> List[Dict[str, str]]:
         if not in_data or not line.strip():
             continue
 
-        # Parse fixed-width columns
-        # Form Type (0-12), Company Name (12-74), CIK (74-86), Date Filed (86-98), File Name (98+)
-        if len(line) < 98:
+        # Columns are nominally fixed-width, but long company names push the
+        # later columns right, so read CIK, date and file name from the end.
+        parts = line.split()
+        if len(parts) < 5 or not parts[-1].endswith('.txt'):
             continue
-
         form_type = line[0:12].strip()
-        company_name = line[12:74].strip()
-        cik_str = line[74:86].strip()
-        date_filed = line[86:98].strip()
-        file_name = line[98:].strip()
+        cik_str, date_filed, file_name = parts[-3], parts[-2], parts[-1]
+        company_name = line[12:].rsplit(cik_str, 1)[0].strip()
 
-        # Filter to Form 4 and 4/A only
-        if form_type not in ('4', '4/A'):
+        if form_type not in TRANSACTION_FORM_TYPES:
             continue
 
         # Extract CIK (remove leading zeros but keep as string)
@@ -248,13 +250,25 @@ def run_backfill(year: int, quarter: int):
     # Fetch and parse the index
     index_content = fetch_form_index(year, quarter)
     all_filings = parse_form_index(index_content)
-    logger.info(f"Index contains {len(all_filings)} Form 4/4A filings")
+    logger.info(f"Index contains {len(all_filings)} Form 4/5 filings")
 
     # Get tracked CIKs
     conn = get_db()
     tracked_ciks = get_tracked_ciks(conn)
     conn.close()
     logger.info(f"Tracking {len(tracked_ciks)} companies with CIKs")
+
+    # Listed companies with no row yet (an IPO, or a new holding company that
+    # took over an existing ticker) would otherwise be missed until the next
+    # bulk file. Their row is created when they are processed.
+    sec_map, sec_titles = fetch_sec_company_list()
+    ticker_by_cik = {}
+    for t, c in sec_map.items():
+        ticker_by_cik.setdefault(str(c), t)
+    new_listed = {f["cik"] for f in all_filings} & set(ticker_by_cik) - set(tracked_ciks)
+    for cik in new_listed:
+        tracked_ciks[cik] = (None, ticker_by_cik[cik])
+    logger.info(f"Adding {len(new_listed)} listed companies not yet tracked")
 
     # Find unique issuer CIKs in the index that we track
     ciks_with_filings = set()
@@ -302,54 +316,14 @@ def run_backfill(year: int, quarter: int):
             company_id, ticker = tracked_ciks[cik]
 
             try:
+                if company_id is None:
+                    company_id = ensure_company(conn, ticker, int(cik), sec_titles.get(int(cik)))
                 # Fetch filings for this company (edgar_client handles finding primary docs)
                 filings = fetch_form4_filings(cik, limit=None, since_date=quarter_start)
 
-                company_inserted = 0
+                # Parse failures are logged inside parse_form4_xml and yield no rows.
+                company_inserted = _store_filings(conn, company_id, ticker, filings)
                 parse_failures = 0
-
-                for filing in filings:
-                    try:
-                        txns = parse_form4_xml(
-                            filing["cik"],
-                            filing["accession_number"],
-                            filing["primary_doc"],
-                            filing["filing_date"],
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"{ticker} ({cik}): failed to parse filing "
-                            f"{filing.get('accession_number', '?')}: {e}"
-                        )
-                        parse_failures += 1
-                        continue
-
-                    for txn in txns:
-                        try:
-                            insert_cur = conn.execute(
-                                """
-                                INSERT OR IGNORE INTO insider_transactions
-                                (company_id, filing_date, transaction_date, reporting_name,
-                                 reporting_cik, transaction_type, shares_transacted, price,
-                                 shares_owned_after, source, raw_json)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'EDGAR', ?)
-                                """,
-                                (
-                                    company_id,
-                                    filing["filing_date"],
-                                    txn["transaction_date"],
-                                    txn["insider_name"],
-                                    txn["insider_cik"],
-                                    txn["transaction_code"],
-                                    txn["shares"],
-                                    txn["price"],
-                                    txn["shares_owned_after"],
-                                    json.dumps(txn),
-                                ),
-                            )
-                            company_inserted += insert_cur.rowcount
-                        except Exception as e:
-                            logger.warning(f"{ticker}: insert error: {e}")
 
                 conn.commit()
                 total_inserted += company_inserted

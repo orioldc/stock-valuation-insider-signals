@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_ingestion.data_loader import load_universe
 from signals.composite_scorer import score_universe
+from signals.share_count_change import fmt_pct
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ def _generate_report(df, old_signals, tickers, new_txn_total, tickers_with_new, 
         for _, row in clusters.iterrows():
             lines.append(f"  {row['ticker']:<6} | Composite: {row['composite']:.4f} | "
                         f"Cluster Score: {row['cluster_score_raw']:.1f} | "
-                        f"Share Δ4Q: {row.get('share_delta_4q', 0):.2f}%")
+                        f"Share Δ4Q: {fmt_pct(row.get('share_delta_4q'))}")
     else:
         lines.append("  (none)")
 

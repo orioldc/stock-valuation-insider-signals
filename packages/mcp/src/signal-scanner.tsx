@@ -272,8 +272,8 @@ function DetailPanel({ detail }: { detail: ClusterDetail }) {
                   <td>{t.date}</td>
                   <td>{t.name}</td>
                   <td className={styles.num}>{(t.shares ?? 0).toLocaleString()}</td>
-                  <td className={styles.num}>${(t.price ?? 0).toFixed(2)}</td>
-                  <td className={styles.num}>${(t.value ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
+                  <td className={styles.num}>{t.price != null ? `$${t.price.toFixed(2)}` : "—"}</td>
+                  <td className={styles.num}>{t.value != null ? `$${t.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : "—"}</td>
                 </tr>
               ))}
             </tbody>

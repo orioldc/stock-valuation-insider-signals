@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tracker.scoring.peer_rank import (
     build_price_panel, build_forward_return_matrices,
-    compute_peer_rank_outcome_vectorized, compute_excess_vs_spy, _get_size_tier
+    compute_peer_rank_outcome_vectorized, compute_excess_vs_spy, compute_forward_return,
+    _get_size_tier
 )
 from tracker.scoring.features import extract_features, FEATURE_NAMES
 from tracker.scoring.base_rates import (
@@ -90,12 +91,16 @@ def build_dataset(db_path, clusters_df, price_panel, fwd_returns, excess_spy):
 
         # Get excess returns for SPY/QQQ beat rates
         spy_excess = compute_excess_vs_spy(price_panel, ticker, str(signal_date.date()), days=252)
+        stock_ret = compute_forward_return(price_panel, ticker, str(signal_date.date()), days=252)
+        qqq_ret = compute_forward_return(price_panel, 'QQQ', str(signal_date.date()), days=252)
+        qqq_excess = stock_ret - qqq_ret if stock_ret is not None and qqq_ret is not None else None
 
         row = {
             **features,
             'label': label,
             'signal_year': signal_year,
             'spy_excess': spy_excess,
+            'qqq_excess': qqq_excess,
         }
         rows.append(row)
 
@@ -184,10 +189,11 @@ def compute_tier_base_rates(data_df):
             # SPY/QQQ beat rates
             spy_wins = (group['spy_excess'] > 0).sum() if 'spy_excess' in group.columns else 0
             spy_total = group['spy_excess'].notna().sum() if 'spy_excess' in group.columns else 0
-            spy_beat_rate = spy_wins / spy_total if spy_total > 0 else 0.0
+            spy_beat_rate = spy_wins / spy_total if spy_total > 0 else None
 
-            # QQQ approximation (would need QQQ excess in real implementation)
-            qqq_beat_rate = spy_beat_rate * 0.95  # Approximate
+            qqq_wins = (group['qqq_excess'] > 0).sum() if 'qqq_excess' in group.columns else 0
+            qqq_total = group['qqq_excess'].notna().sum() if 'qqq_excess' in group.columns else 0
+            qqq_beat_rate = qqq_wins / qqq_total if qqq_total > 0 else None
 
             tier_rates.append({
                 'size_tier': size_tier,
@@ -200,7 +206,8 @@ def compute_tier_base_rates(data_df):
                 'qqq_beat_rate': qqq_beat_rate,
             })
 
-            logger.info(f"  {size_tier:5s}: n={n:4d}, peer_beat={hit_rate:.1%}, spy_beat={spy_beat_rate:.1%}")
+            spy_text = f"{spy_beat_rate:.1%}" if spy_beat_rate is not None else "n/a"
+            logger.info(f"  {size_tier:5s}: n={n:4d}, peer_beat={hit_rate:.1%}, spy_beat={spy_text}")
 
     return pd.DataFrame(tier_rates)
 

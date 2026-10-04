@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_ingestion.data_loader import load_universe, run_full_ingestion, get_db
 from signals.composite_scorer import score_universe
+from signals.share_count_change import fmt_pct
 from signals.insider_clusters import detect_clusters
 
 def main():
@@ -65,7 +66,7 @@ def main():
         print(f"{i+1:>3}. {row['ticker']:<8} | Composite: {row['composite']:.4f} | "
               f"Cluster: {row['cluster_norm']:.3f} {cluster_flag} | "
               f"Buyback: {row['share_norm']:.3f} {buyback_flag} | "
-              f"ΔQoQ: {row['share_delta_qoq']:>8.2f}% | Δ4Q: {row['share_delta_4q']:>8.2f}%")
+              f"Δ4Q: {fmt_pct(row['share_delta_4q']):>9}")
     
     # Phase 4: All clusters with details
     print(f"\n{'='*60}")

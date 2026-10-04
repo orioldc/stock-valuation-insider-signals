@@ -234,59 +234,46 @@ def check_insider_transactions_monthly_volume(conn):
 
 def check_share_buyback_coverage(conn):
     """
-    Companies with >=5 quarters of shares_outstanding, as a fraction of
-    companies not in shares_backfill_failures.
+    Companies with an open-market purchase or sale filed in the last year that
+    have a share count change for a period ending in the last year.
 
-    Threshold: 85% (current actual 91.7%)
-    Threshold type: Regression guard (set 5% below current to catch degradation)
+    The rest are mostly closed-end funds, SPACs and companies that report
+    shares only per class (Berkshire, Visa): their filings carry no single
+    share count, so they get no buyback figure rather than a wrong one.
+
+    Threshold: 80% (84.9% on the 2026-10 rebuild)
+    Threshold type: Regression guard
     """
     cur = conn.cursor()
-
-    # Total eligible companies (excluding known failures)
     cur.execute("""
-        SELECT COUNT(*)
-        FROM companies
-        WHERE ticker != 'NONE'
-          AND (cik IS NULL OR cik NOT IN (SELECT cik FROM shares_backfill_failures))
-    """)
-    total_eligible = cur.fetchone()[0]
-
-    # Companies with >=5 quarters of data
-    cur.execute("""
-        SELECT COUNT(DISTINCT company_id)
-        FROM (
-            SELECT company_id, COUNT(DISTINCT strftime('%Y-%m', date)) as quarters
-            FROM shares_outstanding
-            WHERE company_id IN (
-                SELECT id FROM companies
-                WHERE ticker != 'NONE'
-                  AND (cik IS NULL OR cik NOT IN (SELECT cik FROM shares_backfill_failures))
-            )
-            GROUP BY company_id
-            HAVING quarters >= 5
+        WITH active AS (
+            SELECT DISTINCT company_id FROM insider_transactions
+            WHERE transaction_type IN ('P', 'S') AND filing_date >= date('now', '-365 days')
+        ),
+        latest AS (
+            SELECT company_id, MAX(period_end) AS period_end
+            FROM share_count_changes GROUP BY company_id
         )
+        SELECT COUNT(*),
+               COALESCE(SUM(l.period_end >= date('now', '-365 days')), 0)
+        FROM active a LEFT JOIN latest l USING (company_id)
     """)
-    with_coverage = cur.fetchone()[0]
-
-    # Get failure count for context
-    cur.execute("SELECT COUNT(*) FROM shares_backfill_failures")
-    failures = cur.fetchone()[0]
+    total_eligible, with_coverage = cur.fetchone()
 
     coverage_pct = (with_coverage / total_eligible * 100) if total_eligible > 0 else 0
-    min_pct = 85.0
+    min_pct = 80.0
 
     return {
         'passed': coverage_pct >= min_pct,
         'measured': {
-            'companies_with_5q': with_coverage,
-            'companies_eligible': total_eligible,
-            'known_failures': failures,
+            'companies_with_current_change': with_coverage,
+            'companies_traded_last_year': total_eligible,
             'coverage_pct': round(coverage_pct, 1)
         },
         'expected': {
             'min_coverage_pct': min_pct,
             'threshold_type': 'regression_guard',
-            'current_actual': 91.7
+            'current_actual': 84.9
         }
     }
 
@@ -1574,7 +1561,8 @@ def check_ticker_validity_for_cik(conn):
     Companies whose ticker does not match their CIK per SEC's company_tickers.json.
 
     Actionable: mostly stale symbols after rebrands (ZI→GTM, SQ→XYZ, ABC→COR).
-    These should be updated via fix_ticker_symbols.py or quarantined.
+    refresh.py sets tickers from this list (company_identity.assign_tickers),
+    so anything left here is a company deliberately kept on its old ticker.
 
     Threshold type: Target (should eventually reach zero via systematic fixes)
     """
@@ -1844,27 +1832,6 @@ FAILURE_MAPPINGS = {
         ORDER BY txn_count DESC
         """
     ),
-    'shares_backfill_failures': (
-        'shares_outstanding',
-        'share buyback data',
-        """
-        SELECT c.ticker, f.reason, COUNT(s.date) as shares_rows, f.cik
-        FROM shares_backfill_failures f
-        INNER JOIN companies c ON f.cik = c.cik
-        INNER JOIN shares_outstanding s ON c.id = s.company_id
-        GROUP BY c.ticker, f.reason, f.cik
-        ORDER BY shares_rows DESC
-        """
-    ),
-    'ticker_fix_failures': (
-        'companies',
-        'ticker symbols',
-        """
-        SELECT f.ticker, f.reason, 1 as present, c.id
-        FROM ticker_fix_failures f
-        INNER JOIN companies c ON f.company_id = c.id
-        """
-    )
 }
 
 
@@ -1886,8 +1853,6 @@ def check_failure_table_contradictions(conn):
     - benchmark_backfill_failures → prices (ticker, benchmarks only)
     - price_backfill_failures → prices (ticker, all companies)
     - quarter_index_failures → insider_transactions (cik, scoped to quarter range)
-    - shares_backfill_failures → shares_outstanding (cik, via companies join)
-    - ticker_fix_failures → companies (company_id)
 
     Threshold type: Target (zero tolerance — logical contradiction)
     """
@@ -2829,7 +2794,7 @@ CHECKS = [
     # Coverage
     {
         'id': 'coverage.share_buyback',
-        'description': 'Share buyback coverage >= 85% of eligible companies',
+        'description': 'Current share count change for >= 80% of companies traded in the last year',
         'severity': CRITICAL,
         'check_fn': check_share_buyback_coverage
     },

@@ -203,7 +203,7 @@ function Card({ data, hostContext, onReset }: { data: ValuationData; hostContext
           <div className={styles.insiderInfo}>
             {data.insider_signal.cluster_detected && <span className={styles.clusterBadge}>🔥 Cluster</span>}
             {data.insider_signal.conviction_score != null && <span>Conviction: {data.insider_signal.conviction_score.toFixed(1)}</span>}
-            {data.insider_signal.insider_count != null && <span>{data.insider_signal.insider_count} insiders</span>}
+            {data.insider_signal.insider_count != null && <span>{data.insider_signal.insider_count} insiders buying (120 days)</span>}
           </div>
         </div>
       )}

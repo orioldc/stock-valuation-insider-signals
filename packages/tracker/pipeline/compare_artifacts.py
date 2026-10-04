@@ -66,7 +66,7 @@ def get_table_counts(conn: sqlite3.Connection) -> Dict[str, int]:
         'shares_outstanding',
         'signals',
         'price_backfill_failures',
-        'shares_backfill_failures'
+        'share_count_changes'
     ]
 
     counts = {}
@@ -95,8 +95,8 @@ def get_coverage_metrics(conn: sqlite3.Connection) -> Dict[str, Any]:
     try:
         result = check_share_buyback_coverage(conn)
         metrics['share_buyback_pct'] = result['measured'].get('coverage_pct')
-        metrics['share_buyback_with_5q'] = result['measured'].get('companies_with_5q')
-        metrics['share_buyback_eligible'] = result['measured'].get('companies_eligible')
+        metrics['share_buyback_covered'] = result['measured'].get('companies_with_current_change')
+        metrics['share_buyback_eligible'] = result['measured'].get('companies_traded_last_year')
     except Exception as e:
         metrics['share_buyback_error'] = str(e)
 

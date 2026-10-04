@@ -130,22 +130,38 @@ def find_corrupt_prices(conn):
 
     logger.info(f"  Found {len(ceiling_violations)} ceiling violations")
 
-    # Check 3: Market cap sanity (transaction value > company market cap)
-    logger.info("Checking for transactions exceeding company market cap (type='P' only)...")
+    # Check 3: Market cap sanity (transaction value far above company market cap)
+    # Compared with the market cap on the trade date (shares outstanding then x
+    # that day's market price), not today's: a company worth $5B when the
+    # insider bought may be worth $40M now, and the trade was still real.
+    # A purchase of new shares from the company (a private placement or rights
+    # offering) can be worth more than the company was before it, so only
+    # more than 3x counts; real ones in the data reach about 2x.
+    # Where the trade-date figures are missing, today's market cap is used with
+    # a 100x bar, since the company may have shrunk a lot since: IPO purchases
+    # reach about 20x today's cap, and every row above 100x was a total typed
+    # into the price field.
+    logger.info("Checking for transactions exceeding the market cap on the trade date (type='P' only)...")
 
     # Plausibility bounds for market cap
     MIN_PLAUSIBLE_MCAP = 1_000_000.0      # $1M
     MAX_PLAUSIBLE_MCAP = 5_000_000_000_000.0  # $5T
-    MCAP_RATIO_THRESHOLD = 1.0  # 100% of market cap
+    MCAP_RATIO_THEN = 3.0     # x the market cap on the trade date
+    MCAP_RATIO_TODAY = 100.0  # x today's market cap, when the trade-date one is unknown
 
     cur.execute("""
-        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted, c.market_cap
+        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted, c.market_cap,
+               (SELECT so.shares FROM shares_outstanding so
+                WHERE so.company_id = it.company_id AND so.date <= it.transaction_date
+                ORDER BY so.date DESC LIMIT 1) AS shares_then,
+               (SELECT p.close FROM prices p
+                WHERE p.ticker = c.ticker AND p.date <= it.transaction_date
+                ORDER BY p.date DESC LIMIT 1) AS adjusted_close
         FROM insider_transactions it
         JOIN companies c ON it.company_id = c.id
         WHERE it.transaction_type = 'P'
           AND it.price IS NOT NULL
           AND it.price > 0
-          AND c.market_cap IS NOT NULL
         ORDER BY c.ticker, it.transaction_date
     """)
 
@@ -154,11 +170,22 @@ def find_corrupt_prices(conn):
 
     mcap_violations = 0
     mcap_flagged = 0
+    mcap_skipped = 0
 
-    for row_id, ticker, txn_date, tx_price, shares, market_cap in mcap_transactions:
+    for (row_id, ticker, txn_date, tx_price, shares, market_cap_today,
+         shares_then, adjusted_close) in mcap_transactions:
         if row_id in already_flagged:
             continue
-
+        if shares_then and adjusted_close and adjusted_close > 0:
+            # SEC share counts are as reported at the time, so pair them with the
+            # price as traded then, not the split-adjusted close.
+            raw_market, _ = _compute_raw_market_price(ticker, txn_date, adjusted_close, cur)
+            market_cap, threshold, when = shares_then * raw_market, MCAP_RATIO_THEN, "then"
+        elif market_cap_today:
+            market_cap, threshold, when = market_cap_today, MCAP_RATIO_TODAY, "today"
+        else:
+            mcap_skipped += 1
+            continue
         tx_value = tx_price * shares
 
         # Check if market cap is plausible
@@ -166,11 +193,10 @@ def find_corrupt_prices(conn):
 
         if mcap_plausible:
             ratio = tx_value / market_cap
-            if ratio > MCAP_RATIO_THRESHOLD:
-                # Transaction value exceeds company market cap - impossible
+            if ratio > threshold:
                 corrupt.append((
                     row_id, ticker, txn_date, tx_price, shares,
-                    f"exceeds_market_cap (tx_value=${tx_value/1e9:.2f}B, market_cap=${market_cap/1e9:.2f}B, "
+                    f"exceeds_market_cap (tx_value=${tx_value/1e9:.2f}B, market_cap_{when}=${market_cap/1e9:.2f}B, "
                     f"ratio={ratio:.1f}x)"
                 ))
                 mcap_violations += 1
@@ -179,11 +205,12 @@ def find_corrupt_prices(conn):
             if tx_value > 1e9:  # Only flag if transaction is large enough to matter
                 flagged_only.append((
                     row_id, ticker, txn_date, tx_price, shares,
-                    f"market_cap_implausible (tx_value=${tx_value/1e9:.2f}B, market_cap=${market_cap/1e9:.2f}B) - FLAGGED ONLY"
+                    f"market_cap_implausible (tx_value=${tx_value/1e9:.2f}B, market_cap_{when}=${market_cap/1e9:.2f}B) - FLAGGED ONLY"
                 ))
                 mcap_flagged += 1
 
-    logger.info(f"  Found {mcap_violations} transactions exceeding market cap (will be set to NULL)")
+    logger.info(f"  Found {mcap_violations} transactions far above the market cap (will be set to NULL)")
+    logger.info(f"  Skipped {mcap_skipped} transactions with no market cap at all")
     if mcap_flagged > 0:
         logger.info(f"  Found {mcap_flagged} large transactions with implausible market cap (flagged only)")
 

@@ -8,6 +8,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from edgar_client import fetch_company_tickers, fetch_form4_filings, parse_form4_xml, _get
 from bulk_edgar import normalize_transaction_date
+from company_identity import company_for_cik, record_issuer_tickers
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -228,17 +229,19 @@ def get_db():
 
 
 def ensure_company(conn, ticker, cik, name=None):
-    """Insert company if not exists, return company_id."""
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM companies WHERE ticker = ?", (ticker,))
-    row = cur.fetchone()
-    if row:
-        cur.execute("UPDATE companies SET cik = ? WHERE id = ?", (cik, row[0]))
-        return row[0]
-    cur.execute("INSERT INTO companies (ticker, cik, name) VALUES (?, ?, ?)",
-                (ticker, cik, name or ticker))
+    """Return the company row for a ticker's issuer CIK, creating it if needed.
+
+    The row is found by CIK, never by ticker: tickers get reused, and matching
+    on them used to re-point an existing company at a different issuer.
+    """
+    company_id = company_for_cik(conn, cik, name)
+    # Label a newly created row with the ticker if no other company holds it.
+    conn.execute("""UPDATE companies SET ticker = ?, name = COALESCE(name, ?)
+                    WHERE id = ? AND ticker = 'CIK' || cik
+                      AND NOT EXISTS (SELECT 1 FROM companies WHERE ticker = ?)""",
+                 (ticker, name or ticker, company_id, ticker))
     conn.commit()
-    return cur.lastrowid
+    return company_id
 
 
 def ticker_already_ingested(ticker):
@@ -269,8 +272,97 @@ def get_latest_filing_date(ticker):
     return row[0] if row and row[0] else None
 
 
+def _bulk_coverage_end(conn):
+    """Latest filing date loaded from SEC's quarterly bulk files, or None."""
+    row = conn.execute(
+        "SELECT MAX(filing_date) FROM insider_transactions WHERE source = 'EDGAR_BULK'"
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _store_filings(conn, company_id, ticker, filings):
+    """Parse each filing's XML and insert its trades. Returns rows inserted.
+
+    Filings already in the table (from the bulk files or an earlier run) are
+    skipped whole, so the two sources can never both hold the same filing.
+    A price that fails validation is stored as NULL rather than dropping the
+    trade: the trade happened, only the reported price is untrustworthy.
+    """
+    known = {r[0] for r in conn.execute(
+        "SELECT DISTINCT accession_number FROM insider_transactions WHERE company_id = ?",
+        (company_id,))}
+    inserted = 0
+    nulled_prices = 0
+    seen = {}
+    cur = conn.cursor()
+    for fi, filing in enumerate(filings):
+        if fi % 50 == 0 and fi > 0:
+            logger.info(f"  {ticker}: parsed {fi}/{len(filings)} filings, {inserted} inserted so far")
+        if filing["accession_number"] in known:
+            continue
+        transactions = parse_form4_xml(
+            filing["cik"],
+            filing["accession_number"],
+            filing["primary_doc"],
+            filing["filing_date"],
+        )
+        if transactions:
+            # What the issuer called itself, so tickers can be reassigned later.
+            first = transactions[0]
+            key = (filing["cik"], first["issuer_ticker"])
+            name, lo, hi = seen.get(key, (first["issuer_name"], filing["filing_date"], filing["filing_date"]))
+            if filing["filing_date"] >= hi:
+                name = first["issuer_name"]
+            seen[key] = (name, min(lo, filing["filing_date"]), max(hi, filing["filing_date"]))
+        for txn in transactions:
+            try:
+                price_valid, price_reason, normalized_price = _validate_price_value(
+                    txn["price"], ticker, txn["transaction_date"], cur, shares=txn["shares"]
+                )
+                if not price_valid:
+                    nulled_prices += 1
+                    logger.info(f"{ticker}: price {txn['price']} on {txn['transaction_date']} "
+                                f"stored as NULL - {price_reason}")
+                    normalized_price = None
+                    txn["price_rejected"] = price_reason
+
+                cur.execute("""
+                    INSERT OR IGNORE INTO insider_transactions
+                    (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
+                     transaction_type, shares_transacted, price, shares_owned_after, source, raw_json,
+                     accession_number, line_number, document_type, date_of_orig_sub)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'EDGAR', ?, ?, ?, ?, ?)
+                """, (
+                    company_id,
+                    filing["filing_date"],
+                    txn["transaction_date"],
+                    txn["insider_name"],
+                    txn["insider_cik"],
+                    txn["transaction_code"],
+                    txn["shares"],
+                    normalized_price,
+                    txn["shares_owned_after"],
+                    json.dumps(txn),
+                    txn["accession_number"],
+                    txn["line_number"],
+                    txn["document_type"] or filing.get("form"),
+                    txn["date_of_orig_sub"],
+                ))
+                inserted += cur.rowcount
+            except Exception as e:
+                logger.warning(f"Error inserting transaction for {ticker}: {e}")
+    record_issuer_tickers(conn, seen)
+    conn.commit()
+    if nulled_prices:
+        logger.info(f"{ticker}: {nulled_prices} implausible prices stored as NULL")
+    return inserted
+
+
 def ingest_incremental(ticker, ticker_map=None):
-    """Fetch only NEW Form 4 filings since the last ingestion date for this ticker.
+    """Fetch filings newer than what the table already covers for this ticker.
+
+    The starting point is the later of this ticker's latest filing and the end
+    of the bulk data, so a fresh bulk rebuild only needs the unpublished tail.
     Returns count of newly inserted transactions."""
     if ticker_map is None:
         ticker_map = fetch_company_tickers()
@@ -280,68 +372,17 @@ def ingest_incremental(ticker, ticker_map=None):
         logger.warning(f"No CIK found for {ticker}")
         return 0
 
-    latest_date = get_latest_filing_date(ticker)
-    if not latest_date:
+    conn = get_db()
+    floor = max(filter(None, [get_latest_filing_date(ticker), _bulk_coverage_end(conn)]), default=None)
+    if not floor:
+        conn.close()
         # No data yet — do full ingest for this ticker
         return ingest_insider_trades(ticker, ticker_map)
 
-    conn = get_db()
     company_id = ensure_company(conn, ticker, cik)
-
-    # Fetch filings only since the day after the latest filing date
-    filings = fetch_form4_filings(cik, limit=None, since_date=latest_date)
-    # Filter to only truly new filings (strictly after latest_date)
-    filings = [f for f in filings if f["filing_date"] > latest_date]
-
-    inserted = 0
-    rejected_prices = []
-    cur = conn.cursor()
-    for filing in filings:
-        transactions = parse_form4_xml(
-            filing["cik"],
-            filing["accession_number"],
-            filing["primary_doc"]
-        )
-        for txn in transactions:
-            try:
-                normalized_date = normalize_transaction_date(
-                    txn["transaction_date"],
-                    filing["filing_date"]
-                )
-
-                # Validate price before insertion
-                price_valid, price_reason, normalized_price = _validate_price_value(
-                    txn["price"], ticker, normalized_date, cur, shares=txn["shares"]
-                )
-
-                if not price_valid:
-                    rejected_prices.append((normalized_date, txn["price"], price_reason))
-                    logger.info(f"{ticker}: REJECTED price on {normalized_date}: {txn['price']} - {price_reason}")
-                    continue
-
-                # Use normalized_price (which may be None if price was <= 0)
-                conn.execute("""
-                    INSERT OR IGNORE INTO insider_transactions
-                    (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
-                     transaction_type, shares_transacted, price, shares_owned_after, source, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'EDGAR', ?)
-                """, (
-                    company_id,
-                    filing["filing_date"],
-                    normalized_date,
-                    txn["insider_name"],
-                    txn["insider_cik"],
-                    txn["transaction_code"],
-                    txn["shares"],
-                    normalized_price,
-                    txn["shares_owned_after"],
-                    json.dumps(txn),
-                ))
-                inserted += 1
-            except Exception as e:
-                logger.warning(f"Error inserting transaction for {ticker}: {e}")
-
-    conn.commit()
+    # Same-day filings are included; ones already stored are skipped by accession.
+    filings = fetch_form4_filings(cik, limit=None, since_date=floor)
+    inserted = _store_filings(conn, company_id, ticker, filings)
     conn.close()
     if inserted > 0:
         logger.info(f"{ticker}: Incrementally inserted {inserted} new transactions")
@@ -379,7 +420,7 @@ def populate_sector_yfinance(ticker):
 
 
 def ingest_insider_trades(ticker, ticker_map=None):
-    """Resolve ticker→CIK, fetch Form 4s, parse, store."""
+    """Resolve ticker→CIK, fetch Form 4/5 filings, parse, store."""
     if ticker_map is None:
         ticker_map = fetch_company_tickers()
     
@@ -390,66 +431,10 @@ def ingest_insider_trades(ticker, ticker_map=None):
     
     conn = get_db()
     company_id = ensure_company(conn, ticker, cik)
-    
-    filings = fetch_form4_filings(cik)
-    inserted = 0
-    rejected_prices = []
-    cur = conn.cursor()
-
-    for fi, filing in enumerate(filings):
-        if fi % 50 == 0 and fi > 0:
-            logger.info(f"  {ticker}: parsed {fi}/{len(filings)} filings, {inserted} inserted so far")
-
-        transactions = parse_form4_xml(
-            filing["cik"],
-            filing["accession_number"],
-            filing["primary_doc"]
-        )
-        for txn in transactions:
-            try:
-                normalized_date = normalize_transaction_date(
-                    txn["transaction_date"],
-                    filing["filing_date"]
-                )
-
-                # Validate price before insertion
-                price_valid, price_reason, normalized_price = _validate_price_value(
-                    txn["price"], ticker, normalized_date, cur, shares=txn["shares"]
-                )
-
-                if not price_valid:
-                    rejected_prices.append((normalized_date, txn["price"], price_reason))
-                    logger.info(f"{ticker}: REJECTED price on {normalized_date}: {txn['price']} - {price_reason}")
-                    continue
-
-                # Use normalized_price (which may be None if price was <= 0)
-                conn.execute("""
-                    INSERT OR IGNORE INTO insider_transactions
-                    (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
-                     transaction_type, shares_transacted, price, shares_owned_after, source, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'EDGAR', ?)
-                """, (
-                    company_id,
-                    filing["filing_date"],
-                    normalized_date,
-                    txn["insider_name"],
-                    txn["insider_cik"],
-                    txn["transaction_code"],
-                    txn["shares"],
-                    normalized_price,
-                    txn["shares_owned_after"],
-                    json.dumps(txn),
-                ))
-                inserted += 1
-            except Exception as e:
-                logger.warning(f"Error inserting transaction for {ticker}: {e}")
-
-    conn.commit()
+    filings = fetch_form4_filings(cik, limit=None)
+    inserted = _store_filings(conn, company_id, ticker, filings)
     conn.close()
-    if rejected_prices:
-        logger.info(f"{ticker}: Inserted {inserted} insider transactions, rejected {len(rejected_prices)} corrupt prices")
-    else:
-        logger.info(f"{ticker}: Inserted {inserted} insider transactions")
+    logger.info(f"{ticker}: Inserted {inserted} insider transactions")
     return inserted
 
 
@@ -477,62 +462,6 @@ def _validate_market_cap_value(market_cap):
 
     if market_cap > MAX_PLAUSIBLE_MARKET_CAP:
         return False, f"above_ceiling ({market_cap/1e12:.2f}T > {MAX_PLAUSIBLE_MARKET_CAP/1e12:.1f}T)"
-
-    return True, None
-
-
-def _validate_shares_value(shares, company_id, date, ticker, cur):
-    """
-    Validate shares outstanding value for plausibility.
-
-    Returns (valid: bool, reason: str or None)
-
-    Checks:
-    1. Absolute bounds: 100K - 100B shares (based on P1=1.4M, P99.9=29B)
-    2. Relative QoQ check: reject if >50x or <1/50x vs prior quarter (avoids sentinel/unit errors)
-
-    Args:
-        shares: Value to validate
-        company_id: Company ID for historical comparison
-        date: Date of this value
-        ticker: Ticker for logging
-        cur: Database cursor for querying historical data
-    """
-    # Guard 1: Absolute plausibility bounds
-    # Listed companies have share counts in millions to low billions
-    # Values below 100K are sentinels (1, 10, 100) or data errors
-    # Values above 100B are unit errors (52 quadrillion, etc.)
-    MIN_PLAUSIBLE_SHARES = 100_000          # P1 is 1.4M
-    MAX_PLAUSIBLE_SHARES = 100_000_000_000  # 100B (P99.9 is 29B)
-
-    if shares < MIN_PLAUSIBLE_SHARES:
-        return False, f"below_minimum ({shares:,.0f} < {MIN_PLAUSIBLE_SHARES:,})"
-
-    if shares > MAX_PLAUSIBLE_SHARES:
-        return False, f"above_maximum ({shares:,.0f} > {MAX_PLAUSIBLE_SHARES:,})"
-
-    # Guard 2: Relative QoQ plausibility
-    # A legitimate reverse split (1:100) produces a 0.01x ratio
-    # A legitimate stock split (100:1) produces a 100x ratio
-    # But sentinel values (1) and unit errors produce extreme ratios that revert next quarter
-    # Use 50x threshold to allow legitimate corporate actions while catching errors
-    MAX_QOQ_RATIO = 50.0
-    MIN_QOQ_RATIO = 0.02  # 1/50
-
-    # Get most recent prior value for this company
-    prior = cur.execute("""
-        SELECT shares, date FROM shares_outstanding
-        WHERE company_id = ? AND date < ?
-        ORDER BY date DESC
-        LIMIT 1
-    """, (company_id, date)).fetchone()
-
-    if prior:
-        prior_shares, prior_date = prior
-        if prior_shares > 0:
-            ratio = shares / prior_shares
-            if ratio > MAX_QOQ_RATIO or ratio < MIN_QOQ_RATIO:
-                return False, f"qoq_outlier ({prior_shares:,.0f} -> {shares:,.0f} = {ratio:.2f}x on {prior_date})"
 
     return True, None
 
@@ -611,69 +540,6 @@ def _validate_price_value(price, ticker, transaction_date, cur, shares=None):
     return True, None, price
 
 
-def ingest_shares_outstanding(ticker, ticker_map=None):
-    """Fetch shares outstanding from EDGAR XBRL and store with validation."""
-    if ticker_map is None:
-        ticker_map = fetch_company_tickers()
-
-    cik = ticker_map.get(ticker)
-    if not cik:
-        logger.warning(f"No CIK found for {ticker}")
-        return 0
-
-    cik_padded = str(cik).zfill(10)
-    url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik_padded}/dei/EntityCommonStockSharesOutstanding.json"
-
-    try:
-        resp = _get(url)
-        data = resp.json()
-    except Exception as e:
-        logger.warning(f"Failed to fetch shares outstanding for {ticker}: {e}")
-        return 0
-
-    conn = get_db()
-    company_id = ensure_company(conn, ticker, cik)
-    cur = conn.cursor()
-
-    inserted = 0
-    rejected = []
-    units = data.get("units", {})
-    for unit_key, entries in units.items():
-        for entry in entries:
-            date = entry.get("end") or entry.get("filed")
-            val = entry.get("val")
-            if date and val:
-                shares = float(val)
-
-                # Validate before insert
-                valid, reason = _validate_shares_value(shares, company_id, date, ticker, cur)
-
-                if not valid:
-                    rejected.append((date, shares, reason))
-                    logger.info(f"{ticker}: REJECTED {date}: {shares:,.0f} shares - {reason}")
-                    continue
-
-                try:
-                    cur.execute("""
-                        INSERT OR IGNORE INTO shares_outstanding
-                        (company_id, date, shares, source)
-                        VALUES (?, ?, ?, 'EDGAR_XBRL')
-                    """, (company_id, date, shares))
-                    inserted += cur.rowcount
-                except Exception:
-                    pass
-
-    conn.commit()
-    conn.close()
-
-    if rejected:
-        logger.info(f"{ticker}: Inserted {inserted} shares outstanding records, rejected {len(rejected)}")
-    else:
-        logger.info(f"{ticker}: Inserted {inserted} shares outstanding records")
-
-    return inserted
-
-
 def run_full_ingestion(tickers=None, skip_existing=True):
     """Run ingestion for all tickers."""
     if tickers is None:
@@ -695,7 +561,6 @@ def run_full_ingestion(tickers=None, skip_existing=True):
         return
     
     total_txns = 0
-    total_shares = 0
     errors = []
     skipped = 0
     
@@ -713,14 +578,13 @@ def run_full_ingestion(tickers=None, skip_existing=True):
         except Exception as e:
             errors.append(f"{ticker} (trades): {e}")
             logger.error(f"Error ingesting trades for {ticker}: {e}")
-        
-        try:
-            shares = ingest_shares_outstanding(ticker, ticker_map)
-            total_shares += shares
-        except Exception as e:
-            errors.append(f"{ticker} (shares): {e}")
-            logger.error(f"Error ingesting shares for {ticker}: {e}")
     
+    # Share counts for every company with trades, from SEC's nightly archive.
+    from share_counts import refresh_share_tables
+    conn = get_db()
+    total_shares = refresh_share_tables(conn)["counts"]
+    conn.close()
+
     print(f"\n{'='*50}")
     print(f"INGESTION COMPLETE")
     print(f"{'='*50}")

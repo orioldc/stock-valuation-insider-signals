@@ -94,7 +94,9 @@ def detect_clusters(purchases_df, window_days=30, min_insiders=2):
     qualifying cluster, advancing past its window to avoid counting the same buying
     episode repeatedly.
 
-    Returns DataFrame with one row per cluster event, signal_date = last trade in cluster.
+    Returns DataFrame with one row per cluster event. signal_date is the day the
+    last filing in the cluster was made public (an investor could not have known
+    about the cluster before then); last_trade_date is the last trade itself.
     """
     clusters = []
 
@@ -108,8 +110,15 @@ def detect_clusters(purchases_df, window_days=30, min_insiders=2):
         for _, row in group.iterrows():
             raw = json.loads(row['raw_json']) if row['raw_json'] else {}
             relationship = raw.get('relationship', '')
+            # Without a believable filing date (missing, or before the trade) we
+            # cannot tell when the trade became public, so it is left out rather
+            # than guessed (24 of ~167k purchases in Oct 2026).
+            filed = row['filing_date']
+            if pd.isna(filed) or filed < row['transaction_date']:
+                continue
             trades.append({
                 'date': str(row['transaction_date'].date()),
+                'filed': str(filed.date()),
                 'name': row['reporting_name'],
                 'cik': row['reporting_cik'],
                 'shares': row['shares_transacted'],
@@ -124,7 +133,8 @@ def detect_clusters(purchases_df, window_days=30, min_insiders=2):
 
         for cluster, score in ticker_clusters:
             # Extract cluster metadata
-            signal_date = max(t['date'] for t in cluster)
+            signal_date = max(t['filed'] for t in cluster)
+            last_trade_date = max(t['date'] for t in cluster)
             distinct_insiders = set(t['cik'] for t in cluster)
             total_value = sum(t['value'] for t in cluster)
             insider_names = [str(t['name']) for t in cluster if t['name'] and not pd.isna(t['name'])]
@@ -141,6 +151,7 @@ def detect_clusters(purchases_df, window_days=30, min_insiders=2):
                 'ticker': ticker,
                 'sector': group.iloc[0]['sector'],
                 'signal_date': signal_date,
+                'last_trade_date': last_trade_date,
                 'n_insiders': len(distinct_insiders),
                 'num_transactions': len(cluster),
                 'total_value': total_value,
@@ -265,16 +276,16 @@ def compute_historical_market_cap(ticker, signal_date, prices, split_events):
 
     company_id, current_mcap = row
 
-    # Get latest shares_outstanding as of signal_date
+    # Latest share count in the year before signal_date (older is no guide)
     cur.execute(
         """
         SELECT shares
         FROM shares_outstanding
-        WHERE company_id = ? AND date <= ?
+        WHERE company_id = ? AND date <= ? AND date >= date(?, '-400 days')
         ORDER BY date DESC
         LIMIT 1
         """,
-        (company_id, signal_date),
+        (company_id, signal_date, signal_date),
     )
     shares_row = cur.fetchone()
 
@@ -407,8 +418,9 @@ def compute_forward_returns(clusters_df, prices, split_events):
         if ticker_prices is None:
             continue
 
-        # Find the next trading day on or after signal_date
-        valid_dates = ticker_prices.index[ticker_prices.index >= signal_date]
+        # Buy on the first trading day after the filing day: filings often come
+        # out after the close, so the filing day's own price is not reachable.
+        valid_dates = ticker_prices.index[ticker_prices.index > signal_date]
         if len(valid_dates) == 0:
             continue
         entry_date = valid_dates[0]
@@ -428,7 +440,7 @@ def compute_forward_returns(clusters_df, prices, split_events):
 
         for bench in available_benchmarks:
             bench_prices = prices[bench]
-            bench_valid = bench_prices.index[bench_prices.index >= signal_date]
+            bench_valid = bench_prices.index[bench_prices.index > signal_date]
 
             if len(bench_valid) == 0:
                 # For required benchmarks, this is an error (skip cluster)

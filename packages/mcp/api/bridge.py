@@ -217,6 +217,7 @@ def _load_universe() -> dict:
                 SELECT company_id, shares,
                        ROW_NUMBER() OVER (PARTITION BY company_id ORDER BY date DESC) as rn
                 FROM shares_outstanding
+                WHERE date >= date('now', '-400 days')  -- older counts aren't today's
             ) so ON c.id = so.company_id AND so.rn = 1
             WHERE c.ticker IN ({placeholders})
         """, tickers).fetchall():
@@ -474,10 +475,13 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
                     "qqq_beat_rate": None,
                 }
 
-        # Attach base rates to each result
+        # Attach base rates to each result. Rows with no cluster get none: the
+        # base rate is how past clusters went, so it would read like a signal.
+        no_cluster = {"n_samples": 0, "suppressed": True, "reason": "no insider buying cluster"}
         for result in results:
             segment_key = (result["sector"], result["tier"])
-            conviction = base_rate_cache.get(segment_key, {})
+            conviction = (base_rate_cache.get(segment_key, {}) if result.get("cluster_detected")
+                          else no_cluster)
             result["base_rate"] = conviction.get("base_rate")
             result["base_rate_ci_lower"] = conviction.get("ci_lower")
             result["base_rate_ci_upper"] = conviction.get("ci_upper")
@@ -508,7 +512,9 @@ def get_signals(limit=50, min_score=0, sector=None, cluster_only=False):
 def get_buyback_status(ticker):
     """Buyback status for a ticker, independent of scanner intensity gate.
 
-    "is_buyback" = trailing 4-quarter share count decline (<0%).
+    "is_buyback" = the latest 10-Q/10-K shows the share count down at least 1%
+    on a year earlier (a fall beyond 25% also needs the filing to report
+    repurchases; see signals/share_count_change.py).
     Adds market-cap tier and a size-adjusted relevance score (bucket-percentile
     × tier weight) so the same -3% buyback is read differently for mega- vs.
     micro-cap. Returns None fields if no data.
@@ -550,6 +556,7 @@ def get_buyback_status(ticker):
             SELECT company_id, shares
             FROM shares_outstanding
             WHERE company_id = (SELECT id FROM companies WHERE ticker = ?)
+              AND date >= date('now', '-400 days')  -- older counts aren't today's
             ORDER BY date DESC
             LIMIT 1
         ) so ON c.id = so.company_id
@@ -571,7 +578,7 @@ def get_buyback_status(ticker):
     conn.close()
 
     delta_4q = delta.get("delta_4q")
-    is_buyback = isinstance(delta_4q, (int, float)) and delta_4q < 0
+    is_buyback = delta.get("trend") == "buyback"
 
     raw_share = float(delta.get("score") or 0)
     sa = _size_adjust(ticker, raw_cluster=0.0, raw_share=raw_share, mcap=mcap)
@@ -590,7 +597,11 @@ def get_buyback_status(ticker):
         "market_cap": mcap,
         "market_cap_asof": mcap_asof,
         "market_cap_source": mcap_source,
-        "data_points": delta.get("data_points"),
+        "period_end": delta.get("period_end"),
+        "filed": delta.get("filed"),
+        "repurchases_reported": delta.get("repurchases"),
+        # Kept for clients built before period_end/filed: 1 when there is a figure.
+        "data_points": int(delta_4q is not None),
         "latest_shares": latest_shares,
         "latest_date": latest_date,
     }
@@ -618,14 +629,15 @@ def get_cluster(ticker):
     trade_list = []
     for t in trades:
         raw = json.loads(t["raw_json"]) if t["raw_json"] else {}
-        price = t["price"] or 0
+        # A trade filed without a price has no value; show it as missing, not $0.
+        price = t["price"] if t["price"] and t["price"] > 0 else None
         shares = t["shares"] or 0
         trade_list.append({
             "date": t["date"],
             "name": t["name"],
             "shares": shares,
             "price": price,
-            "value": round(price * shares, 2),
+            "value": round(price * shares, 2) if price is not None else None,
             "relationship": raw.get("relationship", ""),
         })
 
@@ -701,7 +713,7 @@ def get_insider_activity(ticker):
     conn = get_db()
     rows = conn.execute("""
         SELECT it.filing_date, it.transaction_date, it.reporting_name as name,
-               it.shares_transacted as shares, it.price, it.raw_json
+               it.reporting_cik, it.shares_transacted as shares, it.price, it.raw_json
         FROM insider_transactions it
         JOIN companies c ON it.company_id = c.id
         WHERE c.ticker = ? AND it.transaction_type = 'P'
@@ -711,15 +723,23 @@ def get_insider_activity(ticker):
 
     purchases = []
     total_value = 0
+    unpriced = 0
     insiders = set()
     dates = []
 
     for r in rows:
-        price = r["price"] or 0
+        # A trade filed without a price is left out of the total and counted
+        # separately, rather than shown as $0.
+        price = r["price"] if r["price"] and r["price"] > 0 else None
         shares = r["shares"] or 0
-        value = round(price * shares, 2)
-        total_value += value
-        insiders.add(r["name"])
+        value = round(price * shares, 2) if price is not None else None
+        if value is None:
+            unpriced += 1
+        else:
+            total_value += value
+        # One person can be filed under slightly different names; the SEC CIK
+        # identifies them.
+        insiders.add(r["reporting_cik"] or r["name"])
         if r["transaction_date"]:
             dates.append(r["transaction_date"])
         purchases.append({
@@ -734,6 +754,7 @@ def get_insider_activity(ticker):
     summary = {
         "total_purchases": len(purchases),
         "total_value": round(total_value, 2),
+        "trades_unpriced": unpriced,
         "unique_insiders": len(insiders),
         "date_range": {"earliest": min(dates) if dates else None, "latest": max(dates) if dates else None},
     }
@@ -766,6 +787,24 @@ def _compute_conviction_live(ticker: str, insider: dict, hit_rates_release: str 
     spy_beat_rate, qqq_beat_rate, conviction_score (deprecated). Never returns empty dict;
     always includes base_rate_reason describing any failure.
     """
+    # The base rate is how past insider-buying clusters went. With no cluster
+    # now it does not apply, and showing it would read like a signal.
+    if not insider.get("cluster_detected"):
+        return {
+            "base_rate": None,
+            "base_rate_ci_lower": None,
+            "base_rate_ci_upper": None,
+            "base_rate_n_samples": 0,
+            "base_rate_level_used": None,
+            "base_rate_suppressed": True,
+            "base_rate_reason": "no insider buying cluster",
+            "spy_beat_rate": None,
+            "qqq_beat_rate": None,
+            "conviction_score": None,
+            "conviction_source": "base_rate_model",
+            "conviction_deprecated": True,
+            "conviction_deprecation_note": "Use base_rate fields instead; conviction_score will be removed in next release",
+        }
     try:
         from scoring.base_rates import score_cluster
         from signals.size_adjustment import get_tier
@@ -1021,6 +1060,8 @@ def _build_summary_text(p):
             if insider.get("count_window_days"):
                 count_str += f" ({insider['count_window_days']}d window)"
             count_parts.append(count_str)
+        if insider.get("trades_unpriced"):
+            count_parts.append(f"{insider['trades_unpriced']} trade(s) filed without a price, not in totals")
         if insider.get("latest_transaction_date"):
             count_parts.append(f"Latest trade: {insider['latest_transaction_date']}")
         if count_parts:
@@ -1033,6 +1074,8 @@ def _build_summary_text(p):
             if insider.get("as_of"):
                 src_str += f" (as of {insider['as_of']})"
             prov_parts.append(src_str)
+        if insider.get("data_through"):
+            prov_parts.append(f"Filings up to {insider['data_through']}")
         if insider.get("hit_rates_release"):
             prov_parts.append(f"Hit rates: {insider['hit_rates_release']} backtest")
         if prov_parts:
@@ -1192,8 +1235,8 @@ def run_valuation(ticker):
     }
 
     if insider:
-        # Frozen snapshot keys: conviction_score, n_insiders, quality, total_value, latest_transaction_date
-        # Live fetcher fallback keys: cluster_score/score, num_insiders/unique_insiders
+        # Keys from valuation/data/insider_signals.py (signals/ticker_summary.py),
+        # with older snapshot spellings as fallbacks.
         # Use explicit is-not-None checks to avoid treating 0 as missing
         conviction = insider.get("conviction_score")
         if conviction is None:
@@ -1235,6 +1278,8 @@ def run_valuation(ticker):
             "latest_transaction_date": insider.get("latest_transaction_date"),
             "source": insider.get("source"),
             "as_of": insider.get("as_of"),
+            "data_through": insider.get("data_through"),
+            "trades_unpriced": _to_native(insider.get("trades_unpriced")),
             "count_window_days": insider.get("count_window_days"),
         }
 

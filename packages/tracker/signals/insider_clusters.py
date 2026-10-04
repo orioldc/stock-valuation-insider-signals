@@ -207,6 +207,9 @@ def detect_clusters(ticker, lookback_days=90, window_days=30):
             continue
         raw = json.loads(r["raw_json"]) if r["raw_json"] else {}
         relationship = raw.get("relationship", "")
+        # A purchase with no price (bad price removed in cleanup) still counts as
+        # an insider buying, but adds nothing to the dollar value, so the cluster
+        # can only be under-valued, never over-valued.
         price = r["price"] or 0
         shares = r["shares_transacted"] or 0
         value = price * shares

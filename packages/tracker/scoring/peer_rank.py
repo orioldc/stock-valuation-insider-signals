@@ -158,8 +158,9 @@ def compute_peer_rank_vectorized(db_path, fwd_returns, ticker, sector, market_ca
     # Find signal date in forward return matrix
     signal_ts = pd.Timestamp(signal_date)
 
-    # Find first date >= signal_date
-    valid_dates = fwd_returns.index[fwd_returns.index >= signal_ts]
+    # Enter on the first trading day after signal_date (the day the cluster was
+    # made public; filings often come out after the close).
+    valid_dates = fwd_returns.index[fwd_returns.index > signal_ts]
     if len(valid_dates) == 0:
         return None
 
@@ -225,8 +226,9 @@ def compute_forward_return(price_panel, ticker, signal_date, days=252):
     signal_ts = pd.Timestamp(signal_date)
     ticker_prices = price_panel[ticker].dropna()
 
-    # Find entry date (first trading day on or after signal)
-    valid_dates = ticker_prices.index[ticker_prices.index >= signal_ts]
+    # Enter on the first trading day after signal_date (the day the cluster was
+    # made public; filings often come out after the close).
+    valid_dates = ticker_prices.index[ticker_prices.index > signal_ts]
     if len(valid_dates) == 0:
         return None
 

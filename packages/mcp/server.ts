@@ -183,8 +183,8 @@ export function createServer(): McpServer {
       description:
         "For a given stock ticker, returns BOTH (a) insider open-market buying activity " +
         "(Form 4 P-code transactions, 90-day cluster detection, score, individual trades, " +
-        "plus all-time activity summary) AND (b) share-buyback status (trailing-4Q and QoQ " +
-        "shares-outstanding delta, trend label, whether ANY buyback is occurring regardless of intensity). " +
+        "plus all-time activity summary) AND (b) share-buyback status (share count vs. a year " +
+        "earlier from the latest 10-Q/10-K, trend label, whether ANY buyback is occurring regardless of intensity). " +
         "Use this whenever you want to know if a ticker has insider buying OR buybacks. " +
         "Renders a UI card; the text body always summarizes both signals so the LLM sees them in context.",
       inputSchema: ClusterDetailInputSchema.shape,
@@ -216,14 +216,14 @@ export function createServer(): McpServer {
       const bbPct = bb.tier_percentile ?? 0;
 
       const sizeLine = `Market cap tier: ${tier} (${mcapStr}). Scores below are SIZE-ADJUSTED — bucket-percentile × tier weight, so a 3% buyback at a mega-cap can outrank a 20% buyback at a micro-cap.`;
-      const buybackLine = bb.data_points
-        ? `Buyback: ${bbFlag} (trend=${bb.trend ?? "n/a"}, QoQ ${fmtPct(bb.delta_qoq)}, 4Q ${fmtPct(bb.delta_4q)}, ` +
+      const buybackLine = typeof bb.delta_4q === "number"
+        ? `Buyback: ${bbFlag} (trend=${bb.trend ?? "n/a"}, shares vs. a year earlier ${fmtPct(bb.delta_4q)}, ` +
           `tier-percentile ${(bbPct * 100).toFixed(0)}, relevance=${bbRelevance.toFixed(2)})`
         : "Buyback: no data";
 
       // 90-day cluster verdict
       const clusterLine =
-        `Insider cluster (90-day rolling window): ${detected ? "yes" : "no"} ` +
+        `Insider cluster (2+ insiders buying within 30 days, in the last 90 days): ${detected ? "yes" : "no"} ` +
         `(raw score ${score.toFixed(1)}, tier-percentile ${(clusterPct * 100).toFixed(0)}, ` +
         `relevance=${clusterRelevance.toFixed(2)})`;
 
@@ -232,9 +232,11 @@ export function createServer(): McpServer {
       const rangeStr = dateRange?.earliest && dateRange?.latest
         ? ` (${dateRange.earliest} to ${dateRange.latest})`
         : "";
+      const unpriced = summary.trades_unpriced ?? 0;
       const activityLine =
         `All-time insider activity${rangeStr}: ${insiders} unique buyers, ` +
-        `$${(totalValue / 1000).toFixed(0)}K total open-market purchases`;
+        `$${(totalValue / 1000).toFixed(0)}K total open-market purchases` +
+        (unpriced ? ` (plus ${unpriced} trade(s) filed without a price, not in the total)` : "");
 
       // Snapshot verdict (if present)
       const frozen = cluster.frozen;
@@ -353,8 +355,8 @@ export function createServer(): McpServer {
       title: "Is a ticker buying back its shares?",
       description:
         "Yes/no + magnitude buyback check for one ticker, INDEPENDENT of the scanner's intensity " +
-        "threshold. Returns the trailing-4-quarter and QoQ share-count delta and a trend label " +
-        "(buyback / dilution / stable) inferred from shares-outstanding history. Use this when " +
+        "threshold. Returns the share count change vs. a year earlier, as reported in the latest " +
+        "10-Q/10-K, and a trend label (buyback / dilution / stable / unexplained_decline / stale). Use this when " +
         "the user asks 'has BKNG been doing buybacks' or 'does TICKER repurchase shares' — " +
         "this is the dedicated buyback lookup. For combined insider+buyback view, use get-cluster-detail.",
       inputSchema: BuybackInputSchema.shape,
@@ -369,14 +371,18 @@ export function createServer(): McpServer {
         typeof v === "number" ? `${(v / 1e6).toFixed(2)}M` : "n/a";
 
       let text: string;
-      if (!bb.data_points) {
-        text = `${upper}: no shares-outstanding data available — cannot determine buyback status.`;
+      if (typeof bb.delta_4q !== "number") {
+        text = `${upper}: no share count figures in its SEC filings — cannot determine buyback status.`;
       } else {
         const verdict = bb.is_buyback
           ? "yes — actively buying back stock"
           : bb.trend === "dilution"
             ? "no — shares outstanding are increasing (dilution)"
-            : "no — share count is roughly stable";
+            : bb.trend === "unexplained_decline"
+              ? "unclear — share count fell over 25% but the filing reports no buybacks"
+              : bb.trend === "stale"
+                ? "unknown — the latest share figures are over a year old"
+                : "no — share count is roughly stable";
         const mcapStr =
           typeof bb.market_cap === "number" && bb.market_cap > 0
             ? `$${(bb.market_cap / 1e9).toFixed(1)}B`
@@ -391,13 +397,11 @@ export function createServer(): McpServer {
           `${upper} buyback status: ${verdict}\n` +
           `- Market cap tier: ${bb.tier ?? "unknown"} (${mcapStr})\n` +
           `- Trend: ${bb.trend ?? "n/a"}\n` +
-          `- QoQ shares delta: ${fmtPct(bb.delta_qoq)}\n` +
-          `- Trailing-4Q shares delta: ${fmtPct(bb.delta_4q)}\n` +
+          `- Shares vs. a year earlier: ${fmtPct(bb.delta_4q)} (period ended ${bb.period_end ?? "n/a"}, filed ${bb.filed ?? "n/a"})\n` +
           `- Latest shares outstanding: ${fmtShares(bb.latest_shares)} as of ${bb.latest_date ?? "n/a"}\n` +
           `- Raw intensity (% scale): ${rawScore}\n` +
           `- Tier percentile (vs. ${bb.tier ?? "?"}-cap peers): ${pctStr}\n` +
-          `- Relevance score (size-adjusted, 0–1): ${relScore} — use this to compare across cap tiers\n` +
-          `- Quarterly data points: ${bb.data_points}`;
+          `- Relevance score (size-adjusted, 0–1): ${relScore} — use this to compare across cap tiers`;
       }
 
       return {

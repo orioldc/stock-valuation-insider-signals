@@ -3,19 +3,35 @@ name: Rebuild Audit
 # Quarterly audit to verify the full rebuild path and detect incremental drift.
 #
 # This workflow:
-#   1. Performs a full rebuild from source (exercises the otherwise-rotting cold path)
-#   2. Downloads the current published release (product of incremental updates)
-#   3. Compares the two artifacts to detect material divergence
+#   1. Rebuilds the database from an empty schema, the same way the monthly
+#      snapshot's full rebuild does (refresh.py from SEC's bulk files)
+#   2. Checks the rebuilt data against SEC itself (pipeline/correctness_audit.py):
+#      fixed rules, a random sample of trades re-read from the original filings,
+#      a random sample of SEC's filing index looked up in the database, known
+#      past mistakes, and share counts against company reports
+#   3. Downloads the current published release and compares the two, to show
+#      what changed since the last release
 #   4. Validates the rebuilt DB against the data contract
-#   5. Publishes comparison and validation reports as workflow artifacts
+#   5. Publishes all reports as workflow artifacts
+#
+# The correctness audit is the one that says whether the data is right; the
+# comparison only says how far it moved since the last release.
+#
+# Timing: SEC publishes each quarter's bulk file about a week after the
+# quarter ends (7 Jan, 7 Apr, 9 Jul 2026; one came six weeks late). Filings
+# newer than the last bulk file are fetched one at a time, about 20 minutes
+# per 10 days of filings. Running on the 1st meant fetching a whole quarter
+# that way (2.5+ hours), which ran out of time.
+# On the 10th of a quarter's first month the tail is about 10 days, so the
+# rebuild takes well under an hour; the step allows for SEC publishing late.
 #
 # CRITICAL: This workflow DOES NOT publish a release. It is an audit only.
 # If suspicious differences are found, the workflow fails loudly for human review.
 
 on:
   schedule:
-    # 06:00 UTC on the 1st of Jan, Apr, Jul, Oct (quarterly)
-    - cron: "0 6 1 1,4,7,10 *"
+    # 06:00 UTC on the 10th of Jan, Apr, Jul, Oct (see Timing above)
+    - cron: "0 6 10 1,4,7,10 *"
   workflow_dispatch:
     inputs:
       skip_backfills:
@@ -30,7 +46,7 @@ permissions:
 jobs:
   rebuild-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours: 45-60min pipeline + 1-2h backfills + buffer
+    timeout-minutes: 360  # GitHub-hosted maximum; rebuild normally under 1h
     env:
       FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
       PYTHONUNBUFFERED: "1"
@@ -58,25 +74,16 @@ jobs:
           echo "Initialized empty schema:"
           ls -lh audit/rebuilt.db
 
-      - name: Run full pipeline (~45-60 min)
-        timeout-minutes: 90
+      - name: Run full rebuild from SEC bulk files
+        timeout-minutes: 180
         run: |
           cd packages/tracker
-          python run_expanded_pipeline.py
-          # Move result to audit directory
+          python refresh.py --expanded --skip-sectors
           cp db/insider_signals.db ../../audit/rebuilt.db
           echo "Full rebuild complete:"
           ls -lh ../../audit/rebuilt.db
 
       # ── Optional backfills (matching monthly-snapshot.yml pattern) ──
-      - name: Fix ticker symbols
-        if: ${{ github.event.inputs.skip_backfills != 'true' }}
-        timeout-minutes: 10
-        continue-on-error: true
-        run: |
-          cd packages/tracker
-          python scripts/fix_ticker_symbols.py --write
-
       - name: Backfill pre-2021 prices
         if: ${{ github.event.inputs.skip_backfills != 'true' }}
         timeout-minutes: 60
@@ -92,14 +99,6 @@ jobs:
         run: |
           cd packages/tracker
           python scripts/fetch_benchmark_etfs.py
-
-      - name: Backfill shares outstanding
-        if: ${{ github.event.inputs.skip_backfills != 'true' }}
-        timeout-minutes: 90
-        continue-on-error: true
-        run: |
-          cd packages/tracker
-          python scripts/backfill_shares_outstanding.py --write
 
       - name: Recompute market caps
         if: ${{ github.event.inputs.skip_backfills != 'true' }}
@@ -131,6 +130,21 @@ jobs:
           cp packages/tracker/db/insider_signals.db audit/rebuilt.db
           echo "Rebuilt DB after backfills:"
           ls -lh audit/
+
+      # ── Check the rebuilt data against SEC ──
+      - name: Correctness audit
+        id: correctness
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          mkdir -p audit/reports
+          cd packages/tracker
+          set +e
+          python pipeline/correctness_audit.py \
+            --db ../../audit/rebuilt.db \
+            --json ../../audit/reports/correctness.json \
+            | tee ../../audit/reports/correctness.txt
+          echo "correctness_exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
 
       # ── Download current published release ──
       - name: Download current published release
@@ -164,6 +178,9 @@ jobs:
           mkdir -p audit/reports
           cd packages/tracker
 
+          # Steps run with bash -e: without this a failure would stop the step
+          # before its exit code is recorded, and the evaluation would pass.
+          set +e
           python pipeline/compare_artifacts.py \
             ../../audit/published.db \
             ../../audit/rebuilt.db \
@@ -186,12 +203,12 @@ jobs:
           cd packages/tracker
           mkdir -p ../../audit/reports
 
+          set +e
           python -m tracker.pipeline.validate \
             --db ../../audit/rebuilt.db \
             --json-report ../../audit/reports/validation.json \
             --verbose | tee ../../audit/reports/validation.txt
-
-          VALIDATE_EXIT=$?
+          VALIDATE_EXIT=${PIPESTATUS[0]}
           echo "VALIDATION_EXIT_CODE=$VALIDATE_EXIT" >> $GITHUB_ENV
 
           echo ""
@@ -213,11 +230,19 @@ jobs:
         run: |
           echo "=== AUDIT RESULTS ==="
           echo "Published release: $PUBLISHED_TAG"
+          echo "Correctness exit code: ${{ steps.correctness.outputs.correctness_exit_code }}"
           echo "Comparison exit code: ${{ steps.compare.outputs.comparison_exit_code }}"
           echo "Validation exit code: $VALIDATION_EXIT_CODE"
           echo ""
 
           FAILURES=""
+
+          # Check the data against SEC
+          case "${{ steps.correctness.outputs.correctness_exit_code }}" in
+            0) ;;
+            1) FAILURES="${FAILURES}- CORRECTNESS AUDIT FAILED (rebuilt data disagrees with SEC; see correctness.txt)\n" ;;
+            *) FAILURES="${FAILURES}- CORRECTNESS AUDIT DID NOT RUN OR CRASHED\n" ;;
+          esac
 
           # Check comparison
           if [ "${{ steps.compare.outputs.comparison_exit_code }}" = "1" ]; then
@@ -226,8 +251,14 @@ jobs:
             FAILURES="${FAILURES}- COMPARISON FAILED (error during comparison)\n"
           fi
 
+          if [ -z "${{ steps.compare.outputs.comparison_exit_code }}" ]; then
+            FAILURES="${FAILURES}- COMPARISON DID NOT RUN\n"
+          fi
+
           # Check validation
-          if [ "$VALIDATION_EXIT_CODE" = "1" ]; then
+          if [ -z "$VALIDATION_EXIT_CODE" ]; then
+            FAILURES="${FAILURES}- VALIDATION DID NOT RUN\n"
+          elif [ "$VALIDATION_EXIT_CODE" = "1" ]; then
             FAILURES="${FAILURES}- VALIDATION FAILED (rebuilt DB violates data contract)\n"
           elif [ "$VALIDATION_EXIT_CODE" = "2" ]; then
             FAILURES="${FAILURES}- VALIDATION ERROR (error during validation)\n"
@@ -238,7 +269,8 @@ jobs:
             echo -e "$FAILURES"
             echo ""
             echo "Review the audit reports artifact for details."
-            echo "This indicates either:"
+            echo "This indicates one or more of:"
+            echo "  - The rebuilt data disagrees with SEC's filings or company reports"
             echo "  - The incremental path has drifted from the full rebuild"
             echo "  - The full rebuild path is broken and cannot produce a valid artifact"
             echo ""
@@ -246,6 +278,6 @@ jobs:
             exit 1
           else
             echo "✅ Rebuild audit PASSED"
-            echo "The full rebuild path works and produces an artifact consistent with"
+            echo "The rebuilt data matches SEC on every check, and is consistent with"
             echo "the incremental updates. No suspicious drift detected."
           fi

@@ -6,6 +6,10 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Optional
 from bulk_edgar import _parse_sec_date, normalize_transaction_date
+from form4_rules import (
+    TRANSACTION_FORM_TYPES, format_relationship, normalize_cik, normalize_price,
+    pick_primary_owner,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -136,6 +140,20 @@ def get_rate_stats():
     }
 
 
+def fetch_sec_company_list():
+    """SEC's current listed companies as ({ticker: cik}, {cik: name}).
+
+    Unlike fetch_company_tickers there is no fallback: deciding which company
+    owns a ticker from a stale copy would repeat whatever the copy got wrong.
+    """
+    data = _get("https://www.sec.gov/files/company_tickers.json").json()
+    tickers, titles = {}, {}
+    for value in data.values():
+        tickers[value["ticker"]] = int(value["cik_str"])
+        titles.setdefault(int(value["cik_str"]), value["title"])
+    return tickers, titles
+
+
 def fetch_company_tickers():
     """Fetch ticker -> CIK mapping from SEC, with DB fallback."""
     url = "https://www.sec.gov/files/company_tickers.json"
@@ -188,7 +206,7 @@ def fetch_form4_filings(cik, limit=150, since_date="2020-01-01"):
         primary_docs = filing_data.get("primaryDocument", [])
         hits = []
         for i, form in enumerate(forms):
-            if form == "4":
+            if form in TRANSACTION_FORM_TYPES:
                 fdate = dates[i]
                 if fdate < since_date:
                     continue
@@ -197,6 +215,7 @@ def fetch_form4_filings(cik, limit=150, since_date="2020-01-01"):
                     "accession_number": accessions[i],
                     "primary_doc": primary_docs[i],
                     "cik": str(cik),
+                    "form": form,
                 })
         return hits
 
@@ -250,7 +269,21 @@ def parse_form4_xml(cik, accession_number, primary_doc, filing_date=None):
     except Exception as e:
         logger.error(f"Failed to fetch Form 4 XML {url}: {e}")
         return []
-    
+    return parse_form4_document(content, cik, accession_number, filing_date, source=url)
+
+
+def parse_form4_document(content, cik, accession_number, filing_date=None, source=""):
+    """
+    Parse a Form 4/5 ownership document into transaction dicts.
+
+    content: the XML, or SEC's full submission text with the XML inside it.
+    cik: only keep the filing if this is its issuer (None keeps any issuer).
+    Each dict includes the filing's issuer_cik.
+    """
+    start, end = content.find("<ownershipDocument"), content.rfind("</ownershipDocument>")
+    if start != -1 and end != -1:
+        content = content[start:end + len("</ownershipDocument>")]
+    url = source or accession_number
     try:
         root = ET.fromstring(content)
     except ET.ParseError as e:
@@ -296,38 +329,46 @@ def parse_form4_xml(cik, accession_number, primary_doc, filing_date=None):
                 results.append(child)
         return results
     
-    owners = find_all_recursive(root, "reportingOwner")
-    owner_name = ""
-    owner_cik = ""
-    is_director = False
-    is_officer = False
-    is_ten_pct = False
-    officer_title = ""
-    
-    if owners:
-        owner = owners[0]
-        owner_name = find_text(owner, "reportingOwnerId.rptOwnerName", "")
-        owner_cik = find_text(owner, "reportingOwnerId.rptOwnerCik", "")
+    # Only keep trades in this company's own stock. A Form 4 is listed under
+    # every CIK on it, so a company that is itself an insider elsewhere (e.g.
+    # Berkshire buying OXY) shows up with filings about another issuer.
+    issuer_cik = normalize_cik(find_text(root, "issuer.issuerCik", ""))
+    if cik is not None and issuer_cik and issuer_cik != normalize_cik(cik):
+        logger.debug(f"Skipping {url}: issuer {issuer_cik} is not CIK {cik}")
+        return []
+
+    document_type = (find_text(root, "documentType", "") or "").upper()
+    issuer_ticker = (find_text(root, "issuer.issuerTradingSymbol", "") or "").upper()
+    issuer_name = find_text(root, "issuer.issuerName", "") or ""
+    date_of_orig_sub = (_parse_sec_date(find_text(root, "dateOfOriginalSubmission", "") or "") or "")[:10] or None
+
+    def is_true(rel, tag):
+        return (find_text(rel, tag, "0") or "0").strip().lower() in ("1", "true")
+
+    owner_list = []
+    for owner in find_all_recursive(root, "reportingOwner"):
         rel = find(owner, "reportingOwnerRelationship")
+        relationship = "Unknown"
         if rel is not None:
-            is_director = find_text(rel, "isDirector", "0") == "1" or find_text(rel, "isDirector", "false").lower() == "true"
-            is_officer = find_text(rel, "isOfficer", "0") == "1" or find_text(rel, "isOfficer", "false").lower() == "true"
-            is_ten_pct = find_text(rel, "isTenPercentOwner", "0") == "1" or find_text(rel, "isTenPercentOwner", "false").lower() == "true"
-            officer_title = find_text(rel, "officerTitle", "")
-    
-    roles = []
-    if is_officer:
-        roles.append(f"Officer ({officer_title})" if officer_title else "Officer")
-    if is_director:
-        roles.append("Director")
-    if is_ten_pct:
-        roles.append("10% Owner")
-    relationship = ", ".join(roles) if roles else "Unknown"
-    
+            relationship = format_relationship(
+                is_officer=is_true(rel, "isOfficer"),
+                is_director=is_true(rel, "isDirector"),
+                is_ten_pct=is_true(rel, "isTenPercentOwner"),
+                is_other=is_true(rel, "isOther"),
+                title=find_text(rel, "officerTitle", "") or find_text(rel, "otherText", "") or "",
+            )
+        owner_list.append({
+            "name": find_text(owner, "reportingOwnerId.rptOwnerName", ""),
+            "cik": normalize_cik(find_text(owner, "reportingOwnerId.rptOwnerCik", "")),
+            "relationship": relationship,
+        })
+    primary = pick_primary_owner(owner_list)
+    owner_name, owner_cik, relationship = primary["name"], primary["cik"], primary["relationship"]
+
     transactions = find_all_recursive(root, "nonDerivativeTransaction")
     results = []
     
-    for txn in transactions:
+    for line_number, txn in enumerate(transactions, start=1):
         try:
             txn_date_raw = _parse_sec_date(find_text(txn, "transactionDate.value", ""))
             txn_date = normalize_transaction_date(txn_date_raw, filing_date)
@@ -343,7 +384,7 @@ def parse_form4_xml(cik, accession_number, primary_doc, filing_date=None):
                 shares_str = find_text(amounts, "transactionShares.value")
                 price_str = find_text(amounts, "transactionPricePerShare.value")
                 shares = float(shares_str) if shares_str else None
-                price = float(price_str) if price_str else None
+                price = normalize_price(float(price_str)) if price_str else None
             
             post_el = find(txn, "postTransactionAmounts")
             shares_after = None
@@ -353,11 +394,14 @@ def parse_form4_xml(cik, accession_number, primary_doc, filing_date=None):
             
             total_value = (shares * price) if (shares and price) else None
             acq_disp = find_text(txn, "transactionAmounts.transactionAcquiredDisposedCode.value", "")
+            ownership = find_text(txn, "ownershipNature.directOrIndirectOwnership.value", "") or ""
+            ownership_nature = find_text(txn, "ownershipNature.natureOfOwnership.value", "") or ""
             
             results.append({
                 "insider_name": owner_name,
                 "insider_cik": owner_cik,
                 "relationship": relationship,
+                "all_owners": primary["all_owners"],
                 "transaction_code": txn_code,
                 "transaction_date": txn_date,
                 "shares": shares,
@@ -365,6 +409,15 @@ def parse_form4_xml(cik, accession_number, primary_doc, filing_date=None):
                 "total_value": total_value,
                 "shares_owned_after": shares_after,
                 "acq_disp": acq_disp,
+                "ownership": ownership.strip(),
+                "ownership_nature": ownership_nature.strip(),
+                "accession_number": accession_number,
+                "line_number": line_number,
+                "document_type": document_type,
+                "date_of_orig_sub": date_of_orig_sub,
+                "issuer_cik": issuer_cik,
+                "issuer_ticker": issuer_ticker,
+                "issuer_name": issuer_name,
             })
         except Exception as e:
             logger.warning(f"Error parsing transaction in {url}: {e}")

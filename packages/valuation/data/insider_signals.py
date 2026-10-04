@@ -1,28 +1,40 @@
-"""Read insider signal data — dispatch between frozen snapshot and live EDGAR fetch.
+"""Insider buying and share count change for one ticker, for the valuation tool.
 
-Strategy:
-  1. Try live SEC EDGAR fetch first (via insider_fetcher.py), with 7-day disk cache.
-  2. Fall back to frozen snapshot if live fetch fails or returns nothing.
-  3. The frozen file path can be overridden via INSIDER_FROZEN_DATA env var.
+Reads the cleaned insider database (data/insider_signals.db, downloaded and
+kept current by scripts/install.sh and scripts/start.sh), using the same code
+as the scanner (packages/tracker/signals/ticker_summary.py). Only when the
+database is missing does it fall back to the frozen snapshot file.
 
-Why this order: The frozen file contains 3,037 tickers from May 2026. If we check
-it first, those tickers never get updated. Inverting the order gives live data
-precedence while keeping the frozen file as a robust offline fallback.
+There is deliberately no live SEC lookup here: the database has been through
+the cleanup and the correctness audit (amendments, duplicates, joint filings,
+companies' own investments in other issuers), and a separate live parser would
+skip all of that.
+
+Overrides: INSIDER_DB_PATH for the database, INSIDER_FROZEN_DATA for the
+frozen file.
 """
 
 import gzip
 import json
 import logging
 import os
-from datetime import datetime
+import sqlite3
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]  # packages/valuation/data/insider_signals.py → repo root
+_TRACKER_DIR = _REPO_ROOT / "packages" / "tracker"
 
 # Lazy-loaded frozen data with mtime tracking
 _frozen_data: dict | None = None
 _frozen_mtime: float | None = None
 _frozen_path: Path | None = None
+
+
+def _db_path() -> Path:
+    return Path(os.environ.get("INSIDER_DB_PATH", _REPO_ROOT / "data" / "insider_signals.db"))
 
 
 def _resolve_frozen_path() -> Path:
@@ -31,8 +43,7 @@ def _resolve_frozen_path() -> Path:
         return Path(os.environ["INSIDER_FROZEN_DATA"])
 
     # Prefer downloaded data/ copy (from install.sh release asset)
-    repo_root = Path(__file__).resolve().parents[3]  # packages/valuation/data/insider_signals.py → repo root
-    data_path = repo_root / "data" / "insider_frozen.json.gz"
+    data_path = _REPO_ROOT / "data" / "insider_frozen.json.gz"
     if data_path.exists():
         return data_path
 
@@ -46,14 +57,12 @@ def _load_frozen() -> dict:
 
     current_path = _resolve_frozen_path()
 
-    # Check if file exists
     if not current_path.exists():
         _frozen_data = {}
         _frozen_mtime = None
         _frozen_path = current_path
         return {}
 
-    # Check if we need to reload (different path, no cache, or mtime changed)
     current_mtime = current_path.stat().st_mtime
     if (_frozen_data is not None
         and _frozen_path == current_path
@@ -74,59 +83,51 @@ def _load_frozen() -> dict:
     return _frozen_data
 
 
+def _from_database(ticker: str) -> dict | None:
+    if str(_TRACKER_DIR) not in sys.path:
+        # Appended, not prepended, so the valuation package's own modules win.
+        sys.path.append(str(_TRACKER_DIR))
+    from signals.ticker_summary import summarize_ticker
+
+    conn = sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True)
+    try:
+        result = summarize_ticker(conn, ticker)
+    finally:
+        conn.close()
+    if result is not None:
+        result["source"] = "database"
+    return result
+
+
 def get_signal_for_ticker(ticker: str, use_cache: bool = True) -> dict | None:
-    """Return insider signal data for a ticker.
+    """Return insider signal data for a ticker, or None if it is not known.
 
-    Tries live SEC EDGAR fetch first, then falls back to frozen snapshot.
+    The fields are those of signals/ticker_summary.py, plus "source"
+    ("database" or "frozen_snapshot"). "data_through" is the newest filing
+    included, so a reader can tell how current the figures are.
 
-    Returns dict with:
-        ticker, in_universe, quality, cluster_detected,
-        n_insiders, total_value, share_delta_4q, share_delta_qoq, share_trend,
-        latest_transaction_date, insider_summary,
-        source ("live_edgar" | "frozen_snapshot"),
-        as_of (ISO date),
-        cluster_window_days (90),
-        count_window_days (120)
-    or None if ticker is not found.
-
-    Note: The deprecated 'conviction_score' field (if present in frozen data) is
-    removed, as the base-rate scorer has shipped.
+    use_cache is kept for callers; the database needs no cache.
     """
     ticker = ticker.upper()
 
-    # 1. Try live EDGAR fetch first (has built-in 7-day disk cache)
-    try:
-        from data.insider_fetcher import fetch_insider_data
+    if _db_path().exists():
+        try:
+            return _from_database(ticker)
+        except Exception as e:
+            logger.warning(f"Reading insider data for {ticker} from the database failed: {e}")
+            # Fall through to the frozen snapshot
 
-        result = fetch_insider_data(ticker, use_cache=use_cache)
-        if result is not None:
-            # fetch_insider_data already includes provenance fields
-            return result
-    except Exception as e:
-        logger.warning(f"Live insider fetch failed for {ticker}: {e}")
-        # Fall through to frozen snapshot
-
-    # 2. Fall back to frozen snapshot
-    frozen = _load_frozen()
-    if frozen:
-        entry = frozen.get(ticker)
-        if entry:
-            entry["ticker"] = ticker
-            # Augment with provenance metadata
-            entry["source"] = "frozen_snapshot"
-            # Use frozen file mtime as approximation of build date
-            frozen_path = _resolve_frozen_path()
-            if frozen_path.exists():
-                entry["as_of"] = datetime.fromtimestamp(frozen_path.stat().st_mtime).strftime("%Y-%m-%d")
-            else:
-                entry["as_of"] = "unknown"
-            entry["cluster_window_days"] = 90
-            entry["count_window_days"] = 120  # Frozen file was built with 120-day count window
-
-            # Drop deprecated conviction_score field (base-rate scorer has shipped)
-            entry.pop("conviction_score", None)
-            entry.pop("conviction", None)  # handle both possible field names
-
-            return entry
-
-    return None
+    entry = _load_frozen().get(ticker)
+    if not entry:
+        return None
+    entry = dict(entry, ticker=ticker, source="frozen_snapshot")
+    # Snapshots made before ticker_summary.py have no build date of their own,
+    # and the file's modification time is the download or clone date, not the
+    # build date, so the date is left unknown rather than guessed.
+    entry.setdefault("as_of", "unknown")
+    entry.setdefault("data_through", "unknown")
+    entry.setdefault("cluster_window_days", 90)
+    entry.setdefault("count_window_days", 120)
+    entry.pop("conviction_score", None)
+    entry.pop("conviction", None)
+    return entry

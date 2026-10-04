@@ -1,7 +1,7 @@
 """Feature extraction for conviction scoring.
 
 All features are strictly as-of the signal date (no look-ahead).
-Includes split-adjusted buyback computation.
+Buyback figures come from 10-Q/10-K filings, dated by when they were filed.
 """
 
 import sqlite3
@@ -10,101 +10,33 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
+from data_ingestion.share_counts import classify_change, share_change_as_of
+
 DB_PATH = os.environ.get("INSIDER_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "db", "insider_signals.db"))
 
 
-def _load_split_events(conn, ticker):
-    """Load split events for ticker as dict {date_str: ratio}."""
-    rows = conn.execute("""
-        SELECT date, ratio
-        FROM split_events
-        WHERE ticker = ?
-        ORDER BY date
-    """, (ticker,)).fetchall()
-    return {date_str: ratio for date_str, ratio in rows}
-
-
-def _compute_split_adjusted_buyback(conn, ticker, signal_date):
-    """Compute split-adjusted share count change over trailing 365 days.
+def _compute_buyback(conn, ticker, signal_date):
+    """Share count change over the year, from the latest 10-Q/10-K filed by signal_date.
 
     Returns:
         (buyback_pct, buyback_missing) tuple where:
-        - buyback_pct is negative for buybacks, positive for dilution, None if unusable
+        - buyback_pct is positive when shares were retired, negative for dilution,
+          None if unusable
         - buyback_missing is 1 if unusable, 0 otherwise
 
-    Rejects as unusable:
-    - Delta < -25% (likely reporting-basis switch)
-    - Delta > 200% (extreme dilution, likely reporting issue)
-    - Share data staler than 400 days
-    - Observations less than 200 days apart
+    Unusable: no filing yet, a period that ended more than 400 days before the
+    signal, a fall beyond 25% the filing doesn't explain with repurchases, or a
+    rise beyond 200% (kept out of the model's range).
     """
-    signal_ts = pd.Timestamp(signal_date)
-    lookback = signal_ts - timedelta(days=365)
-
-    # Get shares as of signal_date and 365 days prior
-    rows = conn.execute("""
-        SELECT so.date, so.shares
-        FROM shares_outstanding so
-        JOIN companies c ON so.company_id = c.id
-        WHERE c.ticker = ?
-          AND so.date <= ?
-        ORDER BY so.date DESC
-        LIMIT 1
-    """, (ticker, signal_date)).fetchall()
-
-    if not rows:
+    row = conn.execute("SELECT id FROM companies WHERE ticker = ?", (ticker,)).fetchone()
+    change = share_change_as_of(conn, row[0], signal_date) if row else None
+    if change is None:
         return (None, 1)
-
-    current_date, current_shares = rows[0]
-
-    rows_past = conn.execute("""
-        SELECT so.date, so.shares
-        FROM shares_outstanding so
-        JOIN companies c ON so.company_id = c.id
-        WHERE c.ticker = ?
-          AND so.date <= ?
-        ORDER BY so.date DESC
-        LIMIT 1
-    """, (ticker, str(lookback.date()))).fetchall()
-
-    if not rows_past:
+    if (pd.Timestamp(signal_date) - pd.Timestamp(change["period_end"])).days > 400:
         return (None, 1)
-
-    past_date, past_shares = rows_past[0]
-
-    # Check recency
-    current_ts = pd.Timestamp(current_date)
-    past_ts = pd.Timestamp(past_date)
-
-    days_to_signal = (signal_ts - current_ts).days
-    if days_to_signal > 400:
+    if classify_change(change) == "unexplained_decline" or change["change_pct"] > 200:
         return (None, 1)
-
-    days_between = (current_ts - past_ts).days
-    if days_between < 200:
-        return (None, 1)
-
-    # Load splits and adjust past shares for any splits between past_date and current_date
-    splits = _load_split_events(conn, ticker)
-    cumulative_ratio = 1.0
-    for split_date, ratio in splits.items():
-        if past_date < split_date <= current_date:
-            cumulative_ratio *= ratio
-
-    adjusted_past_shares = past_shares * cumulative_ratio
-
-    # Compute delta
-    if adjusted_past_shares == 0:
-        return (None, 1)
-
-    delta_pct = (current_shares / adjusted_past_shares - 1.0) * 100
-
-    # Reject implausible values
-    if delta_pct < -25 or delta_pct > 200:
-        return (None, 1)
-
-    # Return negated so positive means shares retired (buyback)
-    return (-delta_pct, 0)
+    return (-change["change_pct"], 0)
 
 
 def _compute_technical_features(price_panel, ticker, signal_date):
@@ -264,7 +196,7 @@ def extract_features(db_path, price_panel, cluster_row):
     logmcap = np.log10(market_cap)
 
     # Buyback
-    buyback, bb_missing = _compute_split_adjusted_buyback(conn, ticker, signal_date)
+    buyback, bb_missing = _compute_buyback(conn, ticker, signal_date)
 
     # Historical cluster count
     hist_n = _compute_historical_cluster_count(conn, ticker, signal_date)

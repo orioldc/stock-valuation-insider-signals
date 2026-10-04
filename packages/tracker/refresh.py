@@ -22,11 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_ingestion.data_loader import (
     load_universe, load_full_universe, load_active_universe, get_db,
-    ingest_incremental, ingest_shares_outstanding, populate_sector_yfinance,
+    populate_sector_yfinance,
     get_latest_filing_date,
 )
 from data_ingestion.edgar_client import fetch_company_tickers, get_rate_stats
 from signals.composite_scorer import score_universe
+from signals.share_count_change import fmt_pct
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -70,6 +71,25 @@ def _clear_checkpoints():
                 os.remove(os.path.join(CHECKPOINT_DIR, fname))
 
 
+def _quarters_after(date_str):
+    """(year, quarter) pairs from the quarter after date_str up to today's quarter.
+
+    If date_str is None (no bulk data at all), returns just the current quarter.
+    """
+    now = datetime.now()
+    end = (now.year, (now.month - 1) // 3 + 1)
+    if not date_str:
+        return [end]
+    y, q = int(date_str[:4]), (int(date_str[5:7]) - 1) // 3 + 1
+    out = []
+    while (y, q) < end:
+        q += 1
+        if q == 5:
+            y, q = y + 1, 1
+        out.append((y, q))
+    return out
+
+
 def run_weekly_refresh(skip_shares=False, skip_sectors=False,
                        max_tickers=None, skip_ingest=False, include_expanded=False):
     """
@@ -79,14 +99,18 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
     start_time = time.time()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ── Phase 0: Bulk ingest (all SEC EDGAR data, no filtering) ──
+    # ── Phase 0: Rebuild insider transactions from SEC's quarterly bulk files ──
+    # The table is rebuilt from scratch every run so no stale or duplicated row
+    # from an earlier release can survive. Takes ~10 minutes.
     logger.info("=" * 60)
-    logger.info("PHASE 0: Bulk EDGAR ingestion (full universe)")
+    logger.info("PHASE 0: Rebuild insider transactions from SEC bulk files")
     logger.info("=" * 60)
     if not skip_ingest:
-        from data_ingestion.bulk_edgar import ingest_all_bulk
-        bulk_result = ingest_all_bulk(start_year=2020, ticker_filter=None, force=False)
-        logger.info(f"Bulk ingest: {bulk_result['total_transactions']} new transactions")
+        from data_ingestion.bulk_edgar import rebuild_from_bulk
+        bulk_result = rebuild_from_bulk(start_year=2020)
+        logger.info(f"Bulk rebuild: {bulk_result['total_transactions']} transactions, "
+                    f"{bulk_result['amended_rows_removed']} replaced by amendments, "
+                    f"{bulk_result['duplicate_rows_removed']} repeated trades removed")
 
     # Build universe dynamically from DB
     # For scoring: tickers with purchases in last 2 years
@@ -118,82 +142,63 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
     if skip_ingest:
         logger.info("SKIPPING ingestion phases 1-2.5 (--skip-ingest)")
     else:
-        # ── Phase 1: Incremental insider transaction ingestion ──
+        # ── Phase 1: Filings newer than the bulk files ──
+        # SEC's quarterly index lists every filing, so every tracked company
+        # with a new filing is reached, not only recently active ones.
         logger.info("=" * 60)
-        logger.info("PHASE 1: Incremental Form 4 ingestion")
+        logger.info("PHASE 1: Filings not yet in the bulk files (quarterly index)")
         logger.info("=" * 60)
+        from backfill_quarter_index import run_backfill, _clear_checkpoint
+        from data_ingestion.data_loader import _bulk_coverage_end
+        from data_ingestion.form4_rules import (
+            apply_amendments, merge_related_owner_filings, remove_duplicate_filings,
+            remove_self_reported)
+        from data_ingestion.company_identity import assign_tickers, merge_predecessors
+        from data_ingestion.edgar_client import fetch_sec_company_list
 
-        phase1_done = _load_checkpoint("phase1_ingest")
-        logger.info(f"  Checkpoint: {len(phase1_done)} tickers already completed")
-        phase1_skipped = 0
-
-        for i, ticker in enumerate(incremental_tickers):
-            if ticker in phase1_done:
-                phase1_skipped += 1
-                continue
-
-            if (i + 1) % 100 == 0:
-                elapsed = time.time() - start_time
-                stats = get_rate_stats()
-                logger.info(
-                    f"  Progress: {i+1}/{len(incremental_tickers)} ({elapsed:.0f}s elapsed, "
-                    f"{new_txn_total} new txns, delay={stats['current_delay']:.2f}s, "
-                    f"503s={stats['total_503s']})"
-                )
-                _save_checkpoint("phase1_ingest", phase1_done)
-
+        conn = get_db()
+        coverage_end = _bulk_coverage_end(conn)
+        conn.close()
+        for year, quarter in _quarters_after(coverage_end):
+            # The table was just rebuilt, so a checkpoint from an earlier
+            # attempt today would skip companies whose rows no longer exist.
+            _clear_checkpoint(year, quarter)
             try:
-                count = ingest_incremental(ticker, ticker_map)
-                if count > 0:
-                    new_txn_total += count
-                    tickers_with_new.append((ticker, count))
-                phase1_done.add(ticker)
+                result = run_backfill(year, quarter)
+                new_txn_total += result["inserted"]
             except Exception as e:
-                err_str = str(e)
-                if "503" in err_str or "Failed after" in err_str:
-                    errors.append(f"{ticker}: {e} (will retry next run)")
-                    logger.warning(f"Persistent 503 on {ticker} — skipping for now, will retry next run")
-                else:
-                    errors.append(f"{ticker}: {e}")
-                    logger.warning(f"Error on {ticker}: {e}")
-                    phase1_done.add(ticker)
+                errors.append(f"{year}q{quarter} index tail: {e}")
+                logger.error(f"Index tail for {year}q{quarter} failed: {e}")
 
-        _save_checkpoint("phase1_ingest", phase1_done)
-        remaining = len(incremental_tickers) - len(phase1_done)
-        logger.info(
-            f"Phase 1 complete: {new_txn_total} new transactions across {len(tickers_with_new)} tickers "
-            f"(skipped {phase1_skipped} from checkpoint, {remaining} remaining for retry)"
-        )
+        # The tail can bring a new holding company's first filings (and its
+        # claim on an existing ticker), so redo the company matching.
+        sec_map, sec_titles = fetch_sec_company_list()
+        conn = get_db()
+        merge_predecessors(conn, sec_map)
+        assign_tickers(conn, sec_map, sec_titles)
+        # Written by the retired fix_ticker_symbols.py; assign_tickers replaces it.
+        conn.execute("DROP TABLE IF EXISTS ticker_fix_failures")
+        amended = apply_amendments(conn)
+        repeated = remove_duplicate_filings(conn)
+        repeated += merge_related_owner_filings(conn)
+        self_reported = remove_self_reported(conn)
+        conn.close()
+        logger.info(f"Phase 1 complete: {new_txn_total} new transactions, "
+                    f"{amended} rows replaced by amendments, {repeated} repeated trades removed, "
+                    f"{self_reported} filed under the company's own name removed")
 
-        # ── Phase 2: Refresh shares outstanding ──
-        shares_refreshed = 0
+        # ── Phase 2: Rebuild share counts ──
         if not skip_shares:
             logger.info("=" * 60)
-            logger.info("PHASE 2: Shares outstanding refresh")
+            logger.info("PHASE 2: Share counts from SEC company facts")
             logger.info("=" * 60)
-
-            phase2_done = _load_checkpoint("phase2_shares")
-            logger.info(f"  Checkpoint: {len(phase2_done)} tickers already completed")
-
-            for i, ticker in enumerate(incremental_tickers):
-                if ticker in phase2_done:
-                    continue
-
-                if (i + 1) % 100 == 0:
-                    logger.info(f"  Shares progress: {i+1}/{len(incremental_tickers)}")
-                    _save_checkpoint("phase2_shares", phase2_done)
-
-                try:
-                    count = ingest_shares_outstanding(ticker, ticker_map)
-                    shares_refreshed += count
-                    phase2_done.add(ticker)
-                except Exception as e:
-                    if "503" not in str(e) and "Failed after" not in str(e):
-                        phase2_done.add(ticker)
-                    errors.append(f"{ticker} (shares): {e}")
-
-            _save_checkpoint("phase2_shares", phase2_done)
-            logger.info(f"Phase 2 complete: {shares_refreshed} shares records refreshed")
+            from data_ingestion.share_counts import refresh_share_tables
+            conn = get_db()
+            # Written by the retired backfill_shares_outstanding.py.
+            conn.execute("DROP TABLE IF EXISTS shares_backfill_failures")
+            stats = refresh_share_tables(conn)
+            conn.close()
+            logger.info(f"Phase 2 complete: {stats}")
 
         # ── Phase 2.5: Populate missing sectors ──
         if not skip_sectors:
@@ -277,13 +282,14 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
             LIMIT 1
         """, (ticker,)).fetchone()
 
-        # Get latest shares outstanding
+        # Latest share count from the year before the price (an older count
+        # times today's price is not today's market cap)
         shares_row = cur.execute("""
             SELECT shares FROM shares_outstanding
-            WHERE company_id = ?
+            WHERE company_id = ? AND date >= date(?, '-400 days')
             ORDER BY date DESC
             LIMIT 1
-        """, (company_id,)).fetchone()
+        """, (company_id, price_row[0] if price_row else None)).fetchone()
 
         if price_row and shares_row and price_row[1] and shares_row[0]:
             # Both available: compute market cap
@@ -365,7 +371,10 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
 
     # Check coverage
     total_tickers = len(tickers)
-    completed_tickers = len(phase1_done) if not skip_ingest else len(incremental_tickers)
+    # The bulk rebuild and index tail cover every tracked company at once, so
+    # coverage is all-or-nothing: complete unless a tail quarter failed.
+    tail_failed = any("index tail" in e for e in errors)
+    completed_tickers = 0 if tail_failed else total_tickers
     coverage_pct = (completed_tickers / total_tickers * 100) if total_tickers else 0
 
     report = _generate_report(
@@ -445,7 +454,7 @@ def _generate_report(df, old_signals, tickers, new_txn_total, tickers_with_new,
         for _, row in clusters.iterrows():
             lines.append(f"  {row['ticker']:<6} | Composite: {row['composite']:.4f} | "
                         f"Cluster Score: {row['cluster_score_raw']:.1f} | "
-                        f"Share Δ4Q: {row.get('share_delta_4q', 0):.2f}%")
+                        f"Share Δ4Q: {fmt_pct(row.get('share_delta_4q'))}")
     else:
         lines.append("  (none)")
 

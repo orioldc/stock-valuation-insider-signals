@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_ingestion.data_loader import load_universe, load_russell2000_additions, get_db
 from signals.composite_scorer import score_universe
+from signals.share_count_change import fmt_pct
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ def run_quick_refresh():
         for _, row in clusters.iterrows():
             print(f"  {row['ticker']:<6} | Composite: {row['composite']:.4f} | "
                   f"Cluster Score: {row.get('cluster_score_raw', 0):.1f} | "
-                  f"Share Δ4Q: {row.get('share_delta_4q', 0):.2f}%")
+                  f"Share Δ4Q: {fmt_pct(row.get('share_delta_4q'))}")
     
     if old_signals is not None and not old_signals.empty and not clusters.empty:
         old_cluster_tickers = set(old_signals[old_signals.get("cluster_detected", False) == True]["ticker"]) if "cluster_detected" in old_signals.columns else set()

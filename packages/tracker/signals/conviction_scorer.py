@@ -86,8 +86,8 @@ def score_signal(row):
     result["breakdown"]["sweet_spot"] = sweet_spot
     result["breakdown"]["sweet_spot_reason"] = reason
     
-    # 2. Buyback intensity (0-20) — based on share_delta_4q
-    delta_4q = row.get("share_delta_4q") or 0
+    # 2. Buyback intensity (0-20) — based on share_delta_4q, only for a confirmed buyback
+    delta_4q = row.get("share_delta_4q") if row.get("share_trend") == "buyback" else 0
     if delta_4q < -5:
         result["buyback_intensity"] = 20
     elif delta_4q < -3:

@@ -229,8 +229,7 @@ function ClusterView({ data, hostContext }: { data: ClusterData; hostContext?: M
         )}
         {buyback && (
           <>
-            <div className={styles.stat}><span className={styles.statLabel}>Buyback QoQ</span><span className={styles.statValue}>{fmtPct(buyback.delta_qoq)}</span></div>
-            <div className={styles.stat}><span className={styles.statLabel}>Buyback 4Q</span><span className={styles.statValue}>{fmtPct(buyback.delta_4q)}</span></div>
+            <div className={styles.stat}><span className={styles.statLabel}>Shares vs. Year Ago</span><span className={styles.statValue}>{fmtPct(buyback.delta_4q)}</span></div>
             {typeof buyback.relevance_score === "number" && (
               <div className={styles.stat}>
                 <span className={styles.statLabel}>Buyback Relevance</span>

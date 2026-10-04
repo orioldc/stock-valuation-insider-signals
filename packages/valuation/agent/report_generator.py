@@ -547,14 +547,22 @@ def _build_full_report(r: dict) -> str:
         if insider.get("quality"):
             lines.append(f"| Signal Quality | {insider['quality']} |")
         lines.append(f"| Insider Cluster Detected | {'✅ Yes' if insider.get('cluster_detected') else 'No'} |")
+        if insider.get("cluster_detected") and insider.get("cluster_n_insiders"):
+            lines.append(f"| Insiders in Cluster | {insider['cluster_n_insiders']} |")
+            lines.append(f"| Cluster Buy Value | ${insider.get('cluster_total_value', 0):,.0f} |")
+        window = insider.get("count_window_days", 120)
         if insider.get("n_insiders"):
-            lines.append(f"| Insiders in Cluster | {insider['n_insiders']} |")
+            lines.append(f"| Insiders Buying (last {window} days) | {insider['n_insiders']} |")
         if insider.get("total_value"):
-            lines.append(f"| Total Buy Value | ${insider['total_value']:,.0f} |")
+            lines.append(f"| Bought (last {window} days) | ${insider['total_value']:,.0f} |")
+        if insider.get("trades_unpriced"):
+            lines.append(f"| Trades Filed Without a Price | {insider['trades_unpriced']} (not in the totals) |")
         if insider.get("share_delta_4q") is not None:
-            lines.append(f"| Share Buyback (4Q) | {insider['share_delta_4q']:.1f}% |")
+            lines.append(f"| Shares vs. Year Ago | {insider['share_delta_4q']:+.1f}% |")
         if insider.get("latest_transaction_date"):
             lines.append(f"| Last Transaction | {insider['latest_transaction_date']} |")
+        if insider.get("data_through"):
+            lines.append(f"| Filings Included Up To | {insider['data_through']} |")
         if insider.get("insider_summary"):
             lines.append(f"\n_{insider['insider_summary']}_")
         lines.append("")
@@ -705,9 +713,10 @@ def _build_telegram_summary(r: dict) -> str:
         if insider.get("conviction_score") is not None:
             lines.append(f"Conviction: {insider['conviction_score']}/100 ({insider.get('quality', 'N/A')})")
         if insider.get("cluster_detected"):
-            lines.append(f"✅ Insider cluster: {insider.get('n_insiders', 0)} insiders, ${insider.get('total_value', 0):,.0f} bought")
-        if insider.get("share_delta_4q", 0) < -1:
-            lines.append(f"📉 Buyback: {insider['share_delta_4q']:.1f}% share reduction (4Q)")
+            lines.append(f"✅ Insider cluster: {insider.get('cluster_n_insiders', 0)} insiders, "
+                         f"${insider.get('cluster_total_value', 0):,.0f} bought")
+        if insider.get("share_trend") == "buyback":
+            lines.append(f"📉 Buyback: {insider['share_delta_4q']:.1f}% fewer shares than a year earlier")
     else:
         lines.append(f"\n🔍 Not in Insider Tracker universe")
 

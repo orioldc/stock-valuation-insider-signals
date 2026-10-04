@@ -447,10 +447,11 @@ def check_red_flags(profile: dict, financials: dict, insider_signal: dict | None
         )
 
     # Insider signal cross-reference
-    if insider_signal:
-        if insider_signal.get("share_delta_4q", 0) > 5:
+    # A stale share trend (period ended over a year ago) says nothing about now.
+    if insider_signal and insider_signal.get("share_trend") != "stale":
+        if (insider_signal.get("share_delta_4q") or 0) > 5:
             flags.append(
-                f"Share count has grown {insider_signal['share_delta_4q']:.1f}% in trailing 4Q — "
+                f"Share count has grown {insider_signal['share_delta_4q']:.1f}% on a year earlier — "
                 "dilution partially offsets insider buying signal."
             )
 

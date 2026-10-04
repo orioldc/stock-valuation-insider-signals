@@ -39,6 +39,7 @@ def score_universe(tickers, date=None):
     """Score all tickers and return ranked DataFrame.
 
     Weights: 0.6 × size-adjusted insider cluster + 0.4 × size-adjusted buyback.
+    share_delta_4q is None when the company's filings give no share count change.
     """
     if date is None:
         date = datetime.now().strftime("%Y-%m-%d")
@@ -125,8 +126,9 @@ def _store_signals(df, date):
             "share_norm": row["share_norm"],
             "share_adj": row.get("share_adj"),
             "share_pct": row.get("share_pct"),
-            "share_delta_qoq": row["share_delta_qoq"],
-            "share_delta_4q": row["share_delta_4q"],
+            "share_delta_qoq": None if pd.isna(row["share_delta_qoq"]) else row["share_delta_qoq"],
+            "share_delta_4q": None if pd.isna(row["share_delta_4q"]) else row["share_delta_4q"],
+            "share_trend": row["share_trend"],
             "cluster_detected": bool(row["cluster_detected"]),
             "cap_tier": row.get("cap_tier"),
             "tier_weight": row.get("tier_weight"),

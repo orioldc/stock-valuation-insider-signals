@@ -16,9 +16,20 @@ import sqlite3
 import logging
 import zipfile
 import time
+import sys
 import requests
 from datetime import datetime
 from typing import Optional, Set
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from form4_rules import (  # noqa: E402
+    TRANSACTION_FORM_TYPES, apply_amendments, merge_related_owner_filings, normalize_cik,
+    normalize_price, pick_primary_owner, relationship_from_bulk, remove_duplicate_filings,
+    remove_self_reported,
+)
+from company_identity import (  # noqa: E402
+    assign_tickers, company_for_cik, merge_predecessors, record_issuer_tickers,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -218,30 +229,6 @@ def _save_checkpoint(ingested):
         json.dump({"ingested": list(ingested), "updated": datetime.now().isoformat()}, f)
 
 
-def _get_or_create_company(conn, ticker, cik, name=None):
-    """Get company_id, creating if needed. Matches on CIK first, then ticker."""
-    cur = conn.cursor()
-    
-    if cik:
-        cur.execute("SELECT id FROM companies WHERE cik = ?", (int(cik),))
-        row = cur.fetchone()
-        if row:
-            return row[0]
-    
-    if ticker:
-        cur.execute("SELECT id FROM companies WHERE ticker = ?", (ticker,))
-        row = cur.fetchone()
-        if row:
-            if cik:
-                cur.execute("UPDATE companies SET cik = ? WHERE id = ?", (int(cik), row[0]))
-            return row[0]
-    
-    cur.execute("INSERT INTO companies (ticker, cik, name) VALUES (?, ?, ?)",
-                (ticker or f"CIK{cik}", int(cik) if cik else None, name))
-    conn.commit()
-    return cur.lastrowid
-
-
 def _safe_float(val):
     """Parse float from string, returning None on failure."""
     if not val or not val.strip():
@@ -281,82 +268,85 @@ def ingest_quarter(year, quarter, ticker_filter=None):
     
     logger.info(f"  Loaded: {len(submissions)} submissions, {len(nonderiv)} transactions, {len(owners)} owners")
     
-    # Build submission lookup: accession -> {cik, ticker, name, filing_date}
+    # Build submission lookup: accession -> issuer, form type, dates
     sub_map = {}
     for s in submissions:
         acc = s.get("ACCESSION_NUMBER", "").strip()
         if not acc:
             continue
-        ticker = s.get("ISSUERTRADINGSYMBOL", "").strip().upper()
+        doc_type = s.get("DOCUMENT_TYPE", "").strip().upper()
+        if doc_type not in TRANSACTION_FORM_TYPES:
+            continue
         sub_map[acc] = {
-            "cik": s.get("ISSUERCIK", "").strip().lstrip("0"),
+            "cik": normalize_cik(s.get("ISSUERCIK", "")),
             "issuer_name": s.get("ISSUERNAME", "").strip(),
-            "ticker": ticker,
+            "ticker": s.get("ISSUERTRADINGSYMBOL", "").strip().upper(),
             "filing_date": _parse_sec_date(s.get("FILING_DATE", "")),
+            "document_type": doc_type,
+            "date_of_orig_sub": _parse_sec_date(s.get("DATE_OF_ORIG_SUB", "")),
         }
-    
-    # Build owner lookup: accession -> {name, cik, relationship, title}
-    owner_map = {}
+
+    # Build owner lookup: accession -> main owner (joint filings collapse to one)
+    owners_by_acc = {}
     for o in owners:
         acc = o.get("ACCESSION_NUMBER", "").strip()
-        if not acc:
-            continue
-        if acc not in owner_map:
-            owner_map[acc] = []
-        owner_map[acc].append({
-            "name": o.get("RPTOWNERNAME", "").strip(),
-            "cik": o.get("RPTOWNERCIK", "").strip().lstrip("0"),
-            "relationship": o.get("RPTOWNER_RELATIONSHIP", "").strip(),
-            "title": o.get("RPTOWNER_TITLE", "").strip(),
-        })
-    
-    # Ingest transactions
+        if acc in sub_map:
+            owners_by_acc.setdefault(acc, []).append({
+                "name": o.get("RPTOWNERNAME", "").strip(),
+                "cik": normalize_cik(o.get("RPTOWNERCIK", "")),
+                "relationship": relationship_from_bulk(
+                    o.get("RPTOWNER_RELATIONSHIP", ""), o.get("RPTOWNER_TITLE", "")),
+            })
+    owner_map = {acc: pick_primary_owner(lst) for acc, lst in owners_by_acc.items()}
+
+    # Number each filing's trade lines in document order (the SK rises with it).
+    def _sk(txn):
+        try:
+            return int(txn.get("NONDERIV_TRANS_SK", "0"))
+        except ValueError:
+            return 0
+    nonderiv = sorted((t for t in nonderiv if t.get("ACCESSION_NUMBER", "").strip() in sub_map),
+                      key=lambda t: (t["ACCESSION_NUMBER"].strip(), _sk(t)))
+
     conn = sqlite3.connect(DB_PATH)
     inserted = 0
     skipped = 0
     errors = 0
-    
+    line_by_acc = {}
+    company_ids = {}
+
     for txn in nonderiv:
-        acc = txn.get("ACCESSION_NUMBER", "").strip()
-        sub = sub_map.get(acc)
-        if not sub:
-            skipped += 1
-            continue
-        
+        acc = txn["ACCESSION_NUMBER"].strip()
+        sub = sub_map[acc]
+        line_number = line_by_acc[acc] = line_by_acc.get(acc, 0) + 1
+
         ticker = sub["ticker"]
         if ticker_filter and ticker not in ticker_filter:
             skipped += 1
             continue
-        
+
         txn_code = txn.get("TRANS_CODE", "").strip()
         shares = _safe_float(txn.get("TRANS_SHARES"))
-        price = _safe_float(txn.get("TRANS_PRICEPERSHARE"))
+        price = normalize_price(_safe_float(txn.get("TRANS_PRICEPERSHARE")))
         shares_after = _safe_float(txn.get("SHRS_OWND_FOLWNG_TRANS"))
         filing_date = sub["filing_date"]
         txn_date_raw = _parse_sec_date(txn.get("TRANS_DATE", ""))
         txn_date = normalize_transaction_date(txn_date_raw, filing_date)
         acq_disp = txn.get("TRANS_ACQUIRED_DISP_CD", "").strip()
-        
-        # Get owner info
-        owner_list = owner_map.get(acc, [])
-        if owner_list:
-            owner = owner_list[0]
-            insider_name = owner["name"]
-            insider_cik = owner["cik"]
-            relationship = owner["relationship"]
-            if owner["title"]:
-                relationship = f"{relationship} ({owner['title']})" if relationship else owner["title"]
-        else:
-            insider_name = ""
-            insider_cik = ""
-            relationship = "Unknown"
-        
-        company_id = _get_or_create_company(conn, ticker, sub["cik"], sub["issuer_name"])
-        
+        owner = owner_map.get(acc) or pick_primary_owner([])
+
+        if not sub["cik"]:
+            errors += 1
+            continue
+        if sub["cik"] not in company_ids:
+            company_ids[sub["cik"]] = company_for_cik(conn, sub["cik"], sub["issuer_name"])
+        company_id = company_ids[sub["cik"]]
+
         raw_json = json.dumps({
-            "insider_name": insider_name,
-            "insider_cik": insider_cik,
-            "relationship": relationship,
+            "insider_name": owner["name"],
+            "insider_cik": owner["cik"],
+            "relationship": owner["relationship"],
+            "all_owners": owner["all_owners"],
             "transaction_code": txn_code,
             "transaction_date": txn_date,
             "shares": shares,
@@ -364,25 +354,42 @@ def ingest_quarter(year, quarter, ticker_filter=None):
             "total_value": (shares * price) if (shares and price) else None,
             "shares_owned_after": shares_after,
             "acq_disp": acq_disp,
+            "ownership": txn.get("DIRECT_INDIRECT_OWNERSHIP", "").strip(),
+            "ownership_nature": txn.get("NATURE_OF_OWNERSHIP", "").strip(),
+            "accession_number": acc,
+            "document_type": sub["document_type"],
         })
-        
+
         try:
-            conn.execute("""
+            cur = conn.execute("""
                 INSERT OR IGNORE INTO insider_transactions
                 (company_id, filing_date, transaction_date, reporting_name, reporting_cik,
-                 transaction_type, shares_transacted, price, shares_owned_after, source, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'EDGAR_BULK', ?)
-            """, (company_id, filing_date, txn_date, insider_name, insider_cik,
-                  txn_code, shares, price, shares_after, raw_json))
-            inserted += 1
+                 transaction_type, shares_transacted, price, shares_owned_after, source, raw_json,
+                 accession_number, line_number, document_type, date_of_orig_sub)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'EDGAR_BULK', ?, ?, ?, ?, ?)
+            """, (company_id, filing_date, txn_date, owner["name"], owner["cik"],
+                  txn_code, shares, price, shares_after, raw_json,
+                  acc, line_number, sub["document_type"], sub["date_of_orig_sub"]))
+            inserted += cur.rowcount
         except Exception as e:
             errors += 1
             if errors <= 5:
                 logger.warning(f"Insert error: {e}")
-    
+
+    # What each issuer called itself this quarter, for assigning tickers later.
+    seen = {}
+    for sub in sub_map.values():
+        if sub["cik"] and sub["filing_date"]:
+            key = (sub["cik"], sub["ticker"])
+            name, first, last = seen.get(key, (sub["issuer_name"], sub["filing_date"], sub["filing_date"]))
+            if sub["filing_date"] >= last:
+                name = sub["issuer_name"]
+            seen[key] = (name, min(first, sub["filing_date"]), max(last, sub["filing_date"]))
+    record_issuer_tickers(conn, seen)
+
     conn.commit()
     conn.close()
-    
+
     elapsed = time.time() - t0
     logger.info(f"  {quarter_key}: {inserted} inserted, {skipped} skipped, {errors} errors ({elapsed:.1f}s)")
     return {"status": "ok", "transactions": inserted, "skipped": skipped, "errors": errors}
@@ -397,7 +404,10 @@ def download_quarter(year, quarter, use_wayback=False):
     if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
         return local_path
     
+    # SEC publishes 2026q2 onward under datastandardsinnovation/; older quarters
+    # are still under structureddata/. Try both so either era resolves.
     urls = [
+        f"https://www.sec.gov/files/datastandardsinnovation/data/insider-transactions-data-sets/{filename}",
         f"https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/{filename}",
     ]
     if use_wayback:
@@ -413,6 +423,11 @@ def download_quarter(year, quarter, use_wayback=False):
                 with open(local_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         f.write(chunk)
+                # An archive or error page can answer 200 with HTML; keep only real zips.
+                if not zipfile.is_zipfile(local_path):
+                    os.remove(local_path)
+                    logger.warning(f"  {url}: response was not a zip file")
+                    continue
                 logger.info(f"  Downloaded {filename} ({os.path.getsize(local_path) / 1024 / 1024:.1f} MB)")
                 return local_path
             else:
@@ -490,6 +505,61 @@ def ingest_all_bulk(start_year=2020, ticker_filter=None, force=False):
     
     logger.info(f"Bulk ingestion complete: {total_txns} transactions across {len(results)} quarters")
     return {"total_transactions": total_txns, "quarters": results}
+
+
+def rebuild_from_bulk(start_year=2020):
+    """Empty insider_transactions and reload it from every bulk quarter.
+
+    SEC publishes a quarter's file a few days after the quarter ends, so the
+    current quarter and (early in a quarter) the previous one may not exist
+    yet; the per-filing step covers filings after the newest loaded quarter.
+    Any other missing quarter would leave a silent hole in the history, so
+    this raises instead of publishing a partial table.
+    Trades are filed under their issuer's CIK. Once all quarters are in,
+    re-registered companies are folded into their successors and every
+    company gets the ticker SEC lists for it today (see company_identity).
+    Returns the ingest_all_bulk result plus the rows removed by the amendment
+    and duplicate-filing passes and the CIKs folded together.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "db"))
+    from init_db import reset_insider_transactions
+    from edgar_client import fetch_sec_company_list
+
+    # Fetched first: without it tickers can't be assigned, so don't load anything.
+    sec_map, sec_titles = fetch_sec_company_list()
+
+    conn = sqlite3.connect(DB_PATH)
+    reset_insider_transactions(conn)
+    conn.close()
+
+    result = ingest_all_bulk(start_year=start_year, force=True)
+    statuses = [q["status"] for q in result["quarters"]]
+    # Strip up to two trailing unpublished quarters; everything before must be ok.
+    trailing = 0
+    while trailing < 2 and statuses and statuses[-1 - trailing] != "ok":
+        trailing += 1
+    failed = [q["quarter"] for q in result["quarters"][:len(statuses) - trailing]
+              if q["status"] != "ok"]
+    if failed:
+        raise RuntimeError(f"Bulk quarters failed to load: {failed}")
+    if trailing:
+        logger.info(f"Not yet published by SEC (covered per-filing): "
+                    f"{[q['quarter'] for q in result['quarters'][-trailing:]]}")
+
+    conn = sqlite3.connect(DB_PATH)
+    result["merged_ciks"] = merge_predecessors(conn, sec_map)
+    result["tickers_changed"] = assign_tickers(conn, sec_map, sec_titles)
+    result["amended_rows_removed"] = apply_amendments(conn)
+    result["duplicate_rows_removed"] = remove_duplicate_filings(conn)
+    result["duplicate_rows_removed"] += merge_related_owner_filings(conn)
+    result["self_reported_rows_removed"] = remove_self_reported(conn)
+    conn.close()
+    logger.info(f"Folded {len(result['merged_ciks'])} old CIKs into their successors; "
+                f"{result['tickers_changed']} company tickers or names updated")
+    logger.info(f"Amendments replaced {result['amended_rows_removed']} superseded rows; "
+                f"{result['duplicate_rows_removed']} trades repeated in other filings removed, "
+                f"{result['self_reported_rows_removed']} filed under the company's own name removed")
+    return result
 
 
 if __name__ == "__main__":

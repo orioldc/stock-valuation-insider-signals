@@ -369,24 +369,29 @@ print(db); print(csv); print(hist_csv); print(frozen_json); print(checksums)
       mv -f "$TEMP_DIR/insider_signals.db" "$DB_PATH"
       echo "[install]   → $DB_PATH"
 
-      # Download optional assets (no checksum verification for these — they're informational)
+      # Download optional assets (no checksum verification for these — they're informational).
+      # Each goes to the staging folder first and is renamed into place, so the
+      # bridge never reads half a file during a background update.
       if [[ -n "$CSV_URL" ]]; then
         echo "[install]   → $CSV_URL"
-        curl -fL --progress-bar -o "$REPO_ROOT/data/latest_signals.csv" "$CSV_URL"
+        curl -fL --progress-bar -o "$TEMP_DIR/latest_signals.csv" "$CSV_URL"
+        mv -f "$TEMP_DIR/latest_signals.csv" "$REPO_ROOT/data/latest_signals.csv"
         echo "[install]   → $REPO_ROOT/data/latest_signals.csv"
       else
         echo "[install] NOTE: latest_signals.csv not present in release; size-adjusted scanner will return empty until refresh."
       fi
       if [[ -n "$HIST_CSV_URL" ]]; then
         echo "[install]   → $HIST_CSV_URL"
-        curl -fL --progress-bar -o "$REPO_ROOT/data/historical_clusters.csv" "$HIST_CSV_URL"
+        curl -fL --progress-bar -o "$TEMP_DIR/historical_clusters.csv" "$HIST_CSV_URL"
+        mv -f "$TEMP_DIR/historical_clusters.csv" "$REPO_ROOT/data/historical_clusters.csv"
         echo "[install]   → $REPO_ROOT/data/historical_clusters.csv"
       else
         echo "[install] NOTE: historical_clusters.csv not present in release; historical accuracy scoring will degrade to 0 until backtest runs."
       fi
       if [[ -n "$FROZEN_JSON_URL" ]]; then
         echo "[install]   → $FROZEN_JSON_URL"
-        curl -fL --progress-bar -o "$REPO_ROOT/data/insider_frozen.json.gz" "$FROZEN_JSON_URL"
+        curl -fL --progress-bar -o "$TEMP_DIR/insider_frozen.json.gz" "$FROZEN_JSON_URL"
+        mv -f "$TEMP_DIR/insider_frozen.json.gz" "$REPO_ROOT/data/insider_frozen.json.gz"
         echo "[install]   → $REPO_ROOT/data/insider_frozen.json.gz"
       else
         echo "[install] NOTE: insider_frozen.json.gz not present in release; frozen fallback will use committed snapshot until monthly build runs."

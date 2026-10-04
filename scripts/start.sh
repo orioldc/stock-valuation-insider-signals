@@ -22,24 +22,41 @@ PORT="${MCP_API_PORT:-8502}"
 LOG_DIR="$REPO_ROOT/logs"
 mkdir -p "$LOG_DIR"
 
-# Check for stale data snapshot (non-fatal, warn only).
-if [[ -f "$REPO_ROOT/data/.data_release" ]]; then
-  INSTALLED_TAG="$(cat "$REPO_ROOT/data/.data_release" 2>/dev/null || echo "")"
-  if [[ -n "$INSTALLED_TAG" ]]; then
-    LATEST_TAG="$(curl -m 3 -sSL "https://api.github.com/repos/orioldc/stock-valuation-insider-signals/releases?per_page=30" 2>/dev/null \
-      | python3 -c "
+# Keep the data current: when a newer monthly snapshot has been published,
+# download it in the background so Claude Desktop is not kept waiting.
+# install.sh checks the download (checksum, decompress, sanity check) before it
+# replaces the database, so a failed download leaves the current data in place.
+# The tag of the installed snapshot is kept in data/.data_release; a missing
+# file (installs from before it existed) counts as out of date.
+# Set INSIDER_NO_AUTO_UPDATE=1 to only warn instead.
+INSTALLED_TAG="$(cat "$REPO_ROOT/data/.data_release" 2>/dev/null || echo "")"
+# Same choice as install.sh: the newest data-* release that has the database.
+LATEST_TAG="$(curl -m 3 -sSL "https://api.github.com/repos/orioldc/stock-valuation-insider-signals/releases?per_page=30" 2>/dev/null \
+  | python3 -c "
 import json, sys
 try:
     for r in json.load(sys.stdin):
-        if r.get('tag_name', '').startswith('data-') and not r.get('draft') and not r.get('prerelease'):
+        if not r.get('tag_name', '').startswith('data-') or r.get('draft') or r.get('prerelease'):
+            continue
+        if any(a.get('name') == 'insider_signals.db.xz' for a in r.get('assets', [])):
             print(r['tag_name'])
             break
-except: pass
+except Exception:
+    pass
 " 2>/dev/null || echo "")"
-    if [[ -n "$LATEST_TAG" && "$INSTALLED_TAG" != "$LATEST_TAG" ]]; then
-      echo "[start] WARNING: data snapshot is behind (installed=$INSTALLED_TAG, latest=$LATEST_TAG)" >&2
-      echo "[start]   Run: bash scripts/install.sh --db-only --force" >&2
-    fi
+if [[ -n "$LATEST_TAG" && "$INSTALLED_TAG" != "$LATEST_TAG" ]]; then
+  echo "[start] data snapshot is behind (installed=${INSTALLED_TAG:-unknown}, latest=$LATEST_TAG)" >&2
+  # A lock left by a crash or reboot is cleared after two hours.
+  find "$REPO_ROOT/data" -maxdepth 1 -name .updating -mmin +120 -exec rmdir {} \; 2>/dev/null || true
+  if [[ "${INSIDER_NO_AUTO_UPDATE:-0}" == "1" ]]; then
+    echo "[start]   Run: bash scripts/install.sh --db-only --force" >&2
+  elif mkdir "$REPO_ROOT/data/.updating" 2>/dev/null; then
+    # The lock directory stops two launches downloading at the same time.
+    echo "[start]   downloading $LATEST_TAG in the background (log: logs/data_update.log)" >&2
+    nohup bash -c 'bash "$1/install.sh" --db-only --force; rmdir "$2/data/.updating"' _ \
+      "$SCRIPT_DIR" "$REPO_ROOT" > "$LOG_DIR/data_update.log" 2>&1 &
+  else
+    echo "[start]   an update is already running" >&2
   fi
 fi
 

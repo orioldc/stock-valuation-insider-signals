@@ -28,7 +28,7 @@ You don't need a GitHub account, an FMP API key, or any other paid service. The 
 
 ## For AI agents
 
-If an AI assistant (Claude, ChatGPT, Cursor, etc.) is helping you install this, point it at [`MACHINE-INSTALL.md`](MACHINE-INSTALL.md) — that's the canonical scripted-install path with exit codes and recovery procedures. The one-liner version is:
+If an AI assistant (Claude, ChatGPT, Cursor, etc.) is helping you install this, point it at [`MACHINE-INSTALL.md`](MACHINE-INSTALL.md) — that's the canonical scripted-install path with exit codes and recovery procedures. To update an existing install, follow its section [Updating to the latest release](MACHINE-INSTALL.md#updating-to-the-latest-release). The one-liner version is:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/orioldc/stock-valuation-insider-signals/main/scripts/bootstrap.sh | bash
@@ -50,7 +50,7 @@ That's it for the install step.
 
 ## What you'll see on first launch
 
-When you next open Claude Desktop, the extension takes **2–3 minutes** to set itself up (downloading ~98 MB of data, creating a Python virtualenv, installing dependencies). You can leave Claude Desktop open and use it for unrelated chats while this happens.
+When you next open Claude Desktop, the extension takes **2–3 minutes** to set itself up (downloading ~220 MB of data, creating a Python virtualenv, installing dependencies). You can leave Claude Desktop open and use it for unrelated chats while this happens.
 
 You'll know it worked when you start a new chat and ask:
 
@@ -74,6 +74,19 @@ Four tools become available inside Claude:
 | **What's it worth?** (`run-valuation`) | "Run a discounted-cash-flow valuation on this ticker. Tell me if it looks under-, over-, or fairly valued." |
 
 The signal ranking uses **size-adjusted scoring** — a 3% buyback at a $130B company can outrank a 20% buyback at a $50M company. This is on purpose: research shows mid- and large-cap insider activity is more reliable than micro-cap noise.
+
+---
+
+## Getting new data
+
+A new data release is published each month. How you get it depends on your extension version:
+
+- **v0.1.5 or later:** nothing to do. Each time Claude Desktop starts, the extension checks for a newer data release and downloads it in the background. New chats use the new data when the download finishes.
+- **v0.1.4 or earlier:** these versions download data only once, at first install. To get new data, download the newest `.mcpb` from the [releases page](https://github.com/orioldc/stock-valuation-insider-signals/releases), double-click it, and restart Claude Desktop. After that, data updates are automatic.
+
+Not sure which version you have? Open Claude Desktop → **Settings → Extensions** and look at the version number. If you installed with the Terminal one-liner, run the one-liner again: it updates both code and data.
+
+To check which data release you have, see [MACHINE-INSTALL.md](MACHINE-INSTALL.md#step-2-compare-the-installed-data-with-the-latest-release).
 
 ---
 
@@ -147,17 +160,18 @@ The signal scoring is documented in `packages/tracker/signals/`:
 
 These sections are for developers / quants who want to refresh data themselves or run the components standalone. **You can ignore this section if you're a noob — the install above is all you need.**
 
-### Refresh data with your own FMP key
+### Refresh data yourself
 
-The default install ships with the monthly snapshot and does not need an API key. To pull fresher data:
+The insider and share-count data comes from SEC EDGAR and prices come from Yahoo Finance. Neither needs an API key. To pull filings newer than the monthly release:
 
-1. Sign up at [financialmodelingprep.com](https://site.financialmodelingprep.com/) (insider-trading endpoint requires a paid plan).
-2. Set the FMP API key in Claude Desktop's extension settings, or:
-   ```bash
-   cd ~/Library/Application\ Support/Claude/Claude\ Extensions/.../stock-valuation-insider-signals
-   export FMP_API_KEY=your_key_here
-   ./.venv/bin/python packages/tracker/refresh.py
-   ```
+```bash
+cd <install folder>   # see MACHINE-INSTALL.md, "Step 1: find out how the user installed it"
+./.venv/bin/python packages/tracker/refresh.py
+```
+
+A monthly release runs more steps after this one: price download and cleanup, rescoring, validation and a correctness audit against SEC filings (see `.github/workflows/monthly-snapshot.yml`). A home refresh skips those checks, so prefer the monthly release when accuracy matters.
+
+The optional **FMP API key** in the extension settings is used only by the valuation tool (`run-valuation`), as a second source of company financials after SEC filings. The insider data does not use it.
 
 ### Run components standalone
 

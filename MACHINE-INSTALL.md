@@ -96,13 +96,66 @@ All three should succeed (exit 0) for a healthy install.
 
 ## Updating to the latest release
 
-Re-running the bootstrap script is idempotent:
+Code and data are updated separately. A new **data release** (tag `data-YYYY-MM`) is published each month. It holds the database and the scanner files. A new **extension version** (tag `vX.Y.Z`) holds code fixes and is published only when the code changes.
+
+### Step 1: find out how the user installed it
+
+There are two install types. Each has its own update path.
+
+| Install type | Install folder | How to tell |
+|---|---|---|
+| Bootstrap script (this document) | `~/.local/share/stock-valuation-insider-signals` | The folder exists and has a `.git` folder |
+| `.mcpb` file (double-clicked by the user, see README) | Under `~/Library/Application Support/Claude/Claude Extensions/` | Find it with the command below |
+
+```bash
+# Prints the install folder of every copy that is installed.
+ls -d ~/.local/share/stock-valuation-insider-signals 2>/dev/null
+find ~/Library/Application\ Support/Claude/Claude\ Extensions -maxdepth 2 \
+  -name manifest.json -exec grep -q '"name": "stock-valuation-insider-signals"' {} \; \
+  -exec dirname {} \; 2>/dev/null
+```
+
+### Step 2: compare the installed data with the latest release
+
+```bash
+INSTALL_DIR=~/.local/share/stock-valuation-insider-signals   # or the .mcpb folder from step 1
+cat "$INSTALL_DIR/data/.data_release" 2>/dev/null || echo "unknown (installed before versions were recorded)"
+
+# The newest data release that has a database:
+curl -sSL "https://api.github.com/repos/orioldc/stock-valuation-insider-signals/releases?per_page=30" \
+  | jq -r '[.[] | select(.tag_name | startswith("data-")) | select(.draft | not) | select(.prerelease | not)
+            | select(any(.assets[]; .name == "insider_signals.db.xz"))][0].tag_name'
+```
+
+If the two tags match, the data is current. A tag that starts with `local-` is a build made on that machine, not a published release.
+
+### Step 3: update
+
+**Bootstrap installs.** Run the bootstrap again. It is safe to repeat:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/orioldc/stock-valuation-insider-signals/main/scripts/bootstrap.sh | bash
 ```
 
-It will `git pull` the latest code, re-run install.sh (which skips Python/Node deps if the sentinel exists and `--force` is not passed), and re-register the config entry. The user must restart Claude Desktop after each update.
+It resets the code to the latest `main` (local changes in the install folder are discarded), re-runs `install.sh` (Python and Node dependencies are skipped if the sentinel exists) and downloads the newest data release. Then the user restarts Claude Desktop.
+
+**`.mcpb` installs.** The user downloads the newest `.mcpb` from the [releases page](https://github.com/orioldc/stock-valuation-insider-signals/releases) and double-clicks it, then restarts Claude Desktop. An agent cannot do this step for the user (see "What the AI agent should NOT do"). Extension versions up to v0.1.4 download data only once, at first launch, and never again. A user on v0.1.4 or earlier must install a newer `.mcpb` to get new data.
+
+If the data tag from step 2 is still old after the new `.mcpb` has started once, download the data by hand:
+
+```bash
+bash "$INSTALL_DIR/scripts/install.sh" --db-only --force
+```
+
+### Automatic data updates
+
+Both install types use `scripts/start.sh`. Since extension v0.1.5, each time Claude Desktop starts the server, `start.sh` compares `data/.data_release` with the newest data release. If a newer one exists, it downloads it in the background:
+
+- The download log is `logs/data_update.log`.
+- `install.sh` checks the download (checksum, decompress, database check) before it replaces the database. If a step fails, the current data stays in place.
+- The lock folder `data/.updating` stops two downloads at the same time. A lock older than two hours is removed.
+- The server reads the new database on its next request, so no restart is needed after the download.
+- To turn this off, set `INSIDER_NO_AUTO_UPDATE=1` in the server's `env` in `claude_desktop_config.json`. `start.sh` then only prints the command to update by hand.
 
 ## Uninstalling
 

@@ -116,6 +116,14 @@ def test_cover_count_kept_when_it_agrees_with_the_average():
     assert share_counts(facts) == [{"date": "2025-07-25", "shares": 1_020.0, "source": "sec_cover"}]
 
 
+
+def test_mistyped_cover_date_falls_back_to_the_filing_date():
+    facts = _facts(
+        EntityCommonStockSharesOutstanding=[_fact(1_020, "2035-07-25", "A", "2025-08-01")],
+        WeightedAverageNumberOfSharesOutstandingBasic=_quarter_average("A", "2025-08-01", 1_000, 1_050))
+    assert share_counts(facts) == [{"date": "2025-08-01", "shares": 1_020.0, "source": "sec_cover"}]
+
+
 def test_cover_classes_are_added_up():
     # Meta-style: class A and class B on the cover, the average covers both.
     facts = _facts(

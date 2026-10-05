@@ -38,6 +38,8 @@ from collections import defaultdict
 _script_dir = Path(__file__).resolve().parent
 _tracker_dir = _script_dir.parent
 sys.path.insert(0, str(_tracker_dir / "data_ingestion"))
+if str(_tracker_dir) not in sys.path:
+    sys.path.append(str(_tracker_dir))  # for scripts.cleanup_corrupt_prices
 
 from data_ingestion.edgar_client import fetch_company_tickers
 
@@ -1965,58 +1967,28 @@ def check_failure_table_coverage(conn):
     }
 
 
-def _contract_compute_raw_market_price(ticker, transaction_date, adjusted_close, cur):
-    """
-    Compute as-transacted market price from split-back-adjusted close.
-
-    Same formula as cleanup_corrupt_prices.py and historical_backtest.py:
-    raw_market = adjusted_close × PROD(ratio for splits after txn_date)
-
-    Returns (raw_market_price, split_count)
-    """
-    cur.execute("""
-        SELECT ratio
-        FROM split_events
-        WHERE ticker = ? AND date > ?
-        ORDER BY date
-    """, (ticker, transaction_date))
-
-    splits = cur.fetchall()
-    cumulative_ratio = 1.0
-    for (ratio,) in splits:
-        cumulative_ratio *= ratio
-
-    raw_market = adjusted_close * cumulative_ratio
-    return raw_market, len(splits)
-
-
 def check_insider_transaction_price_plausibility(conn):
     """
     No corrupt insider_transactions.price values in purchase (type='P') transactions.
 
     Four categories of price issues:
     1. **Hard bound violations**: price > $1M/share (BRK-A at ~$700K must survive)
-    2. **Market cap sanity violations**: Transaction value (price × shares) exceeds
-       company market cap. Catches cases where aggregate value was written into the
+    2. **Market cap sanity violations**: Transaction value (price × shares) more than
+       3x the market cap on the trade date (100x today's when that is unknown), the
+       same rule cleanup_corrupt_prices.py applies. Catches cases where aggregate value was written into the
        price field (e.g., NUTX: 31,746 shares × $0.63 = "price" $20,000, giving
        $635M transaction value vs $1.3B market cap = 49%). This rule catches NUTX
        where the market divergence rule cannot (no price data before 2022).
     3. **Market divergence (corrupt transactions)**: tx_price / raw_market > 1000x,
-       where raw_market is plausible (between $0.0001 and $10,000). These are
-       transactions where the share count or aggregate value was written into the
-       price field.
+       where raw_market is the split-corrected close and is plausible. A sub-cent
+       close against a filed price under $100 is not used: it usually means the
+       price history belongs to another security.
     4. **Corrupt market prices** (WARN): Our prices table shows implausible values
-       (outside [$0.0001, $10,000] after split correction). Examples: MULN showing
-       $2.7e14/share. These are flagged but NOT counted as transaction corruption.
+       (outside [$0.0001, $10,000] after split correction). Flagged but NOT counted
+       as transaction corruption.
 
-    Market divergence uses CORRECT basis (split-adjusted):
-    - Prices table: back-adjusted to recent reference date
-    - Transaction prices: as-transacted
-    - Comparison: raw_market = adjusted_close × PROD(split_ratio for splits after txn_date)
-
-    This fixes the prior basis mismatch that destroyed 4,065 good rows (e.g., AMZN 2020
-    purchases at $1,900 flagged as corrupt because our adjusted close showed $95 after
-    the 2022 20:1 split).
+    All four are found by cleanup_corrupt_prices.find_corrupt_prices, so a pass
+    means the cleanup ran with today's data.
 
     Scope: transaction_type='P' only (purchases matter for insider signals).
 
@@ -2024,107 +1996,23 @@ def check_insider_transaction_price_plausibility(conn):
 
     Threshold type: Target (zero corrupt transaction prices after cleanup)
     """
-    cur = conn.cursor()
-
+    # Every rule is the cleanup's own (cleanup_corrupt_prices.py), so this
+    # confirms the cleanup ran instead of applying different rules. Copies that
+    # drifted apart used to fail real purchases: a 1x-today market cap bar failed
+    # IPO buys, and a divergence rule without the cleanup's sub-cent guard failed
+    # Trulieve prices compared with another security's price history.
+    from scripts.cleanup_corrupt_prices import find_corrupt_prices
     MAX_PLAUSIBLE_PRICE = 1_000_000.0
-    MIN_PLAUSIBLE_MARKET = 0.0001
-    MAX_PLAUSIBLE_MARKET = 10000.0
     HIGH_DIVERGENCE_RATIO = 1000.0
-    MIN_PLAUSIBLE_MCAP = 1_000_000.0      # $1M
-    MAX_PLAUSIBLE_MCAP = 5_000_000_000_000.0  # $5T
-    MCAP_RATIO_THRESHOLD = 1.0  # 100% of market cap
+    corrupt_rows, flagged_rows = find_corrupt_prices(conn)
 
-    # Check 1: Prices above hard ceiling
-    cur.execute(f"""
-        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted
-        FROM insider_transactions it
-        JOIN companies c ON it.company_id = c.id
-        WHERE it.transaction_type = 'P'
-          AND it.price IS NOT NULL AND it.price > {MAX_PLAUSIBLE_PRICE}
-        ORDER BY it.price DESC
-        LIMIT 20
-    """)
-    ceiling_violations = cur.fetchall()
+    def with_reason(rows, prefix):
+        return [r for r in rows if r[5].startswith(prefix)]
 
-    # Check 2: Market cap sanity (transaction value > company market cap)
-    cur.execute("""
-        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted, c.market_cap
-        FROM insider_transactions it
-        JOIN companies c ON it.company_id = c.id
-        WHERE it.transaction_type = 'P'
-          AND it.price IS NOT NULL
-          AND it.price > 0
-          AND c.market_cap IS NOT NULL
-        ORDER BY c.ticker, it.transaction_date
-    """)
-
-    mcap_transactions = cur.fetchall()
-    mcap_violations = []
-
-    for row_id, ticker, txn_date, tx_price, shares, market_cap in mcap_transactions:
-        # Skip if already caught by ceiling check
-        if tx_price > MAX_PLAUSIBLE_PRICE:
-            continue
-
-        tx_value = tx_price * shares
-
-        # Check if market cap is plausible
-        mcap_plausible = MIN_PLAUSIBLE_MCAP <= market_cap <= MAX_PLAUSIBLE_MCAP
-
-        if mcap_plausible:
-            ratio = tx_value / market_cap
-            if ratio > MCAP_RATIO_THRESHOLD:
-                mcap_violations.append((ticker, txn_date, tx_price, shares, tx_value, market_cap, ratio))
-
-    # Check 3: Market divergence with split-corrected basis
-    cur.execute("""
-        SELECT it.id, c.ticker, it.transaction_date, it.price, it.shares_transacted
-        FROM insider_transactions it
-        JOIN companies c ON it.company_id = c.id
-        WHERE it.transaction_type = 'P'
-          AND it.price IS NOT NULL
-          AND it.price > 0
-        ORDER BY c.ticker, it.transaction_date
-    """)
-
-    transactions = cur.fetchall()
-    corrupt_transactions = []  # High side divergence with plausible market
-    corrupt_market_prices = []  # Market price itself is implausible
-
-    for row_id, ticker, txn_date, tx_price, shares in transactions:
-        # Skip if already caught by ceiling check
-        if tx_price > MAX_PLAUSIBLE_PRICE:
-            continue
-
-        # Get adjusted market close
-        cur.execute("""
-            SELECT close
-            FROM prices
-            WHERE ticker = ? AND date <= ?
-            ORDER BY date DESC
-            LIMIT 1
-        """, (ticker, txn_date))
-
-        market_row = cur.fetchone()
-        if not market_row:
-            continue
-
-        adjusted_close = market_row[0]
-        if adjusted_close <= 0:
-            continue
-
-        # Compute as-transacted market price
-        raw_market, split_count = _contract_compute_raw_market_price(ticker, txn_date, adjusted_close, cur)
-
-        # Check plausibility
-        market_plausible = MIN_PLAUSIBLE_MARKET <= raw_market <= MAX_PLAUSIBLE_MARKET
-        ratio = tx_price / raw_market if raw_market > 0 else 0
-
-        # Categorize
-        if market_plausible and ratio > HIGH_DIVERGENCE_RATIO:
-            corrupt_transactions.append((ticker, txn_date, tx_price, shares, raw_market, ratio, split_count))
-        elif not market_plausible:
-            corrupt_market_prices.append((ticker, txn_date, tx_price, shares, raw_market, split_count))
+    ceiling_violations = [r[:5] for r in with_reason(corrupt_rows, "above_ceiling")]
+    mcap_violations = with_reason(corrupt_rows, "exceeds_market_cap")
+    corrupt_transactions = with_reason(corrupt_rows, "market_divergence_high")
+    corrupt_market_prices = with_reason(flagged_rows, "market_price_corrupt")
 
     # Format examples
     ceiling_examples = [
@@ -2133,22 +2021,22 @@ def check_insider_transaction_price_plausibility(conn):
     ]
 
     mcap_examples = [
-        f"{ticker} on {txn_date}: tx_value=${tx_value/1e9:.2f}B, market_cap=${market_cap/1e9:.2f}B, ratio={ratio:.1f}x"
-        for ticker, txn_date, tx_price, shares, tx_value, market_cap, ratio in mcap_violations[:10]
+        f"{ticker} on {txn_date}: {reason}"
+        for _, ticker, txn_date, _, _, reason in mcap_violations[:10]
     ]
 
     divergence_examples = [
-        f"{ticker} on {txn_date}: tx=${tx_price:,.2f}, raw_market=${raw_market:.4f}, ratio={ratio:.1f}x ({split_count} splits)"
-        for ticker, txn_date, tx_price, shares, raw_market, ratio, split_count in corrupt_transactions[:10]
+        f"{ticker} on {txn_date}: {reason}"
+        for _, ticker, txn_date, _, _, reason in corrupt_transactions[:10]
     ]
 
     market_corrupt_examples = [
-        f"{ticker} on {txn_date}: tx=${tx_price:,.2f}, raw_market=${raw_market:.2e} (outside plausible range)"
-        for ticker, txn_date, tx_price, shares, raw_market, split_count in corrupt_market_prices[:10]
+        f"{ticker} on {txn_date}: {reason}"
+        for _, ticker, txn_date, _, _, reason in corrupt_market_prices[:10]
     ]
 
     # Combine corrupt transaction counts
-    total_corrupt = len(ceiling_violations) + len(mcap_violations) + len(corrupt_transactions)
+    total_corrupt = len(corrupt_rows)
 
     return {
         'passed': total_corrupt == 0,
@@ -2166,7 +2054,7 @@ def check_insider_transaction_price_plausibility(conn):
         'expected': {
             'corrupt_transaction_prices': 0,
             'max_plausible_price': MAX_PLAUSIBLE_PRICE,
-            'mcap_ratio_threshold': MCAP_RATIO_THRESHOLD,
+            'mcap_rule': '3x market cap on the trade date, else 100x today (cleanup_corrupt_prices.py)',
             'high_divergence_ratio': HIGH_DIVERGENCE_RATIO,
             'note': 'Market cap sanity + split-corrected market divergence checks; corrupt market prices (WARN) reported separately',
             'threshold_type': 'target'

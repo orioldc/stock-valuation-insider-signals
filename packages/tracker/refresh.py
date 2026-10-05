@@ -153,7 +153,8 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
         from data_ingestion.form4_rules import (
             apply_amendments, merge_related_owner_filings, remove_duplicate_filings,
             remove_self_reported)
-        from data_ingestion.company_identity import assign_tickers, merge_predecessors
+        from data_ingestion.company_identity import (
+            assign_tickers, merge_duplicate_companies, merge_predecessors)
         from data_ingestion.edgar_client import fetch_sec_company_list
 
         conn = get_db()
@@ -174,6 +175,7 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
         # claim on an existing ticker), so redo the company matching.
         sec_map, sec_titles = fetch_sec_company_list()
         conn = get_db()
+        merge_duplicate_companies(conn)
         merge_predecessors(conn, sec_map)
         assign_tickers(conn, sec_map, sec_titles)
         # Written by the retired fix_ticker_symbols.py; assign_tickers replaces it.

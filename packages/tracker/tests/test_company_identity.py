@@ -1,6 +1,8 @@
 import sqlite3
 
-from company_identity import assign_tickers, company_for_cik, merge_predecessors, record_issuer_tickers
+from company_identity import (
+    assign_tickers, company_for_cik, merge_duplicate_companies, merge_predecessors,
+    record_issuer_tickers)
 
 
 def _trade(conn, cik, accession, filing_date, ticker, name):
@@ -118,3 +120,41 @@ def test_ticker_reused_by_a_company_that_never_files_goes_to_it(db_path):
     _trade(conn, 9984, "A-1", "2025-01-29", "B", "BARNES GROUP INC")
     assign_tickers(conn, {"B": 756894}, {756894: "BARRICK MINING CORP"})
     assert _trades_by_ticker(conn) == [("CIK9984", 9984, "A-1")]
+
+
+def test_renamed_company_takes_its_price_history_with_it(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE prices (ticker TEXT NOT NULL, date TEXT NOT NULL, close REAL, PRIMARY KEY (ticker, date))")
+    _trade(conn, 1, "A-1", "2023-01-05", "MMC", "Marsh McLennan")
+    _trade(conn, 2, "A-2", "2023-01-05", "OLD", "Swapper")
+    assign_tickers(conn, {"MMC": 1, "OLD": 2})
+    conn.executemany("INSERT INTO prices VALUES (?, ?, ?)", [
+        ("MMC", "2019-01-02", 80), ("MMC", "2026-09-04", 200),
+        ("MRSH", "2021-10-04", 1), ("MRSH", "2026-10-02", 201),  # recent fetch of the new symbol
+        ("OLD", "2020-01-02", 5)])
+
+    # Marsh becomes MRSH; the other company takes MMC (a swap).
+    assign_tickers(conn, {"MRSH": 1, "MMC": 2})
+
+    assert sorted(conn.execute("SELECT ticker, date, close FROM prices")) == [
+        ("MMC", "2020-01-02", 5),
+        ("MRSH", "2019-01-02", 80), ("MRSH", "2021-10-04", 1), ("MRSH", "2026-10-02", 201)]
+
+
+def test_two_company_rows_for_one_cik_become_one(db_path):
+    conn = sqlite3.connect(db_path)
+    # An older database made a row per ticker: Community West as CWBC, then CVCY.
+    keep = conn.execute("INSERT INTO companies (ticker, cik) VALUES ('CWBC', 1127371)").lastrowid
+    extra = conn.execute("INSERT INTO companies (ticker, cik) VALUES ('CVCY', 1127371)").lastrowid
+    for company_id, accession in [(keep, "A-1"), (extra, "A-2")]:
+        conn.execute("""INSERT INTO insider_transactions
+                        (company_id, filing_date, transaction_type, accession_number, line_number)
+                        VALUES (?, '2024-01-02', 'P', ?, 1)""", (company_id, accession))
+    conn.execute("CREATE TABLE prices (ticker TEXT NOT NULL, date TEXT NOT NULL, close REAL, PRIMARY KEY (ticker, date))")
+    conn.executemany("INSERT INTO prices VALUES (?, ?, ?)",
+                     [("CVCY", "2020-01-02", 20), ("CWBC", "2024-01-02", 15)])
+
+    assert merge_duplicate_companies(conn) == [(keep, extra)]
+    assert _trades_by_ticker(conn) == [("CWBC", 1127371, "A-1"), ("CWBC", 1127371, "A-2")]
+    assert conn.execute("SELECT ticker, date FROM prices ORDER BY date").fetchall() == [
+        ("CWBC", "2020-01-02"), ("CWBC", "2024-01-02")]

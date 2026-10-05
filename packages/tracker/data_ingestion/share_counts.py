@@ -293,6 +293,11 @@ def share_counts(facts) -> list:
     for accn, entries in _by_filing(_entries(facts, COVER_SHARES)).items():
         latest_end = max(e["end"] for e in entries)
         total = sum(e["val"] for e in entries if e["end"] == latest_end)
+        filed = max(e.get("filed") or "" for e in entries)
+        # A cover date after the filing reached SEC is a typo (2033 for 2023);
+        # the count was known on the day it was filed.
+        if filed and latest_end > filed:
+            latest_end = filed
         if total > 0:
             covers[accn] = (latest_end, float(total))
 

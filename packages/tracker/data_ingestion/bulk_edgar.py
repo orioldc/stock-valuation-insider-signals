@@ -28,7 +28,8 @@ from form4_rules import (  # noqa: E402
     remove_self_reported,
 )
 from company_identity import (  # noqa: E402
-    assign_tickers, company_for_cik, merge_predecessors, record_issuer_tickers,
+    assign_tickers, company_for_cik, merge_duplicate_companies, merge_predecessors,
+    record_issuer_tickers,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -547,6 +548,7 @@ def rebuild_from_bulk(start_year=2020):
                     f"{[q['quarter'] for q in result['quarters'][-trailing:]]}")
 
     conn = sqlite3.connect(DB_PATH)
+    result["duplicate_companies_merged"] = merge_duplicate_companies(conn)
     result["merged_ciks"] = merge_predecessors(conn, sec_map)
     result["tickers_changed"] = assign_tickers(conn, sec_map, sec_titles)
     result["amended_rows_removed"] = apply_amendments(conn)

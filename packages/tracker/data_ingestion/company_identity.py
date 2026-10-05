@@ -91,6 +91,42 @@ def _latest_names(conn):
     return names
 
 
+# Tables whose rows belong to one company row.
+COMPANY_TABLES = ("insider_transactions", "signals", "shares_outstanding",
+                  "share_count_changes", "company_ciks")
+
+
+def merge_duplicate_companies(conn) -> list:
+    """Fold extra company rows that share a CIK into the oldest one.
+
+    Databases started before companies were keyed on CIK made a row per
+    ticker, so a company that changed ticker can have two (Community West as
+    CWBC and as CVCY), with its trades split between them. company_for_cik
+    always picks the oldest row, so that one is kept; the extra row's prices
+    only fill in years the kept row's ticker has none for.
+    Returns [(kept_id, removed_id)].
+    """
+    pairs = conn.execute("""
+        SELECT k.id, k.ticker, d.id, d.ticker FROM companies d
+        JOIN (SELECT cik, MIN(id) AS id FROM companies WHERE cik IS NOT NULL GROUP BY cik) m
+          ON m.cik = d.cik AND d.id != m.id
+        JOIN companies k ON k.id = m.id""").fetchall()
+    tables = [t for t in COMPANY_TABLES if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (t,)).fetchone()]
+    for keep, _, extra, _ in pairs:
+        for table in tables:
+            # A row the kept company already has (same unique key) is a copy.
+            conn.execute(f"UPDATE OR IGNORE {table} SET company_id = ? WHERE company_id = ?",
+                         (keep, extra))
+            conn.execute(f"DELETE FROM {table} WHERE company_id = ?", (extra,))
+        conn.execute("DELETE FROM companies WHERE id = ?", (extra,))
+    _move_ticker_history(conn, [(extra, extra_ticker, keep_ticker)
+                                for _, keep_ticker, extra, extra_ticker in pairs
+                                if extra_ticker and keep_ticker])
+    conn.commit()
+    return [(keep, extra) for keep, _, extra, _ in pairs]
+
+
 def merge_predecessors(conn, sec_map) -> list:
     """Fold re-registered companies' old CIKs into their successors.
 
@@ -229,5 +265,38 @@ def assign_tickers(conn, sec_map, sec_titles=None) -> int:
                      [(f"__{cid}", cid) for cid, _, _, _ in changed])
     conn.executemany("UPDATE companies SET ticker = ?, name = ? WHERE id = ?",
                      [(ticker, name, cid) for cid, _, ticker, name in changed])
+    _move_ticker_history(conn, [(cid, old, new) for cid, old, new, _ in changed if old != new])
     conn.commit()
     return len(changed)
+
+
+# Tables that store a company's own history under its ticker.
+TICKER_HISTORY_TABLES = ("prices", "split_events")
+
+
+def _move_ticker_history(conn, renames):
+    """Move prices and splits from a company's old ticker to its new one.
+
+    Without this a renamed company (Marsh McLennan, MMC to MRSH) keeps only
+    what the price download fetches for the new symbol (5 years), and its
+    older history sits under a ticker no company has. Where the new ticker
+    already has rows (a fetch of the new symbol), those stay and the old
+    ticker only fills in the years before them: the data source may since
+    have given the old symbol to a different security (TRUL), so its recent
+    rows cannot be trusted.
+
+    renames: [(company_id, old_ticker, new_ticker)].
+    """
+    tables = [t for t in TICKER_HISTORY_TABLES if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (t,)).fetchone()]
+    for table in tables:
+        # Park every old ticker's rows first, so swaps between companies don't collide.
+        for cid, old, _ in renames:
+            conn.execute(f"UPDATE {table} SET ticker = ? WHERE ticker = ?", (f"__{cid}", old))
+        for cid, _, new in renames:
+            first = conn.execute(f"SELECT MIN(date) FROM {table} WHERE ticker = ?",
+                                 (new,)).fetchone()[0]
+            if first is not None:
+                conn.execute(f"DELETE FROM {table} WHERE ticker = ? AND date >= ?",
+                             (f"__{cid}", first))
+            conn.execute(f"UPDATE {table} SET ticker = ? WHERE ticker = ?", (new, f"__{cid}"))

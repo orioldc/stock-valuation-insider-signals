@@ -405,6 +405,10 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
         logger.warning(f"Forward tracker update_forward_returns failed: {e}")
 
     print(report)
+    if tail_failed:
+        # Without the index tail the newest weeks of insider trades are missing.
+        # Stop here so the monthly run fails now, not an hour later at validation.
+        sys.exit("Index tail failed, so the newest filings are missing. See ERRORS above.")
     return df
 
 

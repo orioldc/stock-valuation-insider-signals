@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_ingestion"))
 
 from data_ingestion.data_loader import get_db, ensure_company, _store_filings
-from data_ingestion.edgar_client import get_rate_stats, fetch_form4_filings, fetch_sec_company_list
+from data_ingestion.edgar_client import _get as sec_get, get_rate_stats, fetch_form4_filings, fetch_sec_company_list
 from data_ingestion.form4_rules import TRANSACTION_FORM_TYPES
 
 # Add pipeline to path for provenance
@@ -40,10 +40,6 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "insider_signals.db")
 CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
-
-# SEC's User-Agent requirement
-USER_AGENT = "InsiderSignalTracker oriol.diaz@ozoneproject.com"
-
 
 def _ensure_failures_table(conn):
     """
@@ -111,16 +107,13 @@ def _clear_checkpoint(year, quarter):
 
 def fetch_form_index(year: int, quarter: int) -> str:
     """Fetch SEC's form.idx for the given year and quarter."""
-    import urllib.request
-
     url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/form.idx"
     logger.info(f"Fetching form index: {url}")
-
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-
+    # Go through edgar_client like every other SEC call: requests brings its
+    # own CA certificates, so this works on Pythons where urllib cannot verify
+    # SEC's certificate (it failed that way on the monthly runner).
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            content = response.read().decode('latin-1')  # SEC uses latin-1 encoding
+        content = sec_get(url).content.decode('latin-1')  # SEC uses latin-1 encoding
         logger.info(f"Fetched form index: {len(content)} bytes")
         return content
     except Exception as e:

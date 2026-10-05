@@ -128,8 +128,14 @@ if [[ $DB_ONLY -eq 0 ]]; then
   echo "[install] installing npm deps for MCP server …"
   cd "$REPO_ROOT/packages/mcp"
   npm install --silent
-  echo "[install] building MCP server bundle …"
-  npm run build --silent
+  # The .mcpb bundle ships the built server in dist/ but not tsconfig.json
+  # (mcpb pack always leaves that file out), so it cannot be rebuilt there.
+  if [[ ! -f tsconfig.json && -f dist/index.js && -f dist/server.js ]]; then
+    echo "[install] MCP server bundle already built (dist/), skipping build"
+  else
+    echo "[install] building MCP server bundle …"
+    npm run build --silent
+  fi
   cd "$REPO_ROOT"
 fi
 

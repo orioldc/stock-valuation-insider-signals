@@ -29,6 +29,7 @@ On a DB with coverage already present, this extends it. On a DB missing coverage
 travels forward in the published DB artifact.
 """
 
+import ast
 import sys
 import os
 import sqlite3
@@ -499,15 +500,41 @@ def classify_failure(error_msg):
     return (False, f"unknown_error")
 
 
-def fetch_prices_batch(tickers, start_date, end_date):
-    """
-    Fetch prices for a batch of tickers using yfinance.
+# Pauses before asking again for symbols the price source refused because of
+# too many requests. It refuses by returning nothing, not by raising an error.
+THROTTLE_WAITS = (30, 60, 120, 240)
 
-    Returns dict mapping ticker -> DataFrame with columns [date, close].
-    Tolerates individual ticker failures.
-    """
+# Symbols still refused after every pause. They are not "no data" and are
+# left for the next run.
+throttled_symbols = set()
+
+
+class _ErrorLines(logging.Handler):
+    """Keeps yfinance's error lines; it reports per-symbol errors only by logging
+    them, as "['AAA', 'BBB']: YFRateLimitError('Too Many Requests...')"."""
+
+    def __init__(self):
+        super().__init__(logging.ERROR)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+    def symbols_with(self, reason):
+        found = []
+        for line in self.lines:
+            symbols, sep, err = line.partition("]: ")
+            if sep and symbols.startswith("[") and classify_failure(err)[1] == reason:
+                found += ast.literal_eval(symbols + "]")
+        return found
+
+
+def _download_closes(tickers, start_date, end_date):
+    """One download. Returns ({ticker: DataFrame[date, close]}, [throttled tickers])."""
     results = {}
-
+    errors = _ErrorLines()
+    yf_logger = logging.getLogger("yfinance")
+    yf_logger.addHandler(errors)
     try:
         # Download with auto_adjust=True to get split/dividend-adjusted closes
         data = yf.download(
@@ -518,37 +545,42 @@ def fetch_prices_batch(tickers, start_date, end_date):
             auto_adjust=True,
             threads=True
         )
-
-        if data.empty:
-            return results
-
-        # Handle single ticker case (returns Series) vs multi-ticker (MultiIndex columns)
-        if len(tickers) == 1:
-            ticker = tickers[0]
-            if 'Close' in data.columns:
-                df = pd.DataFrame({
-                    'date': data.index,
-                    'close': data['Close'].values
-                })
-                df = df.dropna(subset=['close'])
-                if len(df) > 0:
-                    results[ticker] = df
-        else:
-            # Multi-ticker: data.columns is MultiIndex with (metric, ticker)
-            if 'Close' in data.columns.get_level_values(0):
-                close_data = data['Close']
-                for ticker in close_data.columns:
-                    series = close_data[ticker].dropna()
-                    if len(series) > 0:
-                        df = pd.DataFrame({
-                            'date': series.index,
-                            'close': series.values
-                        })
-                        results[ticker] = df
-
+        if not data.empty:
+            # Columns are (metric, ticker) pairs, even for one ticker in current
+            # yfinance; older versions gave a single ticker plain columns.
+            close_data = data['Close']
+            if isinstance(close_data, pd.Series):
+                close_data = close_data.to_frame(tickers[0])
+            for ticker in close_data.columns:
+                series = close_data[ticker].dropna()
+                if len(series) > 0:
+                    results[ticker] = pd.DataFrame({'date': series.index, 'close': series.values})
     except Exception as e:
         logger.warning(f"Batch download failed: {e}")
+    finally:
+        yf_logger.removeHandler(errors)
+    throttled = [t for t in errors.symbols_with("rate_limited") if t not in results]
+    return results, throttled
 
+
+def fetch_prices_batch(tickers, start_date, end_date):
+    """
+    Fetch prices for a batch of tickers using yfinance.
+
+    Returns dict mapping ticker -> DataFrame with columns [date, close].
+    Tolerates individual ticker failures. Symbols refused for too many
+    requests are asked for again after a pause; any still refused at the end
+    go in throttled_symbols.
+    """
+    results, throttled = _download_closes(tickers, start_date, end_date)
+    for wait in THROTTLE_WAITS:
+        if not throttled:
+            break
+        logger.info(f"  {len(throttled)} symbols refused (too many requests), waiting {wait}s")
+        time.sleep(wait)
+        more, throttled = _download_closes(throttled, start_date, end_date)
+        results.update(more)
+    throttled_symbols.update(throttled)
     return results
 
 
@@ -816,6 +848,18 @@ def run_backfill(dry_run=False, max_tickers=None, size_check=False):
                 # Permanent batch failure (unlikely but handle it)
                 prices_by_ticker = {}
 
+        # A throttled symbol comes back empty instead of raising an error, so it
+        # looks just like a dead one. Ask again for each missing symbol on its
+        # own, after a pause, before deciding it has no data. Known failures are
+        # skipped: there are thousands and they rarely come back.
+        missing = [fetch_symbol for stored_ticker, fetch_symbol, _, _ in batch_items
+                   if fetch_symbol not in prices_by_ticker and fetch_symbol not in throttled_symbols
+                   and stored_ticker not in previously_failed]
+        if missing:
+            time.sleep(RATE_LIMIT_DELAY)
+            for symbol in missing:
+                prices_by_ticker.update(fetch_prices_batch([symbol], START_DATE, END_DATE))
+
         # Insert per company (stored_ticker is storage key, fetch_symbol is download key)
         for stored_ticker, fetch_symbol, cik, name in batch_items:
             if fetch_symbol in prices_by_ticker:
@@ -862,6 +906,8 @@ def run_backfill(dry_run=False, max_tickers=None, size_check=False):
                     else:
                         failed_transient.append((stored_ticker, reason))
                         # Do NOT checkpoint transient failures
+            elif fetch_symbol in throttled_symbols:
+                failed_transient.append((stored_ticker, "rate_limited"))
             else:
                 # No data returned for fetch_symbol
                 # Check if ticker already has prices in DB before marking as permanent failure

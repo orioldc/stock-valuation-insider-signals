@@ -260,6 +260,11 @@ def find_corrupt_prices(conn):
         adjusted_close = market_row[0]
         if adjusted_close <= 0:
             continue
+        # A sub-cent close against an ordinary share price usually means the
+        # price source's history for this symbol belongs to another (often
+        # dead) security, as for TRLV before Trulieve took the symbol.
+        if adjusted_close < 0.01 and tx_price < 100:
+            continue
 
         # Compute as-transacted market price (correct for splits)
         raw_market, split_count = _compute_raw_market_price(ticker, txn_date, adjusted_close, cur)

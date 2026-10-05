@@ -11,8 +11,10 @@ import pandas as pd
 import numpy as np
 import logging
 
-# Add parent to path for imports
+# Add parent to path for imports: packages/ for "tracker.*", and packages/tracker
+# for the modules features.py imports directly ("data_ingestion.*").
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tracker.scoring.peer_rank import (
     build_price_panel, build_forward_return_matrices,

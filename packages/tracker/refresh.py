@@ -112,18 +112,6 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
                     f"{bulk_result['amended_rows_removed']} replaced by amendments, "
                     f"{bulk_result['duplicate_rows_removed']} repeated trades removed")
 
-    # Build universe dynamically from DB
-    # For scoring: tickers with purchases in last 2 years
-    tickers = load_universe()
-    # For incremental XML refresh: tickers with activity in last 6 months
-    incremental_tickers = load_active_universe(months=6)
-
-    if max_tickers:
-        tickers = tickers[:max_tickers]
-        incremental_tickers = incremental_tickers[:max_tickers]
-
-    logger.info(f"Scoring universe: {len(tickers)} tickers | Incremental refresh: {len(incremental_tickers)} tickers")
-
     # Fetch ticker map once (only needed for ingestion)
     ticker_map = None
     if not skip_ingest:
@@ -226,6 +214,22 @@ def run_weekly_refresh(skip_shares=False, skip_sectors=False,
                     time.sleep(0.15)
             else:
                 logger.info("  All tickers have sector data")
+
+    # Build the universe only now. Phase 1 adds the newest filings and renames
+    # companies (assign_tickers). A list built before it misses companies whose
+    # only recent buys are in those filings, and keeps old symbols: prices then
+    # download under a ticker no company has, and the renamed company is scored
+    # under a symbol that no longer exists.
+    # For scoring: tickers with purchases in last 2 years
+    tickers = load_universe()
+    # For incremental XML refresh: tickers with activity in last 6 months
+    incremental_tickers = load_active_universe(months=6)
+
+    if max_tickers:
+        tickers = tickers[:max_tickers]
+        incremental_tickers = incremental_tickers[:max_tickers]
+
+    logger.info(f"Scoring universe: {len(tickers)} tickers | Incremental refresh: {len(incremental_tickers)} tickers")
 
     # ── Phase 2.6: Refresh prices ──
     logger.info("=" * 60)

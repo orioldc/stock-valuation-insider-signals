@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS insider_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_txn_company ON insider_transactions(company_id);
 CREATE INDEX IF NOT EXISTS idx_txn_date ON insider_transactions(transaction_date);
+-- Every ticker summary asks for the newest filing date; without this index
+-- each ask reads all 2 million rows (about 5 seconds).
+CREATE INDEX IF NOT EXISTS idx_txn_filing ON insider_transactions(filing_date);
 CREATE INDEX IF NOT EXISTS idx_txn_owner ON insider_transactions(company_id, reporting_cik, transaction_date);
 
 -- Every (issuer CIK, ticker) pair seen in filings, with the issuer's latest name

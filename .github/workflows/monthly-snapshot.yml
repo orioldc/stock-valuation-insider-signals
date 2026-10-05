@@ -162,7 +162,7 @@ jobs:
 
       - name: Run refresh (20 min to ~2.5h, see Timing above)
         if: ${{ github.event.inputs.force_full_rebuild != 'true' }}
-        timeout-minutes: 180
+        timeout-minutes: 240
         run: |
           cd packages/tracker
           python refresh.py --expanded --skip-sectors
@@ -177,7 +177,7 @@ jobs:
 
       - name: Run full rebuild from SEC bulk files
         if: ${{ github.event.inputs.force_full_rebuild == 'true' }}
-        timeout-minutes: 180
+        timeout-minutes: 240
         run: |
           cd packages/tracker
           python refresh.py --expanded --skip-sectors
@@ -248,7 +248,7 @@ jobs:
       # snapshot committed in packages/valuation/data/, and users would get
       # stale insider data without anyone noticing.
       - name: Export frozen insider snapshot
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           cd packages/tracker
           python scripts/export_frozen_insider.py

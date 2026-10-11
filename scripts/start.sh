@@ -15,7 +15,9 @@ SENTINEL="$REPO_ROOT/.install_complete"
 # First run? install everything.
 if [[ ! -f "$SENTINEL" ]]; then
   echo "[start] first run — running install.sh …" >&2
-  bash "$SCRIPT_DIR/install.sh"
+  # Its messages go to stderr: stdout is where Claude Desktop reads the MCP
+  # server's replies, and must carry nothing else.
+  bash "$SCRIPT_DIR/install.sh" >&2
 fi
 
 PORT="${MCP_API_PORT:-8502}"

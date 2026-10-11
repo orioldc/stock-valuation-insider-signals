@@ -5,7 +5,8 @@ Clean corrupt insider_transactions.price values from the database.
 Applies validation rules to detect and nullify impossible prices:
 1. Price <= 0: Store as NULL (unknown, not zero)
 2. Hard bound: price > $1,000,000/share is corrupt (BRK-A at ~$700K must survive)
-3. Relative to market: If >20x divergence from market close, likely corrupt
+3. Relative to market: If >1000x the market close, likely corrupt (except a
+   price that matches another share class, like Berkshire Class A against BRK-B)
 
 Preserves original corrupt values in a new column (price_original_corrupt) before
 nullifying, so the data is recoverable. Transaction rows are NOT deleted — only
@@ -43,6 +44,11 @@ DB_PATH = os.path.join(TRACKER_DIR, "db", "insider_signals.db")
 MAX_PLAUSIBLE_PRICE = 1_000_000.0
 MAX_MARKET_RATIO = 20.0
 MIN_MARKET_RATIO = 1.0 / 20.0
+
+# Companies stored under one share class whose insiders also trade a far more
+# expensive class: the price of one share of that class, in shares of the stored
+# one. One Berkshire Class A share converts into 1,500 Class B (BRK-B) shares.
+OTHER_CLASS_PRICE_RATIO = {"BRK-B": 1500.0}
 
 
 def get_db(db_path=None):
@@ -274,6 +280,13 @@ def find_corrupt_prices(conn):
 
         # Compute divergence ratio
         ratio = tx_price / raw_market if raw_market > 0 else 0
+
+        # A price near the other share class's level is a real trade in that
+        # class, not a typo: Berkshire insiders buy Class A shares at about
+        # 1,500 times the BRK-B close.
+        other_class = OTHER_CLASS_PRICE_RATIO.get(ticker)
+        if other_class and 0.5 <= ratio / other_class <= 2:
+            continue
 
         # Decision tree:
         # a) If market is plausible AND tx/market > 1000 → NULL the transaction

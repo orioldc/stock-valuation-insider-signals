@@ -32,5 +32,12 @@ def test_a_sub_cent_close_from_another_security_does_not_condemn_real_prices(db_
 
 
 
+def test_berkshire_class_a_prices_are_real_but_other_huge_brk_b_prices_are_not(db_path):
+    # BRK-B closed near $268; Greg Abel's Class A buys were near $405,800 (1,500x).
+    # $900,000 matches neither class, so it is still a typo.
+    assert _corrupt_ids(db_path, "BRK-B", [("2022-09-28", 268.0)],
+                        [("2022-09-29", 405800.0), ("2022-09-29", 900000.0)]) == [1]
+
+
 def test_a_close_from_months_before_the_trade_still_catches_a_dollar_total(db_path):
     assert _corrupt_ids(db_path, "CCNE", [("2021-02-12", 19.78)], [("2021-06-15", 24307.0)]) == [0]
